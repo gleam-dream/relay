@@ -1,4 +1,5 @@
 import gleam/json
+import gleam/list
 import gleam/option.{type Option, None, Some}
 
 /// JSON-RPC 2.0 request identifier (string or integer).
@@ -28,7 +29,11 @@ pub const invalid_params_code = -32_602
 
 pub const internal_error_code = -32_603
 
+pub const resource_not_found_code = -32_002
+
 pub const unsupported_protocol_version_code = -32_022
+
+pub const missing_required_client_capability_code = -32_021
 
 pub fn parse_error() -> RpcError {
   RpcError(parse_error_code, "Parse error.", None)
@@ -50,6 +55,10 @@ pub fn internal_error() -> RpcError {
   RpcError(internal_error_code, "Internal error.", None)
 }
 
+pub fn resource_not_found() -> RpcError {
+  RpcError(resource_not_found_code, "Resource not found.", None)
+}
+
 pub fn unsupported_protocol_version(
   requested: String,
   supported: List(String),
@@ -63,6 +72,18 @@ pub fn unsupported_protocol_version(
     unsupported_protocol_version_code,
     "Unsupported protocol version.",
     Some(data),
+  )
+}
+
+pub fn missing_required_client_capability(
+  capabilities: List(String),
+) -> RpcError {
+  let required =
+    json.object(list.map(capabilities, fn(name) { #(name, json.object([])) }))
+  RpcError(
+    missing_required_client_capability_code,
+    "Missing required client capability.",
+    Some(json.object([#("requiredCapabilities", required)])),
   )
 }
 

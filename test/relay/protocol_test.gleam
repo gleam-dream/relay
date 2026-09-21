@@ -1,11 +1,14 @@
 import gleam/dict
 import gleam/dynamic/decode
 import gleam/json
-import gleam/option.{Some}
+import gleam/option.{None, Some}
+import gleam/string
 import gleeunit
 import gleeunit/should
+import json/blueprint/number
 import json/blueprint/value
-import relay/protocol/jsonrpc.{RequestInteger, RequestString}
+import relay/logging.{Debug, Warning}
+import relay/protocol/jsonrpc.{ProgressInteger, RequestInteger, RequestString}
 import relay/protocol/v2026_07_28 as v2026
 
 pub fn main() -> Nil {
@@ -58,6 +61,191 @@ pub fn unsupported_version_test() {
     }
     _ -> should.fail()
   }
+}
+
+pub fn exact_blueprint_number_round_trips_through_wire_test() {
+  let number_text = "12345678901234567890123456789012345678901234567890"
+  let raw =
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{"
+    <> "\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\","
+    <> "\"io.modelcontextprotocol/clientCapabilities\":{}},"
+    <> "\"name\":\"exact\",\"arguments\":{\"n\":"
+    <> number_text
+    <> "}}}"
+  let assert Ok(limits) = number.number_limits(1024, 100, 1000)
+  let assert Ok(expected) = number.parse_number(limits, number_text)
+
+  case v2026.admit_message(raw) {
+    v2026.AdmittedRequest(v2026.ToolsCall(
+      _,
+      _,
+      _,
+      value.Object([#("n", value.Number(actual))]),
+      _,
+      _,
+    )) -> actual |> should.equal(expected)
+    _ -> should.fail()
+  }
+
+  let response =
+    v2026.encode_call_success_response(
+      RequestInteger(1),
+      value.Object([#("n", value.Number(expected))]),
+    )
+  let rendered = json.to_string(response)
+  string.contains(rendered, "\"n\":" <> number_text)
+  |> should.equal(True)
+}
+
+pub fn json_parser_preserves_non_ascii_text_test() {
+  let assert Ok(value) = json.parse("\"€\"", decode.dynamic)
+  let assert Ok(text) = decode.run(value, decode.string)
+  text |> should.equal("€")
+}
+
+fn request_meta(extra_fields: List(#(String, json.Json))) -> json.Json {
+  json.object([
+    #("io.modelcontextprotocol/protocolVersion", json.string("2026-07-28")),
+    #("io.modelcontextprotocol/clientCapabilities", json.object([])),
+    ..extra_fields
+  ])
+}
+
+fn discovery_request(meta: json.Json) -> String {
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("id", json.int(7)),
+    #("method", json.string("server/discover")),
+    #("params", json.object([#("_meta", meta)])),
+  ])
+  |> json.to_string
+}
+
+pub fn malformed_present_client_info_is_rejected_test() {
+  let meta =
+    request_meta([
+      #(
+        "io.modelcontextprotocol/clientInfo",
+        json.object([#("name", json.string("client-without-version"))]),
+      ),
+    ])
+
+  case v2026.admit_message(discovery_request(meta)) {
+    v2026.AdmittedRejected(Some(RequestInteger(7)), err) ->
+      err.code |> should.equal(-32_602)
+    _ -> should.fail()
+  }
+}
+
+pub fn malformed_present_progress_token_is_rejected_test() {
+  let meta = request_meta([#("progressToken", json.bool(True))])
+
+  case v2026.admit_message(discovery_request(meta)) {
+    v2026.AdmittedRejected(Some(RequestInteger(7)), err) ->
+      err.code |> should.equal(-32_602)
+    _ -> should.fail()
+  }
+}
+
+pub fn valid_client_info_and_zero_progress_token_are_retained_test() {
+  let meta =
+    request_meta([
+      #(
+        "io.modelcontextprotocol/clientInfo",
+        json.object([
+          #("name", json.string("client")),
+          #("version", json.string("1.2.3")),
+        ]),
+      ),
+      #("progressToken", json.int(0)),
+    ])
+
+  case v2026.admit_message(discovery_request(meta)) {
+    v2026.AdmittedRequest(v2026.Discover(_, admitted)) -> {
+      admitted.client_info
+      |> should.equal(Some(v2026.ClientInfo("client", "1.2.3")))
+      admitted.progress_token
+      |> should.equal(Some(ProgressInteger(0)))
+    }
+    _ -> should.fail()
+  }
+}
+
+pub fn modern_log_level_is_request_scoped_metadata_test() {
+  let meta =
+    request_meta([
+      #("io.modelcontextprotocol/logLevel", json.string("debug")),
+    ])
+
+  case v2026.admit_message(discovery_request(meta)) {
+    v2026.AdmittedRequest(v2026.Discover(_, admitted)) -> {
+      admitted.log_level |> should.equal(Some(Debug))
+      v2026.request_allows_log(admitted, Debug) |> should.be_true
+      v2026.request_allows_log(admitted, Warning) |> should.be_true
+    }
+    _ -> should.fail()
+  }
+}
+
+pub fn legacy_logging_set_level_rpc_is_not_admitted_test() {
+  let raw =
+    service_request("logging/setLevel", [
+      #("level", json.string("debug")),
+    ])
+
+  case v2026.admit_message(raw) {
+    v2026.AdmittedRejected(Some(RequestInteger(7)), err) ->
+      err.code |> should.equal(-32_601)
+    _ -> should.fail()
+  }
+}
+
+pub fn resource_read_continuation_is_rejected_test() {
+  let raw =
+    service_request("resources/read", [
+      #("uri", json.string("memory://notes/1")),
+      #("requestState", json.string("continue-me")),
+    ])
+
+  case v2026.admit_message(raw) {
+    v2026.AdmittedRejected(Some(RequestInteger(7)), err) ->
+      err.code |> should.equal(-32_602)
+    _ -> should.fail()
+  }
+}
+
+pub fn prompt_get_continuation_is_admitted_test() {
+  let raw =
+    service_request("prompts/get", [
+      #("name", json.string("welcome")),
+      #("inputResponses", json.object([])),
+    ])
+
+  case v2026.admit_message(raw) {
+    v2026.AdmittedRequest(v2026.PromptsGet(
+      RequestInteger(7),
+      _,
+      "welcome",
+      _,
+      None,
+      Some(value.Object([])),
+    )) -> Nil
+    _ -> should.fail()
+  }
+}
+
+fn service_request(
+  method: String,
+  fields: List(#(String, json.Json)),
+) -> String {
+  let meta = request_meta([])
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("id", json.int(7)),
+    #("method", json.string(method)),
+    #("params", json.object([#("_meta", meta), ..fields])),
+  ])
+  |> json.to_string
 }
 
 // Test call success encoding includes resultType: "complete" and serverInfo in _meta

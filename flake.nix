@@ -34,8 +34,11 @@
       {
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
+            git
             lefthook
             gleam
+            nodejs_22
+            pnpm
             beam28Packages.erlang
             rebar3
             (python3.withPackages (ps: [ ps.jsonschema ]))

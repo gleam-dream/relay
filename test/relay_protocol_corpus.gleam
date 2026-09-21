@@ -1,10 +1,17 @@
+import gleam/bit_array
 import gleam/io
 import gleam/json
-import gleam/option.{Some}
+import gleam/option.{None, Some}
+import gleam/string
 import json/blueprint/codec
 import relay
+import relay/completion
+import relay/content
+import relay/prompts
 import relay/protocol/jsonrpc.{RequestString}
 import relay/protocol/v2026_07_28 as v2026
+import relay/resources
+import relay/server
 
 pub fn main() -> Nil {
   // 1. Tool setup
@@ -74,6 +81,164 @@ pub fn main() -> Nil {
     jsonrpc.error_to_json(Some(RequestString("unsupp-1")), unsupp_err)
     |> json.to_string()
   emit("unsupported_version", "UnsupportedProtocolVersionError", unsupp_wire)
+
+  // Service results below pass through server admission, dispatch and response
+  // encoding, so the gate checks the actual delivered wire shapes.
+  let assert Ok(empty_registry) = relay.registry([])
+  let resource =
+    resources.resource(
+      "memory://corpus/one",
+      "corpus resource",
+      fn(_context: Nil, uri) {
+        Ok([
+          content.TextResourceContents(uri, "resource body", Some("text/plain")),
+        ])
+      },
+    )
+  let template =
+    resources.resource_template(
+      "memory://corpus/{id}",
+      "corpus template",
+      fn(_context: Nil, uri) {
+        Ok([
+          content.TextResourceContents(uri, "template body", Some("text/plain")),
+        ])
+      },
+    )
+  let prompt =
+    prompts.prompt("welcome", [], fn(_context: Nil, _arguments) {
+      Ok(
+        prompts.PromptResult(None, [
+          prompts.PromptMessage(content.UserRole, content.text_content("hello")),
+        ]),
+      )
+    })
+  let completion =
+    completion.completion(fn(_context: Nil, _reference, argument) {
+      Ok(completion.CompletionValues([argument.value], Some(1), Some(False)))
+    })
+  let service_server =
+    server.server_with_services(
+      empty_registry,
+      [resource],
+      [template],
+      [prompt],
+      Some(completion),
+    )
+
+  let #(service_server, delivered) =
+    deliver(service_server, "resources/list", [])
+  emit_service(
+    "resources_list",
+    "ListResourcesResultResponse",
+    "ListResourcesResult",
+    delivered,
+  )
+  let #(service_server, delivered) =
+    deliver(service_server, "resources/templates/list", [])
+  emit_service(
+    "resource_templates_list",
+    "ListResourceTemplatesResultResponse",
+    "ListResourceTemplatesResult",
+    delivered,
+  )
+  let #(service_server, delivered) =
+    deliver(service_server, "resources/read", [
+      #("uri", json.string("memory://corpus/one")),
+    ])
+  emit_service(
+    "resource_read",
+    "ReadResourceResultResponse",
+    "ReadResourceResult",
+    delivered,
+  )
+  let #(service_server, delivered) = deliver(service_server, "prompts/list", [])
+  emit_service(
+    "prompts_list",
+    "ListPromptsResultResponse",
+    "ListPromptsResult",
+    delivered,
+  )
+  let #(service_server, delivered) =
+    deliver(service_server, "prompts/get", [
+      #("name", json.string("welcome")),
+      #("arguments", json.object([])),
+    ])
+  emit_service(
+    "prompt_get",
+    "GetPromptResultResponse",
+    "GetPromptResult",
+    delivered,
+  )
+  let #(_service_server, delivered) =
+    deliver(service_server, "completion/complete", [
+      #(
+        "ref",
+        json.object([
+          #("type", json.string("ref/prompt")),
+          #("name", json.string("welcome")),
+        ]),
+      ),
+      #(
+        "argument",
+        json.object([
+          #("name", json.string("name")),
+          #("value", json.string("a")),
+        ]),
+      ),
+    ])
+  emit_service(
+    "completion",
+    "CompleteResultResponse",
+    "CompleteResult",
+    delivered,
+  )
+}
+
+fn deliver(
+  server: server.Server(Nil),
+  method: String,
+  fields: List(#(String, json.Json)),
+) -> #(server.Server(Nil), String) {
+  let meta =
+    json.object([
+      #("io.modelcontextprotocol/protocolVersion", json.string("2026-07-28")),
+      #("io.modelcontextprotocol/clientCapabilities", json.object([])),
+    ])
+  let request =
+    json.object([
+      #("jsonrpc", json.string("2.0")),
+      #("id", json.int(1)),
+      #("method", json.string(method)),
+      #("params", json.object([#("_meta", meta), ..fields])),
+    ])
+  let #(server, effects) =
+    server.step(
+      server,
+      server.MessageReceived(
+        server.fresh_exchange(),
+        Nil,
+        request |> json.to_string |> bit_array.from_string,
+      ),
+    )
+  case effects {
+    [
+      server.EmitRequestAdmitted(_, _),
+      server.Write(_, bytes),
+      server.CloseExchange(_),
+    ] -> #(server, response_body(bytes))
+    [server.EmitRequestAdmitted(_, _), server.StartInvocation(invocation)] -> {
+      let #(server, effects) = server.step(server, server.perform(invocation))
+      let assert [server.Write(_, bytes), server.CloseExchange(_)] = effects
+      #(server, response_body(bytes))
+    }
+    _ -> panic as "service corpus request was not delivered"
+  }
+}
+
+fn response_body(bytes: BitArray) -> String {
+  let assert Ok(text) = bit_array.to_string(bytes)
+  string.drop_end(text, 1)
 }
 
 fn emit(label: String, definition: String, wire_json: String) -> Nil {
@@ -82,6 +247,25 @@ fn emit(label: String, definition: String, wire_json: String) -> Nil {
     <> json.to_string(json.string(label))
     <> ",\"definition\":"
     <> json.to_string(json.string(definition))
+    <> ",\"instance\":"
+    <> wire_json
+    <> "}"
+  io.println(line)
+}
+
+fn emit_service(
+  label: String,
+  definition: String,
+  result_definition: String,
+  wire_json: String,
+) -> Nil {
+  let line =
+    "{\"label\":"
+    <> json.to_string(json.string(label))
+    <> ",\"definition\":"
+    <> json.to_string(json.string(definition))
+    <> ",\"resultDefinition\":"
+    <> json.to_string(json.string(result_definition))
     <> ",\"instance\":"
     <> wire_json
     <> "}"

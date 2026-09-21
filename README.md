@@ -1,33 +1,20 @@
 # relay
 
-A strongly-typed, production-grade Model Context Protocol (MCP) implementation in Gleam.
+An MCP implementation in Gleam. Wave 2 source work is in progress and remains unaccepted. The five findings from the independent subset review are closed with regressions. The pinned official server HTTP requirements suite passes; this is not a claim of complete MCP conformance.
 
-## Current Status (Wave 1: MCP 2026-07-28 Typed Tools Server over Stdio)
+## Implemented surface
 
-Relay provides an authoritative, strongly-typed MCP `2026-07-28` tools server designed for local execution over standard input and output (`stdio`).
+- MCP `2026-07-28` discovery, tool listing/calls, resource and template listing/reading, prompt listing/get, and completion are handled by the sans-I/O server core. It validates per-request log-level metadata; it does not implement `logging/setLevel` or advertise log-message emission. Typed contextual tools use JSON Blueprint codecs. Tool replies support structured output, content-only output, text, image, audio, resource links, and embedded resources.
+- Local unprotected stdio uses newline-delimited JSON-RPC frames, bounded chunk reads, split UTF-8 handling, serialized stdout, and stderr diagnostics. The OTP runtime owns tool workers, timeouts, cancellation, terminal suppression, and Sinal observations. An asynchronous broken-stdout regression proves the transport stops while stdin is idle.
+- A thin Mist adapter accepts bounded POST requests, checks JSON and MCP headers, Host/Origin allow-lists and media negotiation, and returns JSON or live request-scoped SSE responses. SSE writes apply acknowledgement backpressure, bounded response size and duration, and disconnect cancellation. Cursor tokens are opaque, server-bound and family-scoped.
+- A Gun HTTP client supports revision discovery, checked raw JSON-RPC calls, paginated raw `tools/list` declarations, codec-typed tool calls, typed resource reads, prompt gets, and completion requests. Tool outcomes distinguish structured success, content-only success, tool failure, protocol failure, transport failure, and cancellation. Content decodes as typed text, image, audio, resource-link, and embedded-resource blocks, including annotations.
 
-### What Works Today
-
-- **Local Unprotected Stdio Tools Server**: Spawnable as an OS child process or run directly via `relay/transport/stdio.run_local_unprotected_stdio_server`. Communicates using newline-delimited (`\n` or `\r\n`) JSON-RPC 2.0 frames over `stdin` and `stdout`.
-- **Pure Sans-I/O Protocol Reducer**: `relay/server` implements deterministic state transitions and pure effects (`Write`, `StartInvocation`, `CancelInvocation`, `CloseExchange`, `Ignore`).
-- **Authoritative OTP Runtime Owner**: `relay/runtime` supervises handler processes, isolates handler crashes as sanitized internal errors, enforces invocation timeouts, cancels in-flight work on `notifications/cancelled`, and maintains bounded tombstones to prevent late/stale responses.
-- **Heterogeneous Typed Registry with Blueprint Schemas**: `relay.context_tool` preserves input, output, error codecs, and contextual handlers. Tools with unrelated native types safely coexist in a single registry. Input schemas enforce JSON Schema 2020-12 object-root contracts.
-- **Native Sinal Telemetry**: `relay/telemetry` emits structured `:telemetry` observations via `sinal` using package-owned trusted atoms and typed metadata groups (`frame_rejected`, `request_admitted`, `invocation_started`, `invocation_completed`, `invocation_cancelled`, `invocation_crashed`, `exchange_closed`).
-- **Chunk-Buffering Framer & Isolated Diagnostics**: Safely buffers partial frames, handles multi-byte UTF-8 split across OS read boundaries, bounds frame byte length, serializes stdout through a dedicated actor, and isolates all diagnostics and logging to `stderr`.
+The pinned `@modelcontextprotocol/conformance@0.2.0-alpha.10` server suite runs all 40 HTTP requirement scenarios against the local endpoint: 106 checks pass and 0 fail. One scenario emits no checks for this specification version, so the result does not establish full conformance. Resource subscriptions/listen, list-change notifications, dynamic catalogue updates and log-message emission remain outstanding. Multi-round tool and prompt input is supported with signed continuation state and capability filtering; resource-read continuation is rejected. The typed client has no stdio transport or subscription methods. TLS is implemented for Gun but has not been exercised against a local TLS peer.
 
 > [!WARNING]
-> **Local Unprotected Transport Notice**: The stdio transport is an explicitly local, unprotected process transport. It does not perform bearer token verification, TLS termination, or public network security. It must not be exposed to untrusted network environments.
+> **Unprotected transport:** the available stdio and HTTP entry points do not verify bearer tokens or enforce resource authorization. Bind them only to trusted local environments until protected routing is implemented.
 
-### What Remains Unimplemented (Deferred to Later Waves)
-
-The following components and protocol families are not implemented in Wave 1 and have deliberate public scaffolds with named `todo as "wave N: ..."` markers:
-
-- **Streamable HTTP & SSE Transport** (Wave 3): HTTP endpoints, Mist adapter, request headers (`MCP-Protocol-Version`, `Mcp-Method`), and HTTP disconnect cancellation.
-- **Official Frozen Conformance Harness Run** (Wave 3): The official `@modelcontextprotocol/conformance@0.2.0-alpha.10` test harness requires an HTTP URL endpoint.
-- **Resource-Server Authorization** (Wave 4): Bearer token verification, RFC 9728 OAuth 2.0 protected resource metadata, WWW-Authenticate challenges, JWT/JWKS verifiers, and protected HTTP routing.
-- **Typed MCP Client & Public Test-Kit** (Wave 5): Outbound client method/result pairs, raw checked calls, scripted peer, paired transport, and fake clock.
-- **Legacy Revision Support** (Wave 7): MCP `2025-11-25` revision wire codecs, handshake/initialize typestate, and older transport conventions.
-- **Additional Modern Server Families** (Wave 2): Resources, prompts, completion, pagination, subscriptions, progress notifications, and logging levels.
+Resource-server and client authorization, legacy `2025-11-25` compatibility, later protocol extensions, and the public scripted test kit remain later-wave work. Relay does not yet claim full MCP conformance or production readiness.
 
 ## Usage Example
 
@@ -65,8 +52,8 @@ pub fn main() {
 All tests, schema validations, negative compiler checks, and checksum verifications run deterministically via the dev shell:
 
 ```bash
-# 1. Full test suite (52 tests: unit, reducer, runtime, stdio, child process, Sinal telemetry, property, race)
-nix develop --command gleam test
+# 1. Full Erlang-targeted test suite
+nix develop --command gleam test --target erlang
 
 # 2. Negative compiler fixture check (asserts wrong handler/codec pairing fails at compile time)
 nix develop --command python3 scripts/check_negative_fixtures.py
@@ -75,9 +62,12 @@ nix develop --command python3 scripts/check_negative_fixtures.py
 nix develop --command python3 scripts/relay_schema_check.py
 
 # 4. Deterministic upstream schema & sibling dependency pin checksum verification
-./scripts/verify_checksums.sh
+nix develop --command ./scripts/verify_checksums.sh
 
 # 5. Full repository formatting and flake check
 nix develop --command gleam format --check src test
 nix flake check
+
+# 6. Pinned official Streamable HTTP server requirements
+./scripts/conformance/run-server-suite.sh
 ```

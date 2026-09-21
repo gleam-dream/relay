@@ -1,5 +1,6 @@
 import gleam/bit_array
 import gleam/dict
+import gleam/dynamic
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/json
@@ -10,6 +11,23 @@ import json/blueprint/codec
 import relay
 import relay/runtime.{RuntimeConfig}
 import relay/server
+import relay/telemetry
+import sinal
+
+type ProgressBurstNotice {
+  ProgressBurstFinished
+}
+
+type SinkGateMessage {
+  DecideToHold(process.Subject(Bool))
+  StopSinkGate(process.Subject(Nil))
+}
+
+@external(erlang, "erlang", "self")
+fn ffi_self() -> dynamic.Dynamic
+
+@external(erlang, "relay_ffi", "mailbox_size")
+fn ffi_mailbox_size(pid: dynamic.Dynamic) -> Int
 
 pub fn main() -> Nil {
   gleeunit.main()
@@ -36,7 +54,7 @@ fn sample_server() -> server.Server(String) {
       codec.string(),
       codec.object(codec.empty()),
       fn(_ctx: String, _user: String) {
-        panic as "Deliberate handler crash for testing"
+        panic as "Deliberate handler crash: secret-token-7B3F"
       },
     )
 
@@ -155,9 +173,44 @@ pub fn runtime_lifecycle_test() {
   runtime.stop(rt, 1000)
 }
 
+pub fn duplicate_exchange_does_not_consume_live_capacity_test() {
+  let config = RuntimeConfig(..runtime.default_config(), max_live_exchanges: 1)
+  let output = process.new_subject()
+  let assert Ok(rt) =
+    runtime.start(sample_server(), config, fn(bytes) {
+      process.send(output, bytes)
+    })
+  let duplicate = server.fresh_exchange()
+  let request = make_discover_frame("duplicate")
+
+  let assert Ok(Nil) = runtime.send_frame(rt, duplicate, "ctx", request, 1000)
+  let assert Ok(_) = process.receive(output, 1000)
+  let assert Ok(Nil) = runtime.send_frame(rt, duplicate, "ctx", request, 1000)
+  let assert Ok(Nil) =
+    runtime.send_frame(
+      rt,
+      server.fresh_exchange(),
+      "ctx",
+      make_discover_frame("fresh"),
+      1000,
+    )
+
+  runtime.stop(rt, 1000)
+}
+
 pub fn runtime_crash_isolation_test() {
   let s = sample_server()
   let sink_subj = process.new_subject()
+  let crash_subj = process.new_subject()
+  let assert Ok(crash_hid) = sinal.handler_id("runtime_crash_redaction")
+  let crash_event = telemetry.invocation_crashed_event()
+  let crash_handler =
+    sinal.handler(fn(_ev, _meas, meta: telemetry.InvocationCrashedMeta) {
+      process.send(crash_subj, meta)
+      Ok(Nil)
+    })
+  let assert Ok(crash_attachment) =
+    sinal.attach(crash_hid, crash_event, crash_handler, fn(_, _) { Nil })
   let config = runtime.default_config()
 
   let assert Ok(rt) =
@@ -185,6 +238,10 @@ pub fn runtime_crash_isolation_test() {
   let assert Ok(code_dyn) = dict.get(err_dict, "code")
   let assert Ok(code) = decode.run(code_dyn, decode.int)
   code |> should.equal(-32_603)
+  let assert Ok(crash_meta) = process.receive(crash_subj, 1000)
+  crash_meta.reason |> should.equal("handler crashed (redacted)")
+  string.contains(crash_meta.reason, "secret-token-7B3F")
+  |> should.equal(False)
 
   // Verify owner is still alive and responds to normal requests
   let ex_alive = server.fresh_exchange()
@@ -204,6 +261,37 @@ pub fn runtime_crash_isolation_test() {
   let assert Ok(_) = dict.get(dict_alive, "result")
 
   runtime.stop(rt, 1000)
+  let assert Ok(Nil) = sinal.detach(crash_attachment)
+}
+
+pub fn request_admitted_runtime_observation_test() {
+  let event_subj = process.new_subject()
+  let assert Ok(hid) = sinal.handler_id("runtime_request_admitted")
+  let ev = telemetry.request_admitted_event()
+  let handler =
+    sinal.handler(fn(_ev, _meas, meta: telemetry.RequestAdmittedMeta) {
+      process.send(event_subj, meta)
+      Ok(Nil)
+    })
+  let assert Ok(att) = sinal.attach(hid, ev, handler, fn(_, _) { Nil })
+  let assert Ok(rt) =
+    runtime.start(sample_server(), runtime.default_config(), fn(_bytes) { Nil })
+  let exchange = server.fresh_exchange()
+
+  let assert Ok(Nil) =
+    runtime.send_frame(
+      rt,
+      exchange,
+      "ctx",
+      make_discover_frame("admitted"),
+      1000,
+    )
+  let assert Ok(meta) = process.receive(event_subj, 1000)
+  meta.exchange_id |> should.equal(server.exchange_id_to_int(exchange))
+  meta.method |> should.equal("server/discover")
+
+  runtime.stop(rt, 1000)
+  let assert Ok(Nil) = sinal.detach(att)
 }
 
 pub fn runtime_timeout_test() {
@@ -376,4 +464,134 @@ pub fn runtime_repeated_close_test() {
   res |> should.equal(Error(runtime.RuntimeStopped))
 
   runtime.stop(rt, 1000)
+}
+
+pub fn runtime_progress_backpressure_bounds_mailbox_test() {
+  let notices = process.new_subject()
+  let observations = process.new_subject()
+  let gate = start_sink_gate()
+  let assert Ok(name) = relay.tool_name("progress_burst")
+  let assert Ok(tool) =
+    relay.context_tool_with_progress(
+      name,
+      relay.empty_metadata(),
+      codec.object(codec.empty()),
+      codec.object(codec.empty()),
+      codec.object(codec.empty()),
+      fn(notices, _input, report_progress) {
+        report_progress_burst(report_progress, 1, 128)
+        process.send(notices, ProgressBurstFinished)
+        Ok(Nil)
+      },
+    )
+  let assert Ok(registry) = relay.registry([tool])
+  let config =
+    RuntimeConfig(..runtime.default_config(), invocation_timeout_ms: 5000)
+  let assert Ok(rt) =
+    runtime.start(server.server(registry), config, fn(_bytes) {
+      let hold = process.call_forever(gate, fn(reply) { DecideToHold(reply) })
+      case hold {
+        False -> Nil
+        True -> {
+          // Keep the writer parked while the producer has a chance to offer
+          // the rest of its burst, then inspect the runtime owner's mailbox.
+          process.sleep(100)
+          let queued = ffi_mailbox_size(ffi_self())
+          let release = process.new_subject()
+          process.send(observations, #(queued, release))
+          let _ = process.receive(release, 5000)
+          Nil
+        }
+      }
+    })
+  let exchange = server.fresh_exchange()
+  let assert Ok(Nil) =
+    runtime.send_frame(
+      rt,
+      exchange,
+      notices,
+      progress_call_frame("progress-burst"),
+      1000,
+    )
+  let assert Ok(#(queued, release)) = process.receive(observations, 3000)
+  process.send(release, Nil)
+  let assert Ok(ProgressBurstFinished) = process.receive(notices, 5000)
+  runtime.stop(rt, 1000)
+  stop_sink_gate(gate)
+  should.be_true(queued <= 1)
+}
+
+fn progress_call_frame(id: String) -> BitArray {
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("id", json.string(id)),
+    #("method", json.string("tools/call")),
+    #(
+      "params",
+      json.object([
+        #("name", json.string("progress_burst")),
+        #("arguments", json.object([])),
+        #(
+          "_meta",
+          json.object([
+            #(
+              "io.modelcontextprotocol/protocolVersion",
+              json.string("2026-07-28"),
+            ),
+            #("io.modelcontextprotocol/clientCapabilities", json.object([])),
+            #("progressToken", json.int(1)),
+          ]),
+        ),
+      ]),
+    ),
+  ])
+  |> json.to_string()
+  |> bit_array.from_string()
+}
+
+fn report_progress_burst(
+  report_progress: fn(Int) -> Nil,
+  current: Int,
+  last: Int,
+) -> Nil {
+  case current > last {
+    True -> Nil
+    False -> {
+      report_progress(current)
+      report_progress_burst(report_progress, current + 1, last)
+    }
+  }
+}
+
+fn start_sink_gate() -> process.Subject(SinkGateMessage) {
+  let ready = process.new_subject()
+  let _pid =
+    process.spawn_unlinked(fn() {
+      let subject = process.new_subject()
+      process.send(ready, subject)
+      sink_gate_loop(subject, True)
+    })
+  let assert Ok(subject) = process.receive(ready, 1000)
+  subject
+}
+
+fn sink_gate_loop(
+  subject: process.Subject(SinkGateMessage),
+  first: Bool,
+) -> Nil {
+  case process.receive(subject, 10_000) {
+    Error(_) -> Nil
+    Ok(DecideToHold(reply)) -> {
+      process.send(reply, first)
+      sink_gate_loop(subject, False)
+    }
+    Ok(StopSinkGate(reply)) -> process.send(reply, Nil)
+  }
+}
+
+fn stop_sink_gate(gate: process.Subject(SinkGateMessage)) -> Nil {
+  let reply = process.new_subject()
+  process.send(gate, StopSinkGate(reply))
+  let _ = process.receive(reply, 1000)
+  Nil
 }

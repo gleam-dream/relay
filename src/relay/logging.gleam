@@ -1,17 +1,56 @@
-/// Logging level configuration.
+/// A protocol logging threshold supplied in request metadata.
 pub type LogLevel {
   Debug
   Info
   Notice
   Warning
-  Error
+  ErrorLevel
   Critical
   Alert
   Emergency
 }
 
-/// Sets the logging level.
-/// Deferred to Wave 2: Complete modern server core.
-pub fn set_level(_level: LogLevel) -> Nil {
-  todo as "wave 2: Complete modern server core"
+/// Returns whether a message meets the configured threshold.
+pub fn permits(threshold: LogLevel, message: LogLevel) -> Bool {
+  severity(message) >= severity(threshold)
+}
+
+pub fn level_name(level: LogLevel) -> String {
+  case level {
+    Debug -> "debug"
+    Info -> "info"
+    Notice -> "notice"
+    Warning -> "warning"
+    ErrorLevel -> "error"
+    Critical -> "critical"
+    Alert -> "alert"
+    Emergency -> "emergency"
+  }
+}
+
+pub fn parse_level(raw: String) -> Result(LogLevel, Nil) {
+  case raw {
+    "debug" -> Ok(Debug)
+    "info" -> Ok(Info)
+    "notice" -> Ok(Notice)
+    "warning" -> Ok(Warning)
+    "error" -> Ok(ErrorLevel)
+    "critical" -> Ok(Critical)
+    "alert" -> Ok(Alert)
+    "emergency" -> Ok(Emergency)
+    _ -> Error(Nil)
+  }
+}
+
+fn severity(level: LogLevel) -> Int {
+  case level {
+    Debug -> 0
+    Info -> 1
+    Notice -> 2
+    Warning -> 3
+    ErrorLevel -> 4
+    Critical -> 5
+    Alert -> 6
+    Emergency -> 7
+  }
 }

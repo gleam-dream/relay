@@ -1,7 +1,13 @@
+import gleam/erlang/process
+import gleam/string
 import json/blueprint/codec
 import relay
+import relay/runtime.{RuntimeConfig}
 import relay/server
 import relay/transport/stdio
+
+@external(erlang, "erlang", "halt")
+fn ffi_halt(status: Int) -> Nil
 
 pub fn main() -> Nil {
   let assert Ok(greet_name) = relay.tool_name("greet")
@@ -26,13 +32,44 @@ pub fn main() -> Nil {
       fn(_ctx: String, msg: String) { Error("application error: " <> msg) },
     )
 
-  let assert Ok(reg) = relay.registry([greet_tool, fail_tool])
+  let assert Ok(slow_name) = relay.tool_name("slow")
+  let assert Ok(slow_tool) =
+    relay.context_tool(
+      slow_name,
+      relay.tool_metadata("Delays its response"),
+      codec.field("ms", codec.int()),
+      codec.string(),
+      codec.object(codec.empty()),
+      fn(_ctx: String, delay_ms: Int) {
+        process.sleep(delay_ms)
+        Ok("slow response")
+      },
+    )
+
+  let assert Ok(reg) = relay.registry([greet_tool, fail_tool, slow_tool])
   let s = server.server(reg)
-  let config = stdio.default_stdio_config()
+  let runtime_config =
+    RuntimeConfig(
+      max_live_exchanges: 100,
+      max_frame_bytes: 1024,
+      invocation_timeout_ms: 30_000,
+      tombstone_retention_ms: 60_000,
+    )
+  let config =
+    stdio.LocalUnprotectedStdioConfig(
+      chunk_size: 1,
+      runtime_config: runtime_config,
+    )
 
   // Diagnostic written to isolated stderr
   stdio.log_stderr("Child stdio server starting")
 
-  let _ = stdio.run_local_unprotected_stdio_server(s, config, "child-server")
+  case stdio.run_local_unprotected_stdio_server(s, config, "child-server") {
+    Ok(Nil) -> ffi_halt(0)
+    Error(err) -> {
+      stdio.log_stderr("Child server failed: " <> string.inspect(err))
+      ffi_halt(1)
+    }
+  }
   Nil
 }

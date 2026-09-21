@@ -6,7 +6,6 @@ import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import relay/server.{type ExchangeId, type InvocationId, type Server}
 import relay/telemetry
-import relay/tool
 
 pub type RuntimeConfig {
   RuntimeConfig(
@@ -44,6 +43,12 @@ pub type RuntimeMessage(context) {
     exchange_id: ExchangeId,
     outcome: server.InvocationOutcome,
   )
+  WorkerProgress(
+    invocation_id: InvocationId,
+    exchange_id: ExchangeId,
+    value: Int,
+    reply: Subject(Nil),
+  )
   WorkerCrashed(
     invocation_id: InvocationId,
     exchange_id: ExchangeId,
@@ -71,7 +76,7 @@ type RuntimeState(context) {
   RuntimeState(
     config: RuntimeConfig,
     server: Server(context),
-    write_sink: fn(BitArray) -> Nil,
+    write_sink: fn(BitArray) -> Result(Nil, Nil),
     workers: List(WorkerHandle),
     tombstones: List(InvocationId),
     live_exchanges: Int,
@@ -95,6 +100,19 @@ pub fn start(
   server: Server(context),
   config: RuntimeConfig,
   write_sink: fn(BitArray) -> Nil,
+) -> Result(Runtime(context), actor.StartError) {
+  start_with_status_sink(server, config, fn(bytes) {
+    write_sink(bytes)
+    Ok(Nil)
+  })
+}
+
+/// Starts the runtime with a writer that can report transport failure.
+/// Returning `Error(Nil)` closes the runtime and cancels active invocations.
+pub fn start_with_status_sink(
+  server: Server(context),
+  config: RuntimeConfig,
+  write_sink: fn(BitArray) -> Result(Nil, Nil),
 ) -> Result(Runtime(context), actor.StartError) {
   let builder =
     actor.new_with_initialiser(5000, fn(self_subject) {
@@ -180,45 +198,59 @@ fn handle_message(
               actor.continue(state)
             }
             False -> {
-              case state.live_exchanges >= state.config.max_live_exchanges {
+              case server.exchange_is_known(state.server, exchange) {
                 True -> {
-                  telemetry.emit_frame_rejected(
-                    server.exchange_id_to_int(exchange),
-                    "live exchanges exceed configured limit",
-                  )
-                  process.send(
-                    reply,
-                    Error(TooManyLiveExchanges(
-                      state.live_exchanges,
-                      state.config.max_live_exchanges,
-                    )),
-                  )
+                  process.send(reply, Ok(Nil))
                   actor.continue(state)
                 }
                 False -> {
-                  process.send(reply, Ok(Nil))
-                  let st_inc =
-                    RuntimeState(
-                      ..state,
-                      live_exchanges: state.live_exchanges + 1,
-                    )
-                  let #(next_server, effects) =
-                    server.step(
-                      st_inc.server,
-                      server.MessageReceived(exchange, context, bytes),
-                    )
-                  let next_st =
-                    interpret_effects(
-                      RuntimeState(..st_inc, server: next_server),
-                      effects,
-                    )
-                  actor.continue(next_st)
+                  case state.live_exchanges >= state.config.max_live_exchanges {
+                    True -> {
+                      telemetry.emit_frame_rejected(
+                        server.exchange_id_to_int(exchange),
+                        "live exchanges exceed configured limit",
+                      )
+                      process.send(
+                        reply,
+                        Error(TooManyLiveExchanges(
+                          state.live_exchanges,
+                          state.config.max_live_exchanges,
+                        )),
+                      )
+                      actor.continue(state)
+                    }
+                    False -> {
+                      let st_inc =
+                        RuntimeState(
+                          ..state,
+                          live_exchanges: state.live_exchanges + 1,
+                        )
+                      let #(next_server, effects) =
+                        server.step(
+                          st_inc.server,
+                          server.MessageReceived(exchange, context, bytes),
+                        )
+                      let next_st =
+                        interpret_effects(
+                          RuntimeState(..st_inc, server: next_server),
+                          effects,
+                        )
+                      process.send(reply, Ok(Nil))
+                      actor.continue(next_st)
+                    }
+                  }
                 }
               }
             }
           }
         }
       }
+    }
+
+    WorkerProgress(inv_id, ex_id, value, reply) -> {
+      let next_st = handle_worker_progress(state, inv_id, ex_id, value)
+      process.send(reply, Nil)
+      actor.continue(next_st)
     }
 
     WorkerFinished(inv_id, ex_id, outcome) -> {
@@ -266,8 +298,10 @@ fn interpret_effects(
   list.fold(effects, state, fn(st, eff) {
     case eff {
       server.Write(_ex, bytes) -> {
-        st.write_sink(bytes)
-        st
+        case st.write_sink(bytes) {
+          Ok(Nil) -> st
+          Error(Nil) -> handle_close(st)
+        }
       }
       server.StartInvocation(inv) -> {
         start_invocation(st, inv)
@@ -282,6 +316,13 @@ fn interpret_effects(
       server.SendProgress(_ex, _token, _val) -> {
         st
       }
+      server.EmitRequestAdmitted(ex_id, method) -> {
+        telemetry.emit_request_admitted(
+          server.exchange_id_to_int(ex_id),
+          method,
+        )
+        st
+      }
       server.Ignore(_) -> st
     }
   })
@@ -293,20 +334,28 @@ fn start_invocation(
 ) -> RuntimeState(context) {
   let inv_id = server.invocation_id(inv)
   let ex_id = server.invocation_exchange(inv)
-  case list.contains(state.tombstones, inv_id) {
-    True -> state
-    False ->
+  case state.is_closed, list.contains(state.tombstones, inv_id) {
+    True, _ | False, True -> state
+    False, False ->
       case find_worker(state.workers, inv_id) {
         Some(_) -> state
         None -> {
           let now = ffi_monotonic_time_ms()
           let inv_id_int = server.invocation_id_to_int(inv_id)
           let ex_id_int = server.exchange_id_to_int(ex_id)
-          let tool_name =
-            tool.tool_name_to_string(server.invocation_tool_name(inv))
-          telemetry.emit_invocation_started(ex_id_int, inv_id_int, tool_name)
+          telemetry.emit_invocation_started(
+            ex_id_int,
+            inv_id_int,
+            server.invocation_method(inv),
+          )
 
           let self_subj = state.self_subject
+          let inv =
+            server.invocation_with_progress(inv, fn(value) {
+              process.call_forever(self_subj, fn(reply) {
+                WorkerProgress(inv_id, ex_id, value, reply)
+              })
+            })
           let timer =
             process.send_after(
               self_subj,
@@ -375,6 +424,25 @@ fn cancel_invocation(
   }
 }
 
+fn handle_worker_progress(
+  state: RuntimeState(context),
+  inv_id: server.InvocationId,
+  _ex_id: server.ExchangeId,
+  value: Int,
+) -> RuntimeState(context) {
+  case
+    list.contains(state.tombstones, inv_id),
+    find_worker(state.workers, inv_id)
+  {
+    True, _ | _, None -> state
+    False, Some(_) -> {
+      let #(next_server, effects) =
+        server.step(state.server, server.InvocationProgress(inv_id, value))
+      interpret_effects(RuntimeState(..state, server: next_server), effects)
+    }
+  }
+}
+
 fn handle_worker_finished(
   state: RuntimeState(context),
   inv_id: server.InvocationId,
@@ -393,6 +461,8 @@ fn handle_worker_finished(
           let duration = int.max(0, now - handle.started_at)
           let status_str = case outcome {
             server.OutcomeSuccess(_) -> "success"
+            server.OutcomeContentSuccess(_) -> "success"
+            server.OutcomeStructuredContentSuccess(_, _) -> "success"
             _ -> "error"
           }
           telemetry.emit_invocation_completed(

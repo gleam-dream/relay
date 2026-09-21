@@ -6,8 +6,8 @@ import json/blueprint/codec
 import relay
 import relay/protocol/jsonrpc.{RequestInteger, RequestString}
 import relay/server.{
-  CloseExchange, ExchangeClosed, InvocationFinished, MessageReceived,
-  OutcomeSuccess, StartInvocation, Write,
+  CloseExchange, EmitRequestAdmitted, ExchangeClosed, InvocationFinished,
+  MessageReceived, OutcomeSuccess, StartInvocation, Write,
 }
 
 pub fn main() -> Nil {
@@ -70,7 +70,9 @@ pub fn reducer_determinism_property_test() {
   let #(s_b1, eff_b1) = server.step(s_b, in1)
 
   case eff_a1, eff_b1 {
-    [StartInvocation(inv_a)], [StartInvocation(inv_b)] -> {
+    [EmitRequestAdmitted(_, _), StartInvocation(inv_a)],
+      [EmitRequestAdmitted(_, _), StartInvocation(inv_b)]
+    -> {
       server.invocation_exchange(inv_a)
       |> should.equal(server.invocation_exchange(inv_b))
       let fin_a = server.perform(inv_a)
@@ -95,7 +97,7 @@ pub fn exactly_one_terminal_response_property_test() {
   let #(s1, eff1) = server.step(s0, MessageReceived(ex, "ctx", frame))
 
   case eff1 {
-    [StartInvocation(inv)] -> {
+    [EmitRequestAdmitted(_, _), StartInvocation(inv)] -> {
       let inv_id = server.invocation_id(inv)
       let fin_input =
         InvocationFinished(
@@ -177,7 +179,11 @@ pub fn no_invocation_before_admission_property_test() {
 
   let #(_s2, eff2) = server.step(s0, MessageReceived(ex, "ctx", disc_frame))
   case eff2 {
-    [Write(w_ex, _), CloseExchange(c_ex)] -> {
+    [
+      EmitRequestAdmitted(_, "server/discover"),
+      Write(w_ex, _),
+      CloseExchange(c_ex),
+    ] -> {
       w_ex |> should.equal(ex)
       c_ex |> should.equal(ex)
     }

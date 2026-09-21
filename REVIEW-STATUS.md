@@ -1,47 +1,37 @@
-# Relay Wave 1 implementation review
+# Relay Wave 2 final focused review
 
 ## Verdict
 
-- **FAIL — Wave 1 is not accepted.** The staged implementation at Relay baseline `75ce50dd1ba180c382c239901ee8e0b8508070a3` does not satisfy the frozen work order. A checkpoint commit may preserve the work, but it must not represent acceptance.
+- **PASS — the final residual finding is accepted for the delivered local HTTP subset.** Handler progress is now backpressured through the runtime owner and transport writer, the runtime mailbox remains bounded under a held writer, and an SSE delivery failure closes the runtime and kills its active workers. The broker records the first failure, so a dead SSE actor cannot impose one timeout per queued progress frame.
+- This is not full Wave 2 or full-package acceptance. The deferred rows in `WAVE-2-REPORT.md` remain unfinished, including subscription routing and notifications, dynamic registry changes, logging emission, full typed client and stdio client coverage, local TLS evidence, broader process-cleanup evidence, authorization, legacy compatibility, interoperability fixtures, and the public test kit.
+- The target is the dirty Relay working tree against checkpoint `ce718db`. This review is intentionally limited to the single HIGH finding retained by `relay-wave2-rereview.md` and direct cancellation/timeout regressions from its repair.
 
-## Adherence
+## Residual finding verification
 
-- **HIGH · Exact Blueprint numbers are not preserved.** The design requires ordinary envelopes to use `gleam_json` while preserving exact Blueprint values, and the work order says to stop on a numeric boundary collision. Inbound tool arguments are parsed into `Dynamic`, re-encoded by Erlang `json:encode`, and reparsed by Blueprint ([`src/relay/protocol/v2026_07_28.gleam:336`](/code/gleam-dream/relay/src/relay/protocol/v2026_07_28.gleam:336), [`src/relay_ffi.erl:25`](/code/gleam-dream/relay/src/relay_ffi.erl:25)); outbound non-integer numbers are converted to `Float`, or emitted as a JSON string when exact float conversion fails ([`src/relay/protocol/v2026_07_28.gleam:519`](/code/gleam-dream/relay/src/relay/protocol/v2026_07_28.gleam:519)). This can change a declared JSON number into a string and can lose decimal precision before handler decoding. Proposed `(in-place-fix, now)`.
+No blocking finding remains in the reviewed path.
 
-- **HIGH · The authoritative stdio boundary is line-buffered rather than incrementally read.** `read_stdin/1` ignores `ChunkSize` and calls `io:get_line` ([`src/relay_ffi.erl:51`](/code/gleam-dream/relay/src/relay_ffi.erl:51)). The pure framer can accept split chunks, but the real process boundary cannot produce them, so the README claim that partial UTF-8 is handled across OS read boundaries is unsupported. Proposed `(in-place-fix, now)`.
+The handler's progress callback now uses a synchronous call to the runtime owner. The owner does not acknowledge the callback until it has reduced the progress event and completed the status writer. A producer therefore cannot enqueue its full burst independently of the socket. The regression holds the writer during a 128-value burst, measures the runtime owner's actual mailbox, and requires at most one queued message before releasing the writer.
 
-- **HIGH · Request-admitted telemetry exists only as a callable helper.** The runtime emits frame, invocation, and close observations, but no accepted request path calls `emit_request_admitted`; repository search finds calls only in the telemetry unit test. The design requires Sinal to observe committed Relay facts, and acceptance criterion 9 requires real lifecycle observation after transitions. Proposed `(in-place-fix, now)`.
+The live HTTP runtime now uses a status-returning writer. A rejected or timed-out broker delivery returns `Error`, and the runtime immediately closes its state and kills every active worker. The broker marks itself failed on an absent actor, response-limit failure, actor write failure, or actor acknowledgement timeout; later deliveries reject without another actor wait. The loopback regression resets the real TCP peer after receiving the first SSE data event during a 100,000-value producer burst, observes the worker PID terminate within one second, and proves the producer never finishes the burst.
 
-## Spec
+One in-flight writer call may still occupy the configured request timeout. That is the deliberate delivery bound, not an unbounded progress backlog: only one producer call is admitted through that boundary, the outer runtime delivery returns failure at the same bound, and close/stop or invocation-timeout messages then run without a queue of progress frames ahead of them. The source contains no cyclic wait among the worker, runtime, broker, and SSE actor. The worker waits only for the runtime; the runtime and broker each use bounded transport receives; the actor returns the write result; and any failure closes the runtime. I found no cancellation/timeout deadlock introduced by the synchronous progress repair within the claimed local HTTP subset.
 
-- **HIGH · Missing output schemas are silently admitted.** `context_tool` converts any output `codec.schema` failure to `None` and returns a usable tool ([`src/relay/tool.gleam:189`](/code/gleam-dream/relay/src/relay/tool.gleam:189)). The work order requires the actual output schema to be retained and unavailable schemas to produce a typed refusal before a handler can run. No unavailable-schema, unsupported-feature, invalid-output, or error-encoding-failure acceptance test exists. Proposed `(in-place-fix, now)`.
+## Regression quality
 
-- **HIGH · Broken stdout cannot terminate the transport explicitly.** The stdio adapter discards `write_bytes` failures in the runtime sink ([`src/relay/transport/stdio.gleam:207`](/code/gleam-dream/relay/src/relay/transport/stdio.gleam:207)) and again for refusal responses ([`src/relay/transport/stdio.gleam:280`](/code/gleam-dream/relay/src/relay/transport/stdio.gleam:280)). `run_local_unprotected_stdio_server` can therefore return success after losing a protocol response, contrary to the required explicit broken-stdout terminal outcome. Proposed `(in-place-fix, now)`.
+- `runtime_progress_backpressure_bounds_mailbox_test` directly measures the runtime owner rather than inferring backpressure from successful writes. Its held writer makes the producer attempt the remaining burst while only one progress call can be outstanding.
+- `live_sse_progress_burst_disconnect_cancels_worker_test` uses a real loopback socket and reset, captures the real worker PID, and checks both prompt exit and incomplete production. It exercises live SSE delivery failure during sustained producer pressure.
+- The full test suite passed twice independently, so both timing-sensitive regressions held on repeated runs.
 
-- **HIGH · Required process and race evidence is absent.** The sole child-process test sends four complete newline-terminated frames ([`test/relay/stdio_test.gleam:153`](/code/gleam-dream/relay/test/relay/stdio_test.gleam:153)); partial UTF-8, partial reads, multiple frames in one OS chunk, configured maximum frame, EOF shutdown, broken child/owner, crash, and timeout are only unit/runtime cases or absent. Race cases execute once, depend on sleeps (for example [`test/relay/race_test.gleam:163`](/code/gleam-dream/relay/test/relay/race_test.gleam:163)), and do not assert process or mailbox cleanup. This fails acceptance criteria 7 and 8. Proposed `(in-place-fix, now)`.
+## Independent evidence
 
-- **MEDIUM · Optional request metadata is not validated to the final schema.** `parse_metadata` validates the protocol version and that client capabilities is an object, then ignores `io.modelcontextprotocol/clientInfo`; an invalid present client-info value is accepted despite the final `Implementation` schema requiring string `name` and `version` ([`src/relay/protocol/v2026_07_28.gleam:185`](/code/gleam-dream/relay/src/relay/protocol/v2026_07_28.gleam:185)). An invalid present progress token is also treated as absent ([`src/relay/protocol/v2026_07_28.gleam:239`](/code/gleam-dream/relay/src/relay/protocol/v2026_07_28.gleam:239)). Proposed `(in-place-fix, now)`.
+- `nix develop --command gleam test --target erlang` passed twice: **88 passed, 0 failed** on each run.
+- `scripts/conformance/run-server-suite.sh` passed: **40 scenarios, 106 checks passed, 0 failed**. `input-required-result-missing-input-response` emitted **0 checks**, so this is 106 emitted checks rather than 40 independently asserted scenario passes.
+- `nix develop --command gleam format --check src test` passed.
+- `nix develop --command gleam check --target erlang` passed with the already-recorded unused-constructor and deferred authorization/test-kit TODO warnings.
+- `git diff --check ce718db` passed.
 
-- **MEDIUM · Crash observations can disclose handler data.** The FFI formats the raw caught reason ([`src/relay_ffi.erl:38`](/code/gleam-dream/relay/src/relay_ffi.erl:38)); runtime forwards it to Sinal ([`src/relay/runtime.gleam:431`](/code/gleam-dream/relay/src/relay/runtime.gleam:431)); the public descriptor records it as free text ([`src/relay/telemetry.gleam:166`](/code/gleam-dream/relay/src/relay/telemetry.gleam:166)). A handler panic containing an argument or credential would violate the required observation redaction. Proposed `(in-place-fix, now)`.
+## Acceptance boundary
 
-## Standards
+Accepted: the previously rejected claim for worker-driven progress, response backpressure, live SSE delivery failure, and disconnect cancellation in the delivered local HTTP subset. The producer boundary is synchronous, the observed owner mailbox is bounded, transport failure reaches the runtime, active workers are killed, and the failed broker does not repeat dead-actor waits.
 
-- **HIGH · The required test gate fails in the declared dev shell.** Independent execution of `nix develop --command gleam test` produced `50 passed, 2 failures`: both sibling provenance tests received `error: tool 'git' not found`. The tests invoke `git` through `os:cmd`, while the dev shell package list omits Git ([`flake.nix:35`](/code/gleam-dream/relay/flake.nix:35)). This contradicts `WAVE-1-REPORT.md`'s 52/52 result and fails the work-order gate. Proposed `(in-place-fix, now)`.
-
-## Craft
-
-- **MEDIUM · Transport setup uses assertions and loses typed startup failure.** Writer and runtime startup are destructured with `let assert` inside a function returning `Result(Nil, StdioError)` ([`src/relay/transport/stdio.gleam:199`](/code/gleam-dream/relay/src/relay/transport/stdio.gleam:199), [`src/relay/transport/stdio.gleam:212`](/code/gleam-dream/relay/src/relay/transport/stdio.gleam:212)). A startup failure crashes instead of producing an explicit terminal outcome. Proposed `(in-place-fix, now)`.
-
-## Independent checks
-
-- **PASS:** `nix develop --command gleam check` completed with deferred-TODO and unused-constructor warnings.
-- **FAIL:** `nix develop --command gleam test` — 50 passed, 2 failed because Git is unavailable inside the dev shell.
-- **PASS:** `nix develop --command python3 scripts/relay_schema_check.py` — 5 corpus messages and 14 mutation negatives. This validates only the five authored corpus values, not every runtime error or numeric boundary.
-- **PASS:** `nix develop --command python3 scripts/check_negative_fixtures.py` — one negative fixture rejected.
-- **PASS:** `./scripts/verify_checksums.sh` — schema checksum and sibling heads/versions matched when run outside the dev shell.
-- **PASS:** `nix develop --command gleam format --check src test`.
-- **PASS:** `nix flake check` for the current host; incompatible systems were omitted.
-
-## Routing
-
-- Proposed routes: ten `(in-place-fix, now)` findings. Frontdesk may route them after the checkpoint if desired.
+Not accepted: complete Wave 2, complete MCP coverage, or release readiness. The partial status and deferred ownership recorded in `WAVE-2-REPORT.md` remain authoritative. The passing conformance result covers every emitted check in the pinned server HTTP suite; it does not fill the zero-check scenario or establish the deferred client, stdio, TLS, authorization, compatibility, interoperability, soak, fuzz, matrix, or test-kit scope.

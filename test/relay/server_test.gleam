@@ -6,8 +6,8 @@ import gleeunit/should
 import json/blueprint/codec
 import relay
 import relay/server.{
-  type Server, CancelInvocation, CloseExchange, MessageReceived, StartInvocation,
-  Write,
+  type Server, CancelInvocation, CloseExchange, EmitRequestAdmitted,
+  MessageReceived, StartInvocation, Write,
 }
 
 pub fn main() -> Nil {
@@ -60,7 +60,11 @@ pub fn discovery_step_test() {
     server.step(s, MessageReceived(exchange: ex, context: "ctx", bytes: raw))
 
   case effects {
-    [Write(target_ex, out_bytes), CloseExchange(closed_ex)] -> {
+    [
+      EmitRequestAdmitted(_, "server/discover"),
+      Write(target_ex, out_bytes),
+      CloseExchange(closed_ex),
+    ] -> {
       target_ex |> should.equal(ex)
       closed_ex |> should.equal(ex)
       let assert Ok(out_str) = bit_array.to_string(out_bytes)
@@ -103,7 +107,11 @@ pub fn tools_list_step_test() {
     server.step(s, MessageReceived(exchange: ex, context: "ctx", bytes: raw))
 
   case effects {
-    [Write(target_ex, _), CloseExchange(closed_ex)] -> {
+    [
+      EmitRequestAdmitted(_, "tools/list"),
+      Write(target_ex, _),
+      CloseExchange(closed_ex),
+    ] -> {
       target_ex |> should.equal(ex)
       closed_ex |> should.equal(ex)
     }
@@ -147,7 +155,7 @@ pub fn tools_call_lifecycle_test() {
     )
 
   case effects1 {
-    [StartInvocation(inv)] -> {
+    [EmitRequestAdmitted(_, "tools/call"), StartInvocation(inv)] -> {
       server.invocation_exchange(inv) |> should.equal(ex)
       let _inv_id = server.invocation_id(inv)
 
@@ -210,7 +218,8 @@ pub fn client_cancellation_test() {
       MessageReceived(exchange: ex, context: "ctx", bytes: raw_call),
     )
 
-  let assert [StartInvocation(inv)] = effects1
+  let assert [EmitRequestAdmitted(_, "tools/call"), StartInvocation(inv)] =
+    effects1
   let inv_id = server.invocation_id(inv)
 
   // Now send cancellation notification

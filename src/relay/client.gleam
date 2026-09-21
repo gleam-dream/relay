@@ -1,32 +1,1039 @@
-import json/blueprint/codec.{type Codec}
-import json/blueprint/value.{type Value}
-import relay/protocol/jsonrpc.{type RequestId}
+import gleam/bit_array
+import gleam/dict.{type Dict}
+import gleam/dynamic.{type Dynamic}
+import gleam/dynamic/decode as dyn_decode
+import gleam/erlang/process
+import gleam/int
+import gleam/json
+import gleam/list
+import gleam/option.{type Option, None, Some}
+import gleam/result
+import gleam/string
+import json/blueprint/codec.{type Codec, decode, encode}
+import json/blueprint/migration as blueprint_migration
+import json/blueprint/parser as blueprint_parser
+import json/blueprint/value as blueprint_value
+import relay/completion
+import relay/content.{
+  type Annotations, type ContentBlock, type ResourceContents, type ResourceLink,
+  type Role, Annotations, AssistantRole, AudioContent, BlobResourceContents,
+  EmbeddedResource, EmbeddedResourceBlock, ImageContent, ResourceLink,
+  ResourceLinkBlock, TextContent, TextResourceContents, UserRole,
+}
+import relay/prompts
+import relay/protocol/v2026_07_28 as v2026
 import relay/tool.{type ToolName}
 
-/// Opaque typed client handle.
-pub opaque type Client {
-  Client(id: String)
-}
+const protocol_version = "2026-07-28"
 
-/// Client configuration.
+/// HTTP connection settings for a modern Relay server.
 pub type ClientConfig {
-  ClientConfig(server_command: String)
+  ClientConfig(
+    host: String,
+    port: Int,
+    path: String,
+    secure: Bool,
+    timeout_ms: Int,
+    max_response_bytes: Int,
+  )
 }
 
-/// Connects an MCP client to a server.
-/// Deferred to Wave 5: Typed client and test kit.
-pub fn connect(_config: ClientConfig) -> Result(Client, String) {
-  todo as "wave 5: Typed client and test kit"
+/// Opaque owner-bound Gun connection. Its Erlang process is private to Relay.
+pub opaque type Client {
+  Client(
+    pid: process.Pid,
+    path: String,
+    timeout_ms: Int,
+    max_response_bytes: Int,
+  )
 }
 
-/// Invokes a tool by name with typed input and output codecs.
-/// Deferred to Wave 5: Typed client and test kit.
+pub type ClientError {
+  InvalidClientConfiguration
+  ConnectionFailed(String)
+}
+
+pub type ServerInfo {
+  ServerInfo(name: String, version: String)
+}
+
+/// Capabilities and server identity discovered from a live peer.
+pub type Discovery {
+  Discovery(
+    server_info: Option(ServerInfo),
+    supported_versions: List(String),
+    capabilities: Dynamic,
+  )
+}
+
+/// The outcomes of a typed tool call remain distinct at the client boundary.
+pub type ToolCallOutcome(output) {
+  StructuredSuccess(output, content: List(ContentBlock))
+  ContentOnlySuccess(content: List(ContentBlock))
+  ToolFailure(content: List(ContentBlock))
+  ProtocolFailure(reason: String)
+  TransportFailure(reason: String)
+  Cancelled
+  InputEncodingFailure
+}
+
+@external(erlang, "relay_gun_ffi", "open")
+fn ffi_open(
+  host: String,
+  port: Int,
+  secure: Bool,
+  timeout_ms: Int,
+) -> Result(process.Pid, String)
+
+@external(erlang, "relay_gun_ffi", "request")
+fn ffi_request(
+  pid: process.Pid,
+  path: String,
+  body: BitArray,
+  method: String,
+  name: String,
+  version: String,
+  timeout_ms: Int,
+  max_response_bytes: Int,
+) -> Result(#(Int, BitArray), String)
+
+@external(erlang, "relay_gun_ffi", "close")
+fn ffi_close(pid: process.Pid) -> Nil
+
+@external(erlang, "relay_gun_ffi", "unique_integer")
+fn ffi_unique_integer() -> Int
+
+/// Opens a reusable, owner-bound Gun HTTP/1.1 connection.
+pub fn connect(config: ClientConfig) -> Result(Client, ClientError) {
+  case
+    string.trim(config.host) != ""
+    && config.port > 0
+    && config.port < 65_536
+    && string.starts_with(config.path, "/")
+    && config.timeout_ms > 0
+    && config.max_response_bytes > 0
+  {
+    False -> Error(InvalidClientConfiguration)
+    True ->
+      case
+        ffi_open(config.host, config.port, config.secure, config.timeout_ms)
+      {
+        Ok(pid) ->
+          Ok(Client(
+            pid,
+            config.path,
+            config.timeout_ms,
+            config.max_response_bytes,
+          ))
+        Error(reason) -> Error(ConnectionFailed(reason))
+      }
+  }
+}
+
+/// Closes the underlying Gun connection and its in-flight streams.
+pub fn close(client: Client) -> Nil {
+  ffi_close(client.pid)
+}
+
+/// Cancels in-flight requests by closing the connection.
+pub fn cancel(client: Client) -> Nil {
+  ffi_close(client.pid)
+}
+
+/// Discovers server capabilities and pins use to the retained 2026 revision.
+pub fn discover(client: Client) -> Result(Discovery, String) {
+  let id = request_id()
+  let body = request_envelope(id, "server/discover", [])
+  case request(client, body, "server/discover", "") {
+    Error(reason) -> Error(reason)
+    Ok(#(status, bytes)) ->
+      case status {
+        200 -> decode_discovery(bytes, id)
+        _ -> Error("server discovery returned HTTP " <> int.to_string(status))
+      }
+  }
+}
+
+/// Performs a raw method call while checking the JSON-RPC version and response ID.
+/// The returned bytes preserve the peer's exact JSON representation.
+pub fn raw_json_call(
+  client: Client,
+  method: String,
+  name: Option(String),
+  params: List(#(String, json.Json)),
+) -> Result(BitArray, String) {
+  let requires_name = case method {
+    "tools/call" | "prompts/get" | "resources/read" -> True
+    _ -> False
+  }
+  case requires_name, name {
+    True, None ->
+      Error(method <> " requires a routing name for MCP header agreement")
+    False, Some(_) -> Error("Mcp-Name is not valid for " <> method)
+    _, _ -> {
+      let id = request_id()
+      let body = request_envelope(id, method, params)
+      let name = case name {
+        None -> ""
+        Some(value) -> value
+      }
+      case request(client, body, method, name) {
+        Error(reason) -> Error(reason)
+        Ok(#(status, _)) if status != 200 ->
+          Error("raw method call returned HTTP " <> int.to_string(status))
+        Ok(#(_, bytes)) ->
+          validate_jsonrpc_response(bytes, id)
+          |> result.map(fn(_) { bytes })
+      }
+    }
+  }
+}
+
+/// Traverses all tools/list pages and returns each declaration as checked JSON.
+pub fn list_tools(client: Client) -> Result(List(String), String) {
+  list_tools_page(client, None, [], [], 10_000)
+}
+
+/// Calls a tool using the supplied input and output codecs.
 pub fn call_tool(
-  _client: Client,
-  _name: ToolName,
-  _input: input,
-  _input_codec: Codec(input),
-  _output_codec: Codec(output),
-) -> Result(output, String) {
-  todo as "wave 5: Typed client and test kit"
+  client: Client,
+  name: ToolName,
+  input: input,
+  input_codec: Codec(input),
+  output_codec: Codec(output),
+) -> ToolCallOutcome(output) {
+  case encode(input_codec, input) {
+    Error(_) -> InputEncodingFailure
+    Ok(arguments) -> {
+      let id = request_id()
+      let tool_name = tool.tool_name_to_string(name)
+      let params = [
+        #("name", json.string(tool_name)),
+        #("arguments", v2026.value_to_json(arguments)),
+      ]
+      let body = request_envelope(id, "tools/call", params)
+      case request(client, body, "tools/call", tool_name) {
+        Error("cancelled") -> Cancelled
+        Error(reason) -> TransportFailure(reason)
+        Ok(#(status, _)) if status != 200 ->
+          TransportFailure("tool call returned HTTP " <> int.to_string(status))
+        Ok(#(_, bytes)) ->
+          case decode_tool_response(bytes, id) {
+            Error(reason) -> ProtocolFailure(reason)
+            Ok(#(is_error, maybe_structured, texts)) ->
+              case is_error, maybe_structured {
+                True, _ -> ToolFailure(texts)
+                False, None -> ContentOnlySuccess(texts)
+                False, Some(value) ->
+                  case decode(output_codec, value) {
+                    Ok(output) -> StructuredSuccess(output, texts)
+                    Error(_) ->
+                      ProtocolFailure(
+                        "structured content did not match the output codec",
+                      )
+                  }
+              }
+          }
+      }
+    }
+  }
+}
+
+/// Reads a resource and decodes its text or base64 content.
+pub fn read_resource(
+  client: Client,
+  uri: String,
+) -> Result(List(ResourceContents), String) {
+  use result_value <- result.try(
+    jsonrpc_call_result(client, "resources/read", uri, [
+      #("uri", json.string(uri)),
+    ]),
+  )
+  use raw_contents <- result.try(
+    dyn_decode.run(
+      result_value,
+      dyn_decode.at(["contents"], dyn_decode.list(dyn_decode.dynamic)),
+    )
+    |> result.map_error(fn(_) { "resource result is missing its contents" }),
+  )
+  decode_resource_contents_list(raw_contents)
+}
+
+/// Fetches a prompt result with string-valued arguments.
+pub fn get_prompt(
+  client: Client,
+  name: String,
+  arguments: Dict(String, String),
+) -> Result(prompts.PromptResult, String) {
+  use result_value <- result.try(
+    jsonrpc_call_result(client, "prompts/get", name, [
+      #("name", json.string(name)),
+      #(
+        "arguments",
+        json.object(
+          list.map(dict.to_list(arguments), fn(pair) {
+            let #(key, value) = pair
+            #(key, json.string(value))
+          }),
+        ),
+      ),
+    ]),
+  )
+  decode_prompt_result(result_value)
+}
+
+/// Requests completions using a typed reference, argument, and optional context.
+pub fn complete(
+  client: Client,
+  reference: completion.CompletionRef,
+  argument: completion.CompletionArgument,
+  context: Option(Dict(String, String)),
+) -> Result(completion.CompletionValues, String) {
+  let fields = [
+    #("ref", completion_ref_to_json(reference)),
+    #(
+      "argument",
+      json.object([
+        #("name", json.string(argument.name)),
+        #("value", json.string(argument.value)),
+      ]),
+    ),
+  ]
+  let fields = case context {
+    None -> fields
+    Some(values) ->
+      list.append(fields, [
+        #(
+          "context",
+          json.object(
+            list.map(dict.to_list(values), fn(pair) {
+              let #(key, value) = pair
+              #(key, json.string(value))
+            }),
+          ),
+        ),
+      ])
+  }
+  use result_value <- result.try(jsonrpc_call_result(
+    client,
+    "completion/complete",
+    "",
+    fields,
+  ))
+  decode_completion_values(result_value)
+}
+
+fn request(
+  client: Client,
+  body: BitArray,
+  method: String,
+  name: String,
+) -> Result(#(Int, BitArray), String) {
+  ffi_request(
+    client.pid,
+    client.path,
+    body,
+    method,
+    name,
+    protocol_version,
+    client.timeout_ms,
+    client.max_response_bytes,
+  )
+}
+
+fn jsonrpc_call_result(
+  client: Client,
+  method: String,
+  name: String,
+  params: List(#(String, json.Json)),
+) -> Result(Dynamic, String) {
+  let id = request_id()
+  let body = request_envelope(id, method, params)
+  case request(client, body, method, name) {
+    Error(reason) -> Error(reason)
+    Ok(#(status, _)) if status != 200 ->
+      Error(method <> " returned HTTP " <> int.to_string(status))
+    Ok(#(_, bytes)) ->
+      case bit_array.to_string(bytes) {
+        Error(_) -> Error(method <> " response was not UTF-8")
+        Ok(raw) ->
+          case json.parse(raw, dyn_decode.dynamic) {
+            Error(_) -> Error(method <> " response was not valid JSON")
+            Ok(response) -> validate_jsonrpc_result(response, id)
+          }
+      }
+  }
+}
+
+fn completion_ref_to_json(reference: completion.CompletionRef) -> json.Json {
+  case reference {
+    completion.PromptRef(name) ->
+      json.object([
+        #("type", json.string("ref/prompt")),
+        #("name", json.string(name)),
+      ])
+    completion.ResourceRef(uri) ->
+      json.object([
+        #("type", json.string("ref/resource")),
+        #("uri", json.string(uri)),
+      ])
+  }
+}
+
+fn decode_resource_contents_list(
+  contents: List(Dynamic),
+) -> Result(List(ResourceContents), String) {
+  case contents {
+    [] -> Ok([])
+    [raw, ..rest] ->
+      decode_resource_contents(raw)
+      |> result.try(fn(decoded) {
+        decode_resource_contents_list(rest)
+        |> result.map(fn(rest) { [decoded, ..rest] })
+      })
+  }
+}
+
+fn decode_prompt_result(
+  value: Dynamic,
+) -> Result(prompts.PromptResult, String) {
+  use description <- result.try(optional_string_field(value, ["description"]))
+  use raw_messages <- result.try(
+    dyn_decode.run(
+      value,
+      dyn_decode.at(["messages"], dyn_decode.list(dyn_decode.dynamic)),
+    )
+    |> result.map_error(fn(_) { "prompt result is missing its messages" }),
+  )
+  use messages <- result.try(decode_prompt_messages(raw_messages))
+  Ok(prompts.PromptResult(description, messages))
+}
+
+fn decode_prompt_messages(
+  messages: List(Dynamic),
+) -> Result(List(prompts.PromptMessage), String) {
+  case messages {
+    [] -> Ok([])
+    [raw, ..rest] ->
+      decode_prompt_message(raw)
+      |> result.try(fn(decoded) {
+        decode_prompt_messages(rest)
+        |> result.map(fn(rest) { [decoded, ..rest] })
+      })
+  }
+}
+
+fn decode_prompt_message(
+  value: Dynamic,
+) -> Result(prompts.PromptMessage, String) {
+  use role <- result.try(string_field(value, ["role"]))
+  let role = case role {
+    "user" -> Ok(content.UserRole)
+    "assistant" -> Ok(content.AssistantRole)
+    _ -> Error("prompt message has an unknown role")
+  }
+  use role <- result.try(role)
+  use raw_content <- result.try(
+    dyn_decode.run(value, dyn_decode.at(["content"], dyn_decode.dynamic))
+    |> result.map_error(fn(_) { "prompt message is missing its content" }),
+  )
+  use content <- result.try(decode_content_block(raw_content))
+  Ok(prompts.PromptMessage(role, content))
+}
+
+fn decode_completion_values(
+  value: Dynamic,
+) -> Result(completion.CompletionValues, String) {
+  use values <- result.try(
+    dyn_decode.run(
+      value,
+      dyn_decode.at(
+        ["completion", "values"],
+        dyn_decode.list(dyn_decode.string),
+      ),
+    )
+    |> result.map_error(fn(_) { "completion result is missing its values" }),
+  )
+  use total <- result.try(optional_int_field(value, ["completion", "total"]))
+  use has_more <- result.try(
+    optional_bool_field(value, ["completion", "hasMore"]),
+  )
+  Ok(completion.CompletionValues(values, total, has_more))
+}
+
+fn validate_jsonrpc_response(
+  bytes: BitArray,
+  expected_id: String,
+) -> Result(Nil, String) {
+  case bit_array.to_string(bytes) {
+    Error(_) -> Error("response was not UTF-8")
+    Ok(raw) ->
+      case json.parse(raw, dyn_decode.dynamic) {
+        Error(_) -> Error("response was not valid JSON")
+        Ok(response) -> {
+          let version =
+            dyn_decode.run(
+              response,
+              dyn_decode.at(["jsonrpc"], dyn_decode.string),
+            )
+          let response_id =
+            dyn_decode.run(response, dyn_decode.at(["id"], dyn_decode.string))
+          let result_field =
+            dyn_decode.run(
+              response,
+              dyn_decode.at(["result"], dyn_decode.dynamic),
+            )
+          let error_field =
+            dyn_decode.run(
+              response,
+              dyn_decode.at(["error"], dyn_decode.dynamic),
+            )
+          case version, response_id, result_field, error_field {
+            Ok("2.0"), Ok(actual), Ok(_), Error(_) if actual == expected_id ->
+              Ok(Nil)
+            Ok("2.0"), Ok(actual), Error(_), Ok(_) if actual == expected_id ->
+              Ok(Nil)
+            _, _, _, _ -> Error("malformed or uncorrelated JSON-RPC response")
+          }
+        }
+      }
+  }
+}
+
+fn validate_jsonrpc_result(
+  response: Dynamic,
+  expected_id: String,
+) -> Result(Dynamic, String) {
+  let version =
+    dyn_decode.run(response, dyn_decode.at(["jsonrpc"], dyn_decode.string))
+  let response_id =
+    dyn_decode.run(response, dyn_decode.at(["id"], dyn_decode.string))
+  let result_field =
+    dyn_decode.run(response, dyn_decode.at(["result"], dyn_decode.dynamic))
+  let error_field =
+    dyn_decode.run(response, dyn_decode.at(["error"], dyn_decode.dynamic))
+  case version, response_id, result_field, error_field {
+    Ok("2.0"), Ok(actual), Ok(result), Error(_) if actual == expected_id ->
+      Ok(result)
+    _, _, _, _ -> Error("malformed or uncorrelated JSON-RPC result")
+  }
+}
+
+fn decode_tool_response(
+  bytes: BitArray,
+  expected_id: String,
+) -> Result(#(Bool, Option(blueprint_value.Value), List(ContentBlock)), String) {
+  case bit_array.to_string(bytes) {
+    Error(_) -> Error("tool response was not UTF-8")
+    Ok(raw) ->
+      case json.parse(raw, dyn_decode.dynamic) {
+        Error(_) -> Error("tool response was not valid JSON")
+        Ok(response) ->
+          case validate_jsonrpc_result(response, expected_id) {
+            Error(reason) -> Error(reason)
+            Ok(result_value) -> {
+              let content =
+                dyn_decode.run(
+                  result_value,
+                  dyn_decode.at(
+                    ["content"],
+                    dyn_decode.list(dyn_decode.dynamic),
+                  ),
+                )
+              let is_error = optional_bool(result_value, ["isError"], False)
+              case content, is_error {
+                Ok(blocks), Ok(is_error) ->
+                  case decode_content_blocks(blocks) {
+                    Error(reason) -> Error(reason)
+                    Ok(texts) ->
+                      case decode_structured_content(bytes, result_value) {
+                        Error(reason) -> Error(reason)
+                        Ok(structured) -> Ok(#(is_error, structured, texts))
+                      }
+                  }
+                _, _ -> Error("tool result has invalid content or isError")
+              }
+            }
+          }
+      }
+  }
+}
+
+fn optional_bool(
+  value: Dynamic,
+  path: List(String),
+  default: Bool,
+) -> Result(Bool, String) {
+  case dyn_decode.run(value, dyn_decode.at(path, dyn_decode.dynamic)) {
+    Error(_) -> Ok(default)
+    Ok(raw) ->
+      dyn_decode.run(raw, dyn_decode.bool)
+      |> result.map_error(fn(_) { "tool result boolean field is invalid" })
+  }
+}
+
+fn decode_content_blocks(
+  blocks: List(Dynamic),
+) -> Result(List(ContentBlock), String) {
+  case blocks {
+    [] -> Ok([])
+    [block, ..rest] ->
+      decode_content_block(block)
+      |> result.try(fn(decoded) {
+        decode_content_blocks(rest)
+        |> result.map(fn(rest) { [decoded, ..rest] })
+      })
+  }
+}
+
+fn decode_content_block(block: Dynamic) -> Result(ContentBlock, String) {
+  use block_type <- result.try(string_field(block, ["type"]))
+  case block_type {
+    "text" ->
+      decode_annotations(block)
+      |> result.try(fn(annotations) {
+        string_field(block, ["text"])
+        |> result.map(fn(text) { TextContent(text, annotations) })
+      })
+    "image" ->
+      decode_annotations(block)
+      |> result.try(fn(annotations) {
+        use data <- result.try(string_field(block, ["data"]))
+        use mime_type <- result.try(string_field(block, ["mimeType"]))
+        Ok(ImageContent(data, mime_type, annotations))
+      })
+    "audio" ->
+      decode_annotations(block)
+      |> result.try(fn(annotations) {
+        use data <- result.try(string_field(block, ["data"]))
+        use mime_type <- result.try(string_field(block, ["mimeType"]))
+        Ok(AudioContent(data, mime_type, annotations))
+      })
+    "resource_link" ->
+      decode_resource_link(block)
+      |> result.map(ResourceLinkBlock)
+    "resource" ->
+      decode_annotations(block)
+      |> result.try(fn(annotations) {
+        dyn_decode.run(block, dyn_decode.at(["resource"], dyn_decode.dynamic))
+        |> result.map_error(fn(_) { "embedded resource is missing" })
+        |> result.try(fn(resource) {
+          decode_resource_contents(resource)
+          |> result.map(fn(contents) {
+            EmbeddedResourceBlock(EmbeddedResource(contents, annotations))
+          })
+        })
+      })
+    _ -> Error("tool result contains an unsupported content block")
+  }
+}
+
+fn decode_resource_link(value: Dynamic) -> Result(ResourceLink, String) {
+  use uri <- result.try(string_field(value, ["uri"]))
+  use name <- result.try(string_field(value, ["name"]))
+  use title <- result.try(optional_string_field(value, ["title"]))
+  use description <- result.try(optional_string_field(value, ["description"]))
+  use mime_type <- result.try(optional_string_field(value, ["mimeType"]))
+  use size <- result.try(optional_int_field(value, ["size"]))
+  use annotations <- result.try(decode_annotations(value))
+  Ok(ResourceLink(uri, name, title, description, mime_type, size, annotations))
+}
+
+fn decode_resource_contents(
+  value: Dynamic,
+) -> Result(ResourceContents, String) {
+  use uri <- result.try(string_field(value, ["uri"]))
+  use mime_type <- result.try(optional_string_field(value, ["mimeType"]))
+  use fields <- result.try(
+    dyn_decode.run(
+      value,
+      dyn_decode.dict(dyn_decode.string, dyn_decode.dynamic),
+    )
+    |> result.map_error(fn(_) { "resource contents must be an object" }),
+  )
+  case dict.get(fields, "text"), dict.get(fields, "blob") {
+    Ok(raw), Error(_) ->
+      dyn_decode.run(raw, dyn_decode.string)
+      |> result.map(TextResourceContents(uri, _, mime_type))
+      |> result.map_error(fn(_) { "resource text must be a string" })
+    Error(_), Ok(raw) ->
+      dyn_decode.run(raw, dyn_decode.string)
+      |> result.map(BlobResourceContents(uri, _, mime_type))
+      |> result.map_error(fn(_) { "resource blob must be a string" })
+    _, _ -> Error("resource contents must contain exactly one of text or blob")
+  }
+}
+
+fn decode_annotations(value: Dynamic) -> Result(Option(Annotations), String) {
+  case
+    dyn_decode.run(value, dyn_decode.at(["annotations"], dyn_decode.dynamic))
+  {
+    Error(_) -> Ok(None)
+    Ok(raw) ->
+      decode_annotation_object(raw)
+      |> result.map(Some)
+  }
+}
+
+fn decode_annotation_object(value: Dynamic) -> Result(Annotations, String) {
+  use fields <- result.try(
+    dyn_decode.run(
+      value,
+      dyn_decode.dict(dyn_decode.string, dyn_decode.dynamic),
+    )
+    |> result.map_error(fn(_) { "content annotations must be an object" }),
+  )
+  use audience <- result.try(optional_roles(fields, "audience"))
+  use priority <- result.try(optional_float(fields, "priority"))
+  use title <- result.try(optional_string(fields, "title"))
+  use description <- result.try(optional_string(fields, "description"))
+  Ok(Annotations(audience, priority, title, description))
+}
+
+fn optional_roles(
+  fields: Dict(String, Dynamic),
+  key: String,
+) -> Result(Option(List(Role)), String) {
+  case dict.get(fields, key) {
+    Error(_) -> Ok(None)
+    Ok(raw) ->
+      dyn_decode.run(raw, dyn_decode.list(dyn_decode.string))
+      |> result.map_error(fn(_) {
+        "content annotation audience must be an array"
+      })
+      |> result.try(fn(roles) {
+        decode_roles(roles)
+        |> result.map(Some)
+      })
+  }
+}
+
+fn decode_roles(values: List(String)) -> Result(List(Role), String) {
+  case values {
+    [] -> Ok([])
+    [value, ..rest] ->
+      case value {
+        "user" ->
+          decode_roles(rest)
+          |> result.map(fn(rest) { [UserRole, ..rest] })
+        "assistant" ->
+          decode_roles(rest)
+          |> result.map(fn(rest) { [AssistantRole, ..rest] })
+        _ -> Error("content annotation audience has an unknown role")
+      }
+  }
+}
+
+fn optional_float(
+  fields: Dict(String, Dynamic),
+  key: String,
+) -> Result(Option(Float), String) {
+  case dict.get(fields, key) {
+    Error(_) -> Ok(None)
+    Ok(raw) ->
+      dyn_decode.run(raw, dyn_decode.float)
+      |> result.map(Some)
+      |> result.map_error(fn(_) {
+        "content annotation priority must be numeric"
+      })
+  }
+}
+
+fn optional_string(
+  fields: Dict(String, Dynamic),
+  key: String,
+) -> Result(Option(String), String) {
+  case dict.get(fields, key) {
+    Error(_) -> Ok(None)
+    Ok(raw) ->
+      dyn_decode.run(raw, dyn_decode.string)
+      |> result.map(Some)
+      |> result.map_error(fn(_) { "content annotation field must be a string" })
+  }
+}
+
+fn string_field(value: Dynamic, path: List(String)) -> Result(String, String) {
+  dyn_decode.run(value, dyn_decode.at(path, dyn_decode.string))
+  |> result.map_error(fn(_) { "result object is missing a required string" })
+}
+
+fn optional_string_field(
+  value: Dynamic,
+  path: List(String),
+) -> Result(Option(String), String) {
+  case dyn_decode.run(value, dyn_decode.at(path, dyn_decode.dynamic)) {
+    Error(_) -> Ok(None)
+    Ok(raw) ->
+      dyn_decode.run(raw, dyn_decode.string)
+      |> result.map(Some)
+      |> result.map_error(fn(_) { "optional result string is invalid" })
+  }
+}
+
+fn optional_int_field(
+  value: Dynamic,
+  path: List(String),
+) -> Result(Option(Int), String) {
+  case dyn_decode.run(value, dyn_decode.at(path, dyn_decode.dynamic)) {
+    Error(_) -> Ok(None)
+    Ok(raw) ->
+      dyn_decode.run(raw, dyn_decode.int)
+      |> result.map(Some)
+      |> result.map_error(fn(_) { "optional result integer is invalid" })
+  }
+}
+
+fn optional_bool_field(
+  value: Dynamic,
+  path: List(String),
+) -> Result(Option(Bool), String) {
+  case dyn_decode.run(value, dyn_decode.at(path, dyn_decode.dynamic)) {
+    Error(_) -> Ok(None)
+    Ok(raw) ->
+      dyn_decode.run(raw, dyn_decode.bool)
+      |> result.map(Some)
+      |> result.map_error(fn(_) { "optional result boolean is invalid" })
+  }
+}
+
+fn decode_structured_content(
+  bytes: BitArray,
+  result_value: Dynamic,
+) -> Result(Option(blueprint_value.Value), String) {
+  case
+    dyn_decode.run(
+      result_value,
+      dyn_decode.at(["structuredContent"], dyn_decode.dynamic),
+    )
+  {
+    Error(_) -> Ok(None)
+    Ok(_) ->
+      case
+        blueprint_parser.parse_value(blueprint_parser.default_limits(), bytes)
+      {
+        Error(_) ->
+          Error("structured tool result contains an invalid JSON value")
+        Ok(root) ->
+          case blueprint_at(root, ["result", "structuredContent"]) {
+            None -> Error("structured tool result is missing its value")
+            Some(value) -> Ok(Some(value))
+          }
+      }
+  }
+}
+
+fn decode_tool_list_page(
+  bytes: BitArray,
+  expected_id: String,
+) -> Result(#(List(String), Option(String)), String) {
+  case bit_array.to_string(bytes) {
+    Error(_) -> Error("tools/list response was not UTF-8")
+    Ok(raw) ->
+      case json.parse(raw, dyn_decode.dynamic) {
+        Error(_) -> Error("tools/list response was not valid JSON")
+        Ok(response) ->
+          case validate_jsonrpc_result(response, expected_id) {
+            Error(reason) -> Error(reason)
+            Ok(_) ->
+              case
+                blueprint_parser.parse_value(
+                  blueprint_parser.default_limits(),
+                  bytes,
+                )
+              {
+                Error(_) ->
+                  Error("tools/list response contains an invalid JSON value")
+                Ok(root) ->
+                  case blueprint_at(root, ["result", "tools"]) {
+                    Some(blueprint_value.Array(items)) -> {
+                      let tools =
+                        list.map(
+                          items,
+                          blueprint_migration.value_to_json_string,
+                        )
+                      case blueprint_at(root, ["result", "nextCursor"]) {
+                        None -> Ok(#(tools, None))
+                        Some(blueprint_value.String(cursor)) ->
+                          Ok(#(tools, Some(cursor)))
+                        Some(_) ->
+                          Error("tools/list nextCursor must be a string")
+                      }
+                    }
+                    _ -> Error("tools/list response is missing its tools array")
+                  }
+              }
+          }
+      }
+  }
+}
+
+fn blueprint_at(
+  value: blueprint_value.Value,
+  path: List(String),
+) -> Option(blueprint_value.Value) {
+  case path {
+    [] -> Some(value)
+    [key, ..rest] ->
+      case value {
+        blueprint_value.Object(fields) ->
+          case list.key_find(fields, key) {
+            Ok(child) -> blueprint_at(child, rest)
+            Error(_) -> None
+          }
+        _ -> None
+      }
+  }
+}
+
+fn request_id() -> String {
+  "relay-" <> int.to_string(ffi_unique_integer())
+}
+
+fn list_tools_page(
+  client: Client,
+  cursor: Option(String),
+  seen_cursors: List(String),
+  accumulated: List(String),
+  remaining_pages: Int,
+) -> Result(List(String), String) {
+  case remaining_pages <= 0 {
+    True -> Error("tools/list exceeded the client page limit")
+    False -> {
+      let params = case cursor {
+        None -> []
+        Some(value) -> [#("cursor", json.string(value))]
+      }
+      let id = request_id()
+      let body = request_envelope(id, "tools/list", params)
+      case request(client, body, "tools/list", "") {
+        Error(reason) -> Error(reason)
+        Ok(#(status, _)) if status != 200 ->
+          Error("tools/list returned HTTP " <> int.to_string(status))
+        Ok(#(_, bytes)) ->
+          case decode_tool_list_page(bytes, id) {
+            Error(reason) -> Error(reason)
+            Ok(#(items, next_cursor)) -> {
+              let accumulated = list.append(accumulated, items)
+              case next_cursor {
+                None -> Ok(accumulated)
+                Some(next) ->
+                  case list.contains(seen_cursors, next) {
+                    True -> Error("tools/list cursor repeated")
+                    False ->
+                      list_tools_page(
+                        client,
+                        Some(next),
+                        [next, ..seen_cursors],
+                        accumulated,
+                        remaining_pages - 1,
+                      )
+                  }
+              }
+            }
+          }
+      }
+    }
+  }
+}
+
+fn request_envelope(
+  id: String,
+  method: String,
+  params: List(#(String, json.Json)),
+) -> BitArray {
+  let metadata =
+    json.object([
+      #(
+        "io.modelcontextprotocol/protocolVersion",
+        json.string(protocol_version),
+      ),
+      #("io.modelcontextprotocol/clientCapabilities", json.object([])),
+    ])
+  let params = json.object([#("_meta", metadata), ..params])
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("id", json.string(id)),
+    #("method", json.string(method)),
+    #("params", params),
+  ])
+  |> json.to_string
+  |> bit_array.from_string
+}
+
+fn decode_discovery(
+  bytes: BitArray,
+  expected_id: String,
+) -> Result(Discovery, String) {
+  case bit_array.to_string(bytes) {
+    Error(_) -> Error("server discovery response was not UTF-8")
+    Ok(raw) ->
+      case json.parse(raw, dyn_decode.dynamic) {
+        Error(_) -> Error("server discovery response was not valid JSON")
+        Ok(dynamic) -> {
+          let versions =
+            dyn_decode.run(
+              dynamic,
+              dyn_decode.at(
+                ["result", "supportedVersions"],
+                dyn_decode.list(dyn_decode.string),
+              ),
+            )
+          let wire_version =
+            dyn_decode.run(
+              dynamic,
+              dyn_decode.at(["jsonrpc"], dyn_decode.string),
+            )
+          let response_id =
+            dyn_decode.run(dynamic, dyn_decode.at(["id"], dyn_decode.string))
+          let capabilities =
+            dyn_decode.run(
+              dynamic,
+              dyn_decode.at(["result", "capabilities"], dyn_decode.dynamic),
+            )
+          case versions, capabilities, wire_version, response_id {
+            Ok(supported), Ok(capabilities), Ok("2.0"), Ok(id) ->
+              case
+                id == expected_id && list.contains(supported, protocol_version)
+              {
+                False ->
+                  Error(
+                    "server discovery response was uncorrelated or did not support "
+                    <> protocol_version,
+                  )
+                True ->
+                  Ok(Discovery(
+                    server_info: decode_server_info(dynamic),
+                    supported_versions: supported,
+                    capabilities: capabilities,
+                  ))
+              }
+            _, _, _, _ ->
+              Error("server discovery response is missing required fields")
+          }
+        }
+      }
+  }
+}
+
+fn decode_server_info(dynamic: Dynamic) -> Option(ServerInfo) {
+  let name =
+    dyn_decode.run(
+      dynamic,
+      dyn_decode.at(
+        ["result", "_meta", "io.modelcontextprotocol/serverInfo", "name"],
+        dyn_decode.string,
+      ),
+    )
+  let version =
+    dyn_decode.run(
+      dynamic,
+      dyn_decode.at(
+        ["result", "_meta", "io.modelcontextprotocol/serverInfo", "version"],
+        dyn_decode.string,
+      ),
+    )
+  case name, version {
+    Ok(name), Ok(version) -> Some(ServerInfo(name, version))
+    _, _ -> None
+  }
 }

@@ -20,6 +20,20 @@ pub fn validate_input_schema(
   }
 }
 
+/// Validates that an output schema is available and within the modern MCP profile.
+pub fn validate_output_schema(
+  schema_res: Result(Schema, SchemaError),
+) -> Result(Schema, SchemaAdmissionError) {
+  case schema_res {
+    Error(_) -> Error(MissingSchema)
+    Ok(schema) ->
+      case materialize_schema(schema) {
+        value.Object(_) -> Ok(schema)
+        _ -> Error(SchemaMustBeObject(schema_type_name(schema)))
+      }
+  }
+}
+
 /// Checks if a schema represents an object-like structure.
 pub fn is_object_schema(schema: Schema) -> Bool {
   case schema {

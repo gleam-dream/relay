@@ -2,3 +2,4 @@ build/
 erl_crash.dump
 *.beam
 .direnv/
+scripts/conformance/node_modules/
