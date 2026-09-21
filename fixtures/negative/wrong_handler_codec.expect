@@ -1,0 +1,6 @@
+# Wrong handler/codec pairing must produce a compile-time type mismatch.
+Type mismatch
+Expected type:
+Int
+Found type:
+String

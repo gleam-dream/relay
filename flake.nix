@@ -38,6 +38,7 @@
             gleam
             beam28Packages.erlang
             rebar3
+            (python3.withPackages (ps: [ ps.jsonschema ]))
           ];
         };
 

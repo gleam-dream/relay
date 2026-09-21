@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Deterministic verification of committed checksums and pins without network access.
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+echo "==> Verifying frozen MCP 2026-07-28 schema fixture checksum..."
+EXPECTED_SCHEMA_SHA256="ef70b61f99b6d2e5e3b46863822eab08dff6a45bedc7a08914e0e5b133f40203"
+SCHEMA_FILE="$ROOT/test/fixtures/mcp_2026/schema.json.source"
+
+if [ ! -f "$SCHEMA_FILE" ]; then
+    echo "FAIL: Schema fixture not found at $SCHEMA_FILE" >&2
+    exit 1
+fi
+
+ACTUAL_SCHEMA_SHA256="$(shasum -a 256 "$SCHEMA_FILE" | awk '{print $1}')"
+if [ "$ACTUAL_SCHEMA_SHA256" != "$EXPECTED_SCHEMA_SHA256" ]; then
+    echo "FAIL: Schema checksum mismatch: got $ACTUAL_SCHEMA_SHA256, expected $EXPECTED_SCHEMA_SHA256" >&2
+    exit 1
+fi
+echo "PASS: MCP 2026-07-28 schema checksum matches ($ACTUAL_SCHEMA_SHA256)"
+
+echo "==> Verifying sibling dependency pins..."
+# json_blueprint pin
+EXPECTED_BLUEPRINT_HEAD="d3f0708b61eddb4a4789c0476ab5384267814a51"
+ACTUAL_BLUEPRINT_HEAD="$(git -C "$ROOT/../json_blueprint" rev-parse HEAD)"
+if [ "$ACTUAL_BLUEPRINT_HEAD" != "$EXPECTED_BLUEPRINT_HEAD" ]; then
+    echo "FAIL: json_blueprint git head mismatch: got $ACTUAL_BLUEPRINT_HEAD, expected $EXPECTED_BLUEPRINT_HEAD" >&2
+    exit 1
+fi
+if ! grep -q 'version = "1.7.1"' "$ROOT/../json_blueprint/gleam.toml"; then
+    echo "FAIL: json_blueprint version is not 1.7.1" >&2
+    exit 1
+fi
+echo "PASS: json_blueprint pin matches (commit $ACTUAL_BLUEPRINT_HEAD, version 1.7.1, MIT)"
+
+# sinal pin
+EXPECTED_SINAL_HEAD="dd09933e5466628f7d46fa896c389f31ba7d4cb6"
+ACTUAL_SINAL_HEAD="$(git -C "$ROOT/../sinal" rev-parse HEAD)"
+if [ "$ACTUAL_SINAL_HEAD" != "$EXPECTED_SINAL_HEAD" ]; then
+    echo "FAIL: sinal git head mismatch: got $ACTUAL_SINAL_HEAD, expected $EXPECTED_SINAL_HEAD" >&2
+    exit 1
+fi
+if ! grep -q 'version = "0.1.0"' "$ROOT/../sinal/gleam.toml"; then
+    echo "FAIL: sinal version is not 0.1.0" >&2
+    exit 1
+fi
+echo "PASS: sinal pin matches (commit $ACTUAL_SINAL_HEAD, version 0.1.0, Apache-2.0)"
+
+echo "All committed checksums and pins verified successfully."
