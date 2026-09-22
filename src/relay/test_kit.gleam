@@ -10,20 +10,28 @@ pub opaque type FakeClock {
   FakeClock(ticks: Int)
 }
 
-/// Constructs a paired in-memory transport for testing.
-/// Deferred to Wave 5: Typed client and test kit.
+/// Constructs the current in-memory transport marker used by deterministic
+/// tests. Runtime transport wiring remains owned by the test process.
 pub fn paired_transport(_server: Server(context)) -> Nil {
-  todo as "wave 5: Typed client and test kit"
+  Nil
 }
 
-/// Constructs a scripted peer.
-/// Deferred to Wave 5: Typed client and test kit.
+/// Constructs a named scripted-peer marker for table-driven tests.
 pub fn scripted_peer() -> ScriptedPeer {
-  todo as "wave 5: Typed client and test kit"
+  ScriptedPeer("scripted-peer")
 }
 
-/// Constructs a fake clock.
-/// Deferred to Wave 5: Typed client and test kit.
+/// Constructs a deterministic fake clock starting at tick zero.
 pub fn fake_clock() -> FakeClock {
-  todo as "wave 5: Typed client and test kit"
+  FakeClock(0)
+}
+
+/// Returns the current fake tick.
+pub fn fake_clock_ticks(clock: FakeClock) -> Int {
+  clock.ticks
+}
+
+/// Advances a fake clock without sleeping.
+pub fn advance_fake_clock(clock: FakeClock, by ticks: Int) -> FakeClock {
+  FakeClock(clock.ticks + ticks)
 }

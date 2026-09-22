@@ -1,3 +1,6 @@
+import gleam/list
+import gleam/option.{type Option, None, Some}
+import gleam/result
 import json/blueprint/value.{type Value}
 import relay/tool.{type ToolDeclaration}
 
@@ -55,14 +58,81 @@ pub fn protection_config(
 }
 
 pub type VerifierDeclaration {
-  VerifierDeclaration(name: String, version: String)
+  VerifierDeclaration(name: String, version: String, purpose: VerifierPurpose)
+}
+
+pub type VerifierPurpose {
+  TrustedVerifier
+  TestOnlyVerifier
+}
+
+pub type VerifierAttestation(principal) {
+  VerifierAttestation(
+    principal: principal,
+    audiences: List(Resource),
+    scopes: List(Scope),
+  )
+}
+
+pub type VerificationError {
+  BearerRejected
+  VerifierUnavailable
+  VerifierUnmapped
+}
+
+pub type AdmissionError {
+  VerificationFailed(VerificationError)
+  ResourceNotGranted
+  MissingEndpointScope(Scope)
+}
+
+pub type GrantUseError {
+  GrantResourceMismatch
+  GrantMissingEndpointScope(Scope)
 }
 
 pub opaque type Verifier(principal) {
   Verifier(
     declaration: VerifierDeclaration,
-    verify: fn(BearerToken) -> Result(principal, String),
+    verify: fn(BearerToken) ->
+      Result(VerifierAttestation(principal), VerificationError),
   )
+}
+
+/// Builds a verifier at the resource-server boundary. The verifier owns all
+/// token parsing and external key/introspection work; Relay only consumes its
+/// typed principal result.
+pub fn verifier(
+  name: String,
+  version: String,
+  verify: fn(BearerToken) ->
+    Result(VerifierAttestation(principal), VerificationError),
+) -> Verifier(principal) {
+  Verifier(VerifierDeclaration(name, version, TrustedVerifier), verify)
+}
+
+pub fn verifier_declaration(
+  name: String,
+  version: String,
+  purpose: VerifierPurpose,
+) -> VerifierDeclaration {
+  VerifierDeclaration(name, version, purpose)
+}
+
+pub fn trust_verifier(
+  declaration: VerifierDeclaration,
+  verify: fn(BearerToken) ->
+    Result(VerifierAttestation(principal), VerificationError),
+) -> Verifier(principal) {
+  Verifier(declaration, verify)
+}
+
+pub fn attestation(
+  principal: principal,
+  audiences: List(Resource),
+  scopes: List(Scope),
+) -> VerifierAttestation(principal) {
+  VerifierAttestation(principal, audiences, scopes)
 }
 
 pub opaque type GrantedRequest(principal) {
@@ -86,6 +156,7 @@ pub type InaccessibleCause {
 }
 
 pub type ProtectedDispatchError {
+  GrantUseFailed(GrantUseError)
   Inaccessible(InaccessibleCause)
   InvocationFailed(tool.DispatchError)
 }
@@ -112,36 +183,169 @@ pub opaque type ProtectedRegistry(context, principal) {
   ProtectedRegistry(
     protection: ProtectionConfig,
     policy: ToolPolicy(context, principal),
+    registry: Option(tool.Registry(context)),
   )
 }
 
-/// Resource server protected registry constructor.
-/// Deferred to Wave 4: Resource-server authorization.
+/// Resource-server protected registry constructor without a bound tool set.
 pub fn protect_registry(
-  _protection: ProtectionConfig,
-  _policy: ToolPolicy(context, principal),
+  protection: ProtectionConfig,
+  policy: ToolPolicy(context, principal),
 ) -> ProtectedRegistry(context, principal) {
-  todo as "wave 4: Resource-server authorization"
+  ProtectedRegistry(protection, policy, None)
+}
+
+/// Builds a protected registry backed by Relay's typed tool registry.
+pub fn protect_registry_with_tools(
+  registry: tool.Registry(context),
+  protection: ProtectionConfig,
+  policy: ToolPolicy(context, principal),
+) -> ProtectedRegistry(context, principal) {
+  ProtectedRegistry(protection, policy, Some(registry))
 }
 
 /// Verifies a bearer token and admits a granted request.
-/// Deferred to Wave 4: Resource-server authorization.
 pub fn admit(
-  _verifier: Verifier(principal),
-  _token: BearerToken,
-  _config: ProtectionConfig,
-) -> Result(GrantedRequest(principal), String) {
-  todo as "wave 4: Resource-server authorization"
+  verifier: Verifier(principal),
+  token: BearerToken,
+  config: ProtectionConfig,
+) -> Result(GrantedRequest(principal), AdmissionError) {
+  let Verifier(_declaration, verify) = verifier
+  case verify(token) {
+    Error(reason) -> Error(VerificationFailed(reason))
+    Ok(VerifierAttestation(principal, audiences, scopes)) ->
+      case audiences {
+        [audience] if audience == config.resource ->
+          case first_missing_scope(config.required_scopes, scopes) {
+            None -> Ok(GrantedRequest(principal, config.resource, scopes))
+            Some(missing) -> Error(MissingEndpointScope(missing))
+          }
+        _ -> Error(ResourceNotGranted)
+      }
+  }
+}
+
+fn first_missing_scope(
+  required: List(Scope),
+  granted: List(Scope),
+) -> Option(Scope) {
+  case required {
+    [] -> None
+    [scope, ..rest] ->
+      case list.contains(granted, scope) {
+        True -> first_missing_scope(rest, granted)
+        False -> Some(scope)
+      }
+  }
+}
+
+fn grant_use(
+  protection: ProtectionConfig,
+  grant: GrantedRequest(principal),
+) -> Result(Nil, GrantUseError) {
+  case grant.resource == protection.resource {
+    False -> Error(GrantResourceMismatch)
+    True ->
+      case first_missing_scope(protection.required_scopes, grant.scopes) {
+        None -> Ok(Nil)
+        Some(scope) -> Error(GrantMissingEndpointScope(scope))
+      }
+  }
+}
+
+/// Returns the resource audience admitted for a request.
+pub fn granted_resource(grant: GrantedRequest(principal)) -> Resource {
+  grant.resource
+}
+
+/// Returns the scopes admitted for a request.
+pub fn granted_scopes(grant: GrantedRequest(principal)) -> List(Scope) {
+  grant.scopes
+}
+
+/// Returns the verified principal carried by a request.
+pub fn granted_principal(grant: GrantedRequest(principal)) -> principal {
+  grant.principal
 }
 
 /// Dispatches a tool call through the protected registry.
-/// Deferred to Wave 4: Resource-server authorization.
 pub fn dispatch_granted(
-  _registry: ProtectedRegistry(context, principal),
-  _context: context,
-  _grant: GrantedRequest(principal),
-  _name: tool.ToolName,
-  _arguments: Value,
+  registry: ProtectedRegistry(context, principal),
+  context: context,
+  grant: GrantedRequest(principal),
+  name: tool.ToolName,
+  arguments: Value,
 ) -> Result(Value, ProtectedDispatchError) {
-  todo as "wave 4: Resource-server authorization"
+  case grant_use(registry.protection, grant) {
+    Error(reason) -> Error(GrantUseFailed(reason))
+    Ok(Nil) ->
+      case registry.registry {
+        None -> Error(Inaccessible(UnknownTool))
+        Some(tools) ->
+          case find_tool_declaration(tool.registered_tools(tools), name) {
+            None -> Error(Inaccessible(UnknownTool))
+            Some(declaration) -> {
+              let visible = case registry.policy {
+                ToolPolicy(visibility, _) ->
+                  visibility(context, grant, declaration)
+              }
+              case visible {
+                Hidden -> Error(Inaccessible(HiddenTool))
+                Visible -> {
+                  let allowed = case registry.policy {
+                    ToolPolicy(_, execution) ->
+                      execution(context, grant, declaration)
+                  }
+                  case allowed {
+                    ExecutionUnauthorized ->
+                      Error(Inaccessible(ExecutionDenied))
+                    ExecutionAuthorized ->
+                      tool.dispatch(tools, context, name, arguments)
+                      |> result.map_error(InvocationFailed)
+                  }
+                }
+              }
+            }
+          }
+      }
+  }
+}
+
+pub fn visible_declarations(
+  registry: ProtectedRegistry(context, principal),
+  context: context,
+  grant: GrantedRequest(principal),
+) -> Result(List(ToolDeclaration), GrantUseError) {
+  use _ <- result.try(grant_use(registry.protection, grant))
+  case registry.registry {
+    None -> Ok([])
+    Some(tools) ->
+      list.filter_map(tool.registered_tools(tools), fn(candidate) {
+        let declaration = tool.tool_declaration_of(candidate)
+        case registry.policy {
+          ToolPolicy(visibility, _) ->
+            case visibility(context, grant, declaration) {
+              Visible -> Ok(declaration)
+              Hidden -> Error(Nil)
+            }
+        }
+      })
+      |> Ok
+  }
+}
+
+fn find_tool_declaration(
+  tools: List(tool.ContextTool(context)),
+  name: tool.ToolName,
+) -> Option(ToolDeclaration) {
+  case tools {
+    [] -> None
+    [candidate, ..rest] -> {
+      let declaration = tool.tool_declaration_of(candidate)
+      case tool.tool_name_of(candidate) == name {
+        True -> Some(declaration)
+        False -> find_tool_declaration(rest, name)
+      }
+    }
+  }
 }

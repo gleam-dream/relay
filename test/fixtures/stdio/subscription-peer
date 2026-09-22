@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+IFS= read -r request
+id=$(printf '%s' "$request" | sed 's/.*"id":"//;s/".*//')
+printf '{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":"%s"},"notifications":{"toolsListChanged":true}}}\n' "$id"
+printf '{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":"%s"}}}\n' "$id"

@@ -10,16 +10,10 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import json/blueprint/codec.{type Codec, decode, encode}
-import json/blueprint/migration as blueprint_migration
 import json/blueprint/parser as blueprint_parser
 import json/blueprint/value as blueprint_value
 import relay/completion
-import relay/content.{
-  type Annotations, type ContentBlock, type ResourceContents, type ResourceLink,
-  type Role, Annotations, AssistantRole, AudioContent, BlobResourceContents,
-  EmbeddedResource, EmbeddedResourceBlock, ImageContent, ResourceLink,
-  ResourceLinkBlock, TextContent, TextResourceContents, UserRole,
-}
+import relay/content
 import relay/prompts
 import relay/protocol/jsonrpc.{RequestString}
 import relay/protocol/v2026_07_28 as v2026
@@ -84,11 +78,99 @@ pub type Discovery {
   )
 }
 
+pub type IconTheme {
+  IconLight
+  IconDark
+}
+
+pub type Icon {
+  Icon(
+    src: String,
+    mime_type: Option(String),
+    sizes: Option(List(String)),
+    theme: Option(IconTheme),
+  )
+}
+
+pub type Annotations {
+  Annotations(
+    audience: Option(List(content.Role)),
+    priority: Option(Float),
+    last_modified: Option(String),
+  )
+}
+
+pub type ToolAnnotations {
+  ToolAnnotations(
+    title: Option(String),
+    read_only_hint: Option(Bool),
+    destructive_hint: Option(Bool),
+    idempotent_hint: Option(Bool),
+    open_world_hint: Option(Bool),
+  )
+}
+
+/// A typed tool declaration received from a peer. Schema documents remain
+/// ordinary Gleam JSON values because peers may use arbitrary JSON Schema.
+pub type ToolDeclaration {
+  ToolDeclaration(
+    name: String,
+    title: Option(String),
+    description: Option(String),
+    input_schema: json.Json,
+    output_schema: Option(json.Json),
+    annotations: Option(ToolAnnotations),
+    icons: Option(List(Icon)),
+    meta: Option(json.Json),
+  )
+}
+
+/// A typed resource declaration received from a peer.
+pub type ResourceDeclaration {
+  ResourceDeclaration(
+    uri: String,
+    name: String,
+    title: Option(String),
+    description: Option(String),
+    mime_type: Option(String),
+    size: Option(Int),
+    annotations: Option(Annotations),
+    icons: Option(List(Icon)),
+    meta: Option(json.Json),
+  )
+}
+
+/// A typed resource-template declaration received from a peer.
+pub type ResourceTemplateDeclaration {
+  ResourceTemplateDeclaration(
+    uri_template: String,
+    name: String,
+    title: Option(String),
+    description: Option(String),
+    mime_type: Option(String),
+    annotations: Option(Annotations),
+    icons: Option(List(Icon)),
+    meta: Option(json.Json),
+  )
+}
+
+/// A typed prompt declaration received from a peer.
+pub type PromptDeclaration {
+  PromptDeclaration(
+    name: String,
+    title: Option(String),
+    description: Option(String),
+    arguments: List(prompts.PromptArgument),
+    icons: Option(List(Icon)),
+    meta: Option(json.Json),
+  )
+}
+
 /// The outcomes of a typed tool call remain distinct at the client boundary.
 pub type ToolCallOutcome(output) {
-  StructuredSuccess(output, content: List(ContentBlock))
-  ContentOnlySuccess(content: List(ContentBlock))
-  ToolFailure(content: List(ContentBlock))
+  StructuredSuccess(output, content: List(content.ContentBlock))
+  ContentOnlySuccess(content: List(content.ContentBlock))
+  ToolFailure(content: List(content.ContentBlock))
   ProtocolFailure(reason: String)
   TransportFailure(reason: String)
   Cancelled
@@ -105,10 +187,16 @@ pub type SubscriptionNotification {
 
 /// An HTTP subscription stream owned by one Gun connection.
 pub opaque type Subscription {
-  Subscription(
+  HttpSubscription(
     reader: process.Pid,
     request_id: String,
     notifications: SubscriptionFilter,
+  )
+  StdioSubscription(
+    client: stdio_client.Client,
+    request_id: String,
+    notifications: SubscriptionFilter,
+    max_response_bytes: Int,
   )
 }
 
@@ -320,24 +408,92 @@ pub fn raw_json_call(
   }
 }
 
-/// Traverses all tools/list pages and returns each declaration as checked JSON.
-pub fn list_tools(client: Client) -> Result(List(String), String) {
+/// Traverses all tools/list pages and returns typed declarations.
+pub fn list_tools(client: Client) -> Result(List(ToolDeclaration), String) {
+  list_tool_declarations(client)
+}
+
+/// Compatibility surface that preserves each declaration as checked JSON.
+pub fn list_tools_json(client: Client) -> Result(List(String), String) {
   list_json_pages(client, "tools/list", "tools")
 }
 
-/// Traverses all resources/list pages and returns each declaration as checked JSON.
-pub fn list_resources(client: Client) -> Result(List(String), String) {
+/// Traverses all resources/list pages and returns typed declarations.
+pub fn list_resources(
+  client: Client,
+) -> Result(List(ResourceDeclaration), String) {
+  list_resource_declarations(client)
+}
+
+/// Compatibility surface that preserves each declaration as checked JSON.
+pub fn list_resources_json(client: Client) -> Result(List(String), String) {
   list_json_pages(client, "resources/list", "resources")
 }
 
-/// Traverses all resources/templates/list pages as checked JSON declarations.
-pub fn list_resource_templates(client: Client) -> Result(List(String), String) {
+/// Traverses all resources/templates/list pages as typed declarations.
+pub fn list_resource_templates(
+  client: Client,
+) -> Result(List(ResourceTemplateDeclaration), String) {
+  list_resource_template_declarations(client)
+}
+
+/// Compatibility surface that preserves each declaration as checked JSON.
+pub fn list_resource_templates_json(
+  client: Client,
+) -> Result(List(String), String) {
   list_json_pages(client, "resources/templates/list", "resourceTemplates")
 }
 
-/// Traverses all prompts/list pages and returns each declaration as checked JSON.
-pub fn list_prompts(client: Client) -> Result(List(String), String) {
+/// Traverses all prompts/list pages and returns typed declarations.
+pub fn list_prompts(client: Client) -> Result(List(PromptDeclaration), String) {
+  list_prompt_declarations(client)
+}
+
+/// Compatibility surface that preserves each declaration as checked JSON.
+pub fn list_prompts_json(client: Client) -> Result(List(String), String) {
   list_json_pages(client, "prompts/list", "prompts")
+}
+
+/// Lists tools as typed declarations while retaining arbitrary JSON Schema.
+pub fn list_tool_declarations(
+  client: Client,
+) -> Result(List(ToolDeclaration), String) {
+  case list_json_pages(client, "tools/list", "tools") {
+    Error(reason) -> Error(reason)
+    Ok(items) -> decode_json_items(items, decode_tool_declaration)
+  }
+}
+
+/// Lists resources as typed declarations.
+pub fn list_resource_declarations(
+  client: Client,
+) -> Result(List(ResourceDeclaration), String) {
+  case list_json_pages(client, "resources/list", "resources") {
+    Error(reason) -> Error(reason)
+    Ok(items) -> decode_json_items(items, decode_resource_declaration)
+  }
+}
+
+/// Lists resource templates as typed declarations.
+pub fn list_resource_template_declarations(
+  client: Client,
+) -> Result(List(ResourceTemplateDeclaration), String) {
+  case
+    list_json_pages(client, "resources/templates/list", "resourceTemplates")
+  {
+    Error(reason) -> Error(reason)
+    Ok(items) -> decode_json_items(items, decode_resource_template_declaration)
+  }
+}
+
+/// Lists prompts as typed declarations.
+pub fn list_prompt_declarations(
+  client: Client,
+) -> Result(List(PromptDeclaration), String) {
+  case list_json_pages(client, "prompts/list", "prompts") {
+    Error(reason) -> Error(reason)
+    Ok(items) -> decode_json_items(items, decode_prompt_declaration)
+  }
 }
 
 /// Calls a tool using the supplied input and output codecs.
@@ -389,7 +545,7 @@ pub fn call_tool(
 pub fn read_resource(
   client: Client,
   uri: String,
-) -> Result(List(ResourceContents), String) {
+) -> Result(List(content.ResourceContents), String) {
   use result_value <- result.try(
     jsonrpc_call_result(client, "resources/read", uri, [
       #("uri", json.string(uri)),
@@ -475,8 +631,36 @@ pub fn listen(
   requested: SubscriptionFilter,
 ) -> Result(Subscription, String) {
   case client.transport {
-    StdioTransport(_) ->
-      Error("subscriptions/listen over the stdio client is not implemented")
+    StdioTransport(child) -> {
+      let id = request_id()
+      let body =
+        v2026.encode_subscriptions_listen_request(RequestString(id), requested)
+        |> json.to_string
+        |> bit_array.from_string
+      case
+        stdio_client.subscribe(
+          child,
+          body,
+          id,
+          client.timeout_ms,
+          client.max_response_bytes,
+        )
+      {
+        Error(reason) ->
+          Error("subscription acknowledgement failed: " <> reason)
+        Ok(bytes) ->
+          case decode_subscription_acknowledgement(bytes, id) {
+            Error(reason) -> Error(reason)
+            Ok(notifications) ->
+              Ok(StdioSubscription(
+                child,
+                id,
+                notifications,
+                client.max_response_bytes,
+              ))
+          }
+      }
+    }
     HttpTransport(pid) -> {
       let id = request_id()
       let body =
@@ -506,7 +690,8 @@ pub fn listen(
                   ffi_close_sse(reader)
                   Error(reason)
                 }
-                Ok(notifications) -> Ok(Subscription(reader, id, notifications))
+                Ok(notifications) ->
+                  Ok(HttpSubscription(reader, id, notifications))
               }
           }
       }
@@ -518,7 +703,10 @@ pub fn listen(
 pub fn acknowledged_notifications(
   subscription: Subscription,
 ) -> SubscriptionFilter {
-  subscription.notifications
+  case subscription {
+    HttpSubscription(_, _, notifications) -> notifications
+    StdioSubscription(_, _, notifications, _) -> notifications
+  }
 }
 
 /// Waits for and decodes the next notification from a subscription stream.
@@ -529,18 +717,40 @@ pub fn next_notification(
   case timeout_ms > 0 {
     False -> Error("subscription wait timeout must be positive")
     True ->
-      case ffi_next_sse(subscription.reader, timeout_ms) {
-        Error("timeout") -> Error("subscription notification timed out")
-        Error(reason) -> Error(reason)
-        Ok(bytes) ->
-          decode_subscription_notification(bytes, subscription.request_id)
+      case subscription {
+        HttpSubscription(reader, request_id, _) ->
+          case ffi_next_sse(reader, timeout_ms) {
+            Error("timeout") -> Error("subscription notification timed out")
+            Error(reason) -> Error(reason)
+            Ok(bytes) -> decode_subscription_notification(bytes, request_id)
+          }
+        StdioSubscription(child, request_id, _, max_response_bytes) ->
+          case
+            stdio_client.next_notification(
+              child,
+              request_id,
+              timeout_ms,
+              max_response_bytes,
+            )
+          {
+            Error("stdio notification timed out") ->
+              Error("subscription notification timed out")
+            Error(reason) -> Error(reason)
+            Ok(bytes) -> decode_subscription_notification(bytes, request_id)
+          }
       }
   }
 }
 
 /// Cancels this stream without closing other requests on the shared connection.
 pub fn close_subscription(subscription: Subscription) -> Nil {
-  ffi_close_sse(subscription.reader)
+  case subscription {
+    HttpSubscription(reader, _, _) -> ffi_close_sse(reader)
+    StdioSubscription(child, request_id, _, _) -> {
+      let _ = stdio_client.cancel_subscription(child, request_id)
+      Nil
+    }
+  }
 }
 
 fn decode_subscription_acknowledgement(
@@ -747,7 +957,7 @@ fn completion_ref_to_json(reference: completion.CompletionRef) -> json.Json {
 
 fn decode_resource_contents_list(
   contents: List(Dynamic),
-) -> Result(List(ResourceContents), String) {
+) -> Result(List(content.ResourceContents), String) {
   case contents {
     [] -> Ok([])
     [raw, ..rest] ->
@@ -887,7 +1097,10 @@ fn validate_jsonrpc_result(
 fn decode_tool_response(
   bytes: BitArray,
   expected_id: String,
-) -> Result(#(Bool, Option(blueprint_value.Value), List(ContentBlock)), String) {
+) -> Result(
+  #(Bool, Option(blueprint_value.Value), List(content.ContentBlock)),
+  String,
+) {
   case bit_array.to_string(bytes) {
     Error(_) -> Error("tool response was not UTF-8")
     Ok(raw) ->
@@ -939,7 +1152,7 @@ fn optional_bool(
 
 fn decode_content_blocks(
   blocks: List(Dynamic),
-) -> Result(List(ContentBlock), String) {
+) -> Result(List(content.ContentBlock), String) {
   case blocks {
     [] -> Ok([])
     [block, ..rest] ->
@@ -951,32 +1164,34 @@ fn decode_content_blocks(
   }
 }
 
-fn decode_content_block(block: Dynamic) -> Result(ContentBlock, String) {
+fn decode_content_block(
+  block: Dynamic,
+) -> Result(content.ContentBlock, String) {
   use block_type <- result.try(string_field(block, ["type"]))
   case block_type {
     "text" ->
       decode_annotations(block)
       |> result.try(fn(annotations) {
         string_field(block, ["text"])
-        |> result.map(fn(text) { TextContent(text, annotations) })
+        |> result.map(fn(text) { content.TextContent(text, annotations) })
       })
     "image" ->
       decode_annotations(block)
       |> result.try(fn(annotations) {
         use data <- result.try(string_field(block, ["data"]))
         use mime_type <- result.try(string_field(block, ["mimeType"]))
-        Ok(ImageContent(data, mime_type, annotations))
+        Ok(content.ImageContent(data, mime_type, annotations))
       })
     "audio" ->
       decode_annotations(block)
       |> result.try(fn(annotations) {
         use data <- result.try(string_field(block, ["data"]))
         use mime_type <- result.try(string_field(block, ["mimeType"]))
-        Ok(AudioContent(data, mime_type, annotations))
+        Ok(content.AudioContent(data, mime_type, annotations))
       })
     "resource_link" ->
       decode_resource_link(block)
-      |> result.map(ResourceLinkBlock)
+      |> result.map(content.ResourceLinkBlock)
     "resource" ->
       decode_annotations(block)
       |> result.try(fn(annotations) {
@@ -985,7 +1200,10 @@ fn decode_content_block(block: Dynamic) -> Result(ContentBlock, String) {
         |> result.try(fn(resource) {
           decode_resource_contents(resource)
           |> result.map(fn(contents) {
-            EmbeddedResourceBlock(EmbeddedResource(contents, annotations))
+            content.EmbeddedResourceBlock(content.EmbeddedResource(
+              contents,
+              annotations,
+            ))
           })
         })
       })
@@ -993,7 +1211,9 @@ fn decode_content_block(block: Dynamic) -> Result(ContentBlock, String) {
   }
 }
 
-fn decode_resource_link(value: Dynamic) -> Result(ResourceLink, String) {
+fn decode_resource_link(
+  value: Dynamic,
+) -> Result(content.ResourceLink, String) {
   use uri <- result.try(string_field(value, ["uri"]))
   use name <- result.try(string_field(value, ["name"]))
   use title <- result.try(optional_string_field(value, ["title"]))
@@ -1001,12 +1221,20 @@ fn decode_resource_link(value: Dynamic) -> Result(ResourceLink, String) {
   use mime_type <- result.try(optional_string_field(value, ["mimeType"]))
   use size <- result.try(optional_int_field(value, ["size"]))
   use annotations <- result.try(decode_annotations(value))
-  Ok(ResourceLink(uri, name, title, description, mime_type, size, annotations))
+  Ok(content.ResourceLink(
+    uri,
+    name,
+    title,
+    description,
+    mime_type,
+    size,
+    annotations,
+  ))
 }
 
 fn decode_resource_contents(
   value: Dynamic,
-) -> Result(ResourceContents, String) {
+) -> Result(content.ResourceContents, String) {
   use uri <- result.try(string_field(value, ["uri"]))
   use mime_type <- result.try(optional_string_field(value, ["mimeType"]))
   use fields <- result.try(
@@ -1019,17 +1247,19 @@ fn decode_resource_contents(
   case dict.get(fields, "text"), dict.get(fields, "blob") {
     Ok(raw), Error(_) ->
       dyn_decode.run(raw, dyn_decode.string)
-      |> result.map(TextResourceContents(uri, _, mime_type))
+      |> result.map(content.TextResourceContents(uri, _, mime_type))
       |> result.map_error(fn(_) { "resource text must be a string" })
     Error(_), Ok(raw) ->
       dyn_decode.run(raw, dyn_decode.string)
-      |> result.map(BlobResourceContents(uri, _, mime_type))
+      |> result.map(content.BlobResourceContents(uri, _, mime_type))
       |> result.map_error(fn(_) { "resource blob must be a string" })
     _, _ -> Error("resource contents must contain exactly one of text or blob")
   }
 }
 
-fn decode_annotations(value: Dynamic) -> Result(Option(Annotations), String) {
+fn decode_annotations(
+  value: Dynamic,
+) -> Result(Option(content.Annotations), String) {
   case
     dyn_decode.run(value, dyn_decode.at(["annotations"], dyn_decode.dynamic))
   {
@@ -1040,7 +1270,9 @@ fn decode_annotations(value: Dynamic) -> Result(Option(Annotations), String) {
   }
 }
 
-fn decode_annotation_object(value: Dynamic) -> Result(Annotations, String) {
+fn decode_annotation_object(
+  value: Dynamic,
+) -> Result(content.Annotations, String) {
   use fields <- result.try(
     dyn_decode.run(
       value,
@@ -1052,13 +1284,139 @@ fn decode_annotation_object(value: Dynamic) -> Result(Annotations, String) {
   use priority <- result.try(optional_float(fields, "priority"))
   use title <- result.try(optional_string(fields, "title"))
   use description <- result.try(optional_string(fields, "description"))
-  Ok(Annotations(audience, priority, title, description))
+  Ok(content.Annotations(audience, priority, title, description))
+}
+
+fn decode_declaration_annotations(
+  value: Dynamic,
+) -> Result(Option(Annotations), String) {
+  case
+    dyn_decode.run(value, dyn_decode.at(["annotations"], dyn_decode.dynamic))
+  {
+    Error(_) -> Ok(None)
+    Ok(raw) -> {
+      use fields <- result.try(
+        dyn_decode.run(
+          raw,
+          dyn_decode.dict(dyn_decode.string, dyn_decode.dynamic),
+        )
+        |> result.map_error(fn(_) {
+          "declaration annotations must be an object"
+        }),
+      )
+      use audience <- result.try(optional_roles(fields, "audience"))
+      use priority <- result.try(optional_float(fields, "priority"))
+      use last_modified <- result.try(optional_string(fields, "lastModified"))
+      Ok(Some(Annotations(audience, priority, last_modified)))
+    }
+  }
+}
+
+fn decode_tool_annotations(
+  value: Dynamic,
+) -> Result(Option(ToolAnnotations), String) {
+  case
+    dyn_decode.run(value, dyn_decode.at(["annotations"], dyn_decode.dynamic))
+  {
+    Error(_) -> Ok(None)
+    Ok(raw) -> {
+      use fields <- result.try(
+        dyn_decode.run(
+          raw,
+          dyn_decode.dict(dyn_decode.string, dyn_decode.dynamic),
+        )
+        |> result.map_error(fn(_) { "tool annotations must be an object" }),
+      )
+      use title <- result.try(optional_string(fields, "title"))
+      use read_only_hint <- result.try(optional_bool_dict(
+        fields,
+        "readOnlyHint",
+      ))
+      use destructive_hint <- result.try(optional_bool_dict(
+        fields,
+        "destructiveHint",
+      ))
+      use idempotent_hint <- result.try(optional_bool_dict(
+        fields,
+        "idempotentHint",
+      ))
+      use open_world_hint <- result.try(optional_bool_dict(
+        fields,
+        "openWorldHint",
+      ))
+      Ok(
+        Some(ToolAnnotations(
+          title,
+          read_only_hint,
+          destructive_hint,
+          idempotent_hint,
+          open_world_hint,
+        )),
+      )
+    }
+  }
+}
+
+fn decode_icons(value: Dynamic) -> Result(Option(List(Icon)), String) {
+  case dyn_decode.run(value, dyn_decode.at(["icons"], dyn_decode.dynamic)) {
+    Error(_) -> Ok(None)
+    Ok(raw) -> {
+      use values <- result.try(
+        dyn_decode.run(raw, dyn_decode.list(dyn_decode.dynamic))
+        |> result.map_error(fn(_) { "declaration icons must be an array" }),
+      )
+      decode_icon_values(values)
+      |> result.map(Some)
+    }
+  }
+}
+
+fn decode_icon_values(values: List(Dynamic)) -> Result(List(Icon), String) {
+  case values {
+    [] -> Ok([])
+    [value, ..rest] ->
+      decode_icon(value)
+      |> result.try(fn(icon) {
+        decode_icon_values(rest)
+        |> result.map(fn(decoded_rest) { [icon, ..decoded_rest] })
+      })
+  }
+}
+
+fn decode_icon(value: Dynamic) -> Result(Icon, String) {
+  use src <- result.try(string_field(value, ["src"]))
+  use mime_type <- result.try(optional_string_field(value, ["mimeType"]))
+  use sizes <- result.try(
+    case dyn_decode.run(value, dyn_decode.at(["sizes"], dyn_decode.dynamic)) {
+      Error(_) -> Ok(None)
+      Ok(raw) ->
+        dyn_decode.run(raw, dyn_decode.list(dyn_decode.string))
+        |> result.map(Some)
+        |> result.map_error(fn(_) { "icon sizes must be an array of strings" })
+    },
+  )
+  use theme <- result.try(
+    case dyn_decode.run(value, dyn_decode.at(["theme"], dyn_decode.dynamic)) {
+      Error(_) -> Ok(None)
+      Ok(raw) ->
+        case dyn_decode.run(raw, dyn_decode.string) {
+          Error(_) -> Error("icon theme is invalid")
+          Ok(name) ->
+            case name {
+              "light" -> Ok(Some(IconLight))
+              "dark" -> Ok(Some(IconDark))
+              _ -> Error("icon theme must be light or dark")
+            }
+        }
+    },
+  )
+  Ok(Icon(src, mime_type, sizes, theme))
 }
 
 fn optional_roles(
   fields: Dict(String, Dynamic),
   key: String,
-) -> Result(Option(List(Role)), String) {
+) -> Result(Option(List(content.Role)), String) {
   case dict.get(fields, key) {
     Error(_) -> Ok(None)
     Ok(raw) ->
@@ -1073,17 +1431,17 @@ fn optional_roles(
   }
 }
 
-fn decode_roles(values: List(String)) -> Result(List(Role), String) {
+fn decode_roles(values: List(String)) -> Result(List(content.Role), String) {
   case values {
     [] -> Ok([])
     [value, ..rest] ->
       case value {
         "user" ->
           decode_roles(rest)
-          |> result.map(fn(rest) { [UserRole, ..rest] })
+          |> result.map(fn(rest) { [content.UserRole, ..rest] })
         "assistant" ->
           decode_roles(rest)
-          |> result.map(fn(rest) { [AssistantRole, ..rest] })
+          |> result.map(fn(rest) { [content.AssistantRole, ..rest] })
         _ -> Error("content annotation audience has an unknown role")
       }
   }
@@ -1101,6 +1459,19 @@ fn optional_float(
       |> result.map_error(fn(_) {
         "content annotation priority must be numeric"
       })
+  }
+}
+
+fn optional_bool_dict(
+  fields: Dict(String, Dynamic),
+  key: String,
+) -> Result(Option(Bool), String) {
+  case dict.get(fields, key) {
+    Error(_) -> Ok(None)
+    Ok(raw) ->
+      dyn_decode.run(raw, dyn_decode.bool)
+      |> result.map(Some)
+      |> result.map_error(fn(_) { "tool annotation hint must be boolean" })
   }
 }
 
@@ -1200,35 +1571,276 @@ fn decode_json_list_page(
         Ok(response) ->
           case validate_jsonrpc_result(response, expected_id) {
             Error(reason) -> Error(reason)
-            Ok(_) ->
-              case
-                blueprint_parser.parse_value(
-                  blueprint_parser.default_limits(),
-                  bytes,
+            Ok(result_value) -> {
+              use items <- result.try(
+                dyn_decode.run(
+                  result_value,
+                  dyn_decode.at(
+                    [collection_key],
+                    dyn_decode.list(dyn_decode.dynamic),
+                  ),
                 )
-              {
+                |> result.map_error(fn(_) {
+                  "list response is missing its collection array"
+                }),
+              )
+              use encoded_items <- result.try(dynamic_json_strings(items))
+              use next_cursor <- result.try(
+                optional_string_field(result_value, ["nextCursor"]),
+              )
+              Ok(#(encoded_items, next_cursor))
+            }
+          }
+      }
+  }
+}
+
+fn dynamic_json_strings(values: List(Dynamic)) -> Result(List(String), String) {
+  case values {
+    [] -> Ok([])
+    [value, ..rest] ->
+      dynamic_to_json(value)
+      |> result.map(json.to_string)
+      |> result.try(fn(encoded) {
+        dynamic_json_strings(rest)
+        |> result.map(fn(encoded_rest) { [encoded, ..encoded_rest] })
+      })
+  }
+}
+
+fn decode_json_items(
+  items: List(String),
+  decoder: fn(Dynamic) -> Result(value, String),
+) -> Result(List(value), String) {
+  case items {
+    [] -> Ok([])
+    [raw, ..rest] ->
+      case json.parse(raw, dyn_decode.dynamic) {
+        Error(_) -> Error("list item was not valid JSON")
+        Ok(value) ->
+          case decoder(value) {
+            Error(reason) -> Error(reason)
+            Ok(decoded) ->
+              decode_json_items(rest, decoder)
+              |> result.map(fn(decoded_rest) { [decoded, ..decoded_rest] })
+          }
+      }
+  }
+}
+
+fn decode_tool_declaration(value: Dynamic) -> Result(ToolDeclaration, String) {
+  use name <- result.try(string_field(value, ["name"]))
+  use title <- result.try(optional_string_field(value, ["title"]))
+  use description <- result.try(optional_string_field(value, ["description"]))
+  use raw_input <- result.try(dynamic_field(value, ["inputSchema"]))
+  use input_schema <- result.try(dynamic_to_json(raw_input))
+  use output_schema <- result.try(optional_json_field(value, ["outputSchema"]))
+  use annotations <- result.try(decode_tool_annotations(value))
+  use icons <- result.try(decode_icons(value))
+  use meta <- result.try(optional_json_field(value, ["_meta"]))
+  Ok(ToolDeclaration(
+    name,
+    title,
+    description,
+    input_schema,
+    output_schema,
+    annotations,
+    icons,
+    meta,
+  ))
+}
+
+fn decode_resource_declaration(
+  value: Dynamic,
+) -> Result(ResourceDeclaration, String) {
+  use uri <- result.try(string_field(value, ["uri"]))
+  use name <- result.try(string_field(value, ["name"]))
+  use title <- result.try(optional_string_field(value, ["title"]))
+  use description <- result.try(optional_string_field(value, ["description"]))
+  use mime_type <- result.try(optional_string_field(value, ["mimeType"]))
+  use size <- result.try(optional_int_field(value, ["size"]))
+  use annotations <- result.try(decode_declaration_annotations(value))
+  use icons <- result.try(decode_icons(value))
+  use meta <- result.try(optional_json_field(value, ["_meta"]))
+  Ok(ResourceDeclaration(
+    uri,
+    name,
+    title,
+    description,
+    mime_type,
+    size,
+    annotations,
+    icons,
+    meta,
+  ))
+}
+
+fn decode_resource_template_declaration(
+  value: Dynamic,
+) -> Result(ResourceTemplateDeclaration, String) {
+  use uri_template <- result.try(string_field(value, ["uriTemplate"]))
+  use name <- result.try(string_field(value, ["name"]))
+  use title <- result.try(optional_string_field(value, ["title"]))
+  use description <- result.try(optional_string_field(value, ["description"]))
+  use mime_type <- result.try(optional_string_field(value, ["mimeType"]))
+  use annotations <- result.try(decode_declaration_annotations(value))
+  use icons <- result.try(decode_icons(value))
+  use meta <- result.try(optional_json_field(value, ["_meta"]))
+  Ok(ResourceTemplateDeclaration(
+    uri_template,
+    name,
+    title,
+    description,
+    mime_type,
+    annotations,
+    icons,
+    meta,
+  ))
+}
+
+fn decode_prompt_declaration(
+  value: Dynamic,
+) -> Result(PromptDeclaration, String) {
+  use name <- result.try(string_field(value, ["name"]))
+  use title <- result.try(optional_string_field(value, ["title"]))
+  use description <- result.try(optional_string_field(value, ["description"]))
+  use raw_arguments <- result.try(optional_prompt_arguments(value))
+  use arguments <- result.try(decode_prompt_arguments(raw_arguments))
+  use icons <- result.try(decode_icons(value))
+  use meta <- result.try(optional_json_field(value, ["_meta"]))
+  Ok(PromptDeclaration(name, title, description, arguments, icons, meta))
+}
+
+fn optional_prompt_arguments(value: Dynamic) -> Result(List(Dynamic), String) {
+  use fields <- result.try(
+    dyn_decode.run(
+      value,
+      dyn_decode.dict(dyn_decode.string, dyn_decode.dynamic),
+    )
+    |> result.map_error(fn(_) { "prompt declaration must be an object" }),
+  )
+  case dict.get(fields, "arguments") {
+    Error(_) -> Ok([])
+    Ok(raw) ->
+      dyn_decode.run(raw, dyn_decode.list(dyn_decode.dynamic))
+      |> result.map_error(fn(_) { "prompt declaration arguments are invalid" })
+  }
+}
+
+fn decode_prompt_arguments(
+  values: List(Dynamic),
+) -> Result(List(prompts.PromptArgument), String) {
+  case values {
+    [] -> Ok([])
+    [value, ..rest] -> {
+      use name <- result.try(string_field(value, ["name"]))
+      use description <- result.try(
+        optional_string_field(value, ["description"]),
+      )
+      use required <- result.try(optional_bool_field(value, ["required"]))
+      use title <- result.try(optional_string_field(value, ["title"]))
+      let required = case required {
+        Some(value) -> value
+        None -> False
+      }
+      let argument = prompts.PromptArgument(name, description, required, title)
+      decode_prompt_arguments(rest)
+      |> result.map(fn(decoded_rest) { [argument, ..decoded_rest] })
+    }
+  }
+}
+
+fn optional_json_field(
+  value: Dynamic,
+  path: List(String),
+) -> Result(Option(json.Json), String) {
+  case dyn_decode.run(value, dyn_decode.at(path, dyn_decode.dynamic)) {
+    Error(_) -> Ok(None)
+    Ok(raw) -> dynamic_to_json(raw) |> result.map(Some)
+  }
+}
+
+fn dynamic_to_json(value: Dynamic) -> Result(json.Json, String) {
+  case dyn_decode.run(value, dyn_decode.optional(dyn_decode.dynamic)) {
+    Ok(None) -> Ok(json.null())
+    Error(_) -> Error("JSON value could not be inspected")
+    Ok(Some(non_null)) ->
+      case dyn_decode.run(non_null, dyn_decode.bool) {
+        Ok(boolean) -> Ok(json.bool(boolean))
+        Error(_) ->
+          case dyn_decode.run(non_null, dyn_decode.int) {
+            Ok(integer) -> Ok(json.int(integer))
+            Error(_) ->
+              case dyn_decode.run(non_null, dyn_decode.float) {
+                Ok(decimal) -> Ok(json.float(decimal))
                 Error(_) ->
-                  Error("list response contains an invalid JSON value")
-                Ok(root) ->
-                  case blueprint_at(root, ["result", collection_key]) {
-                    Some(blueprint_value.Array(items)) -> {
-                      let tools =
-                        list.map(
-                          items,
-                          blueprint_migration.value_to_json_string,
+                  case dyn_decode.run(non_null, dyn_decode.string) {
+                    Ok(text) -> Ok(json.string(text))
+                    Error(_) ->
+                      case
+                        dyn_decode.run(
+                          non_null,
+                          dyn_decode.list(dyn_decode.dynamic),
                         )
-                      case blueprint_at(root, ["result", "nextCursor"]) {
-                        None -> Ok(#(tools, None))
-                        Some(blueprint_value.String(cursor)) ->
-                          Ok(#(tools, Some(cursor)))
-                        Some(_) -> Error("list nextCursor must be a string")
+                      {
+                        Ok(values) ->
+                          dynamic_json_list(values)
+                          |> result.map(fn(items) {
+                            json.array(items, fn(item) { item })
+                          })
+                        Error(_) ->
+                          case
+                            dyn_decode.run(
+                              non_null,
+                              dyn_decode.dict(
+                                dyn_decode.string,
+                                dyn_decode.dynamic,
+                              ),
+                            )
+                          {
+                            Ok(fields) -> dynamic_json_object(fields)
+                            Error(_) ->
+                              Error("JSON value has an unsupported type")
+                          }
                       }
-                    }
-                    _ -> Error("list response is missing its collection array")
                   }
               }
           }
       }
+  }
+}
+
+fn dynamic_json_list(values: List(Dynamic)) -> Result(List(json.Json), String) {
+  case values {
+    [] -> Ok([])
+    [value, ..rest] ->
+      dynamic_to_json(value)
+      |> result.try(fn(decoded) {
+        dynamic_json_list(rest)
+        |> result.map(fn(decoded_rest) { [decoded, ..decoded_rest] })
+      })
+  }
+}
+
+fn dynamic_json_object(
+  fields: Dict(String, Dynamic),
+) -> Result(json.Json, String) {
+  dict.to_list(fields)
+  |> dynamic_json_fields
+  |> result.map(json.object)
+}
+
+fn dynamic_json_fields(
+  fields: List(#(String, Dynamic)),
+) -> Result(List(#(String, json.Json)), String) {
+  case fields {
+    [] -> Ok([])
+    [#(key, value), ..rest] ->
+      dynamic_to_json(value)
+      |> result.try(fn(decoded) {
+        dynamic_json_fields(rest)
+        |> result.map(fn(decoded_rest) { [#(key, decoded), ..decoded_rest] })
+      })
   }
 }
 

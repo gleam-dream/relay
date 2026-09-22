@@ -1,45 +1,117 @@
-# Relay Wave 3 final focused review
+# Relay Wave 4 focused rereview
 
 ## Verdict
 
-- **PASS — the HTTP subscription-establishment and dynamic-registry subset is accepted.** The generation-based repair closes the last same-name replacement race while preserving the prior empty-registry, net-change, acknowledgement, cleanup, and bounded-retention guarantees.
-- This review targets the repaired subset in the complete dirty Relay tree against checkpoint `20ad8af`. It does not accept full Wave 3 or package completion.
-- The previously accepted Wave 3 subset remains accepted. The deferred package work listed in `WAVE-3-REPORT.md` remains outside this verdict.
+- **PASS — accept the focused correction subset.** The four HIGH findings in
+  `relay-wave4-review.md` are closed in the dirty Relay tree based on checkpoint
+  `c293b53`. No new blocking finding was found within those repaired surfaces.
+- This verdict accepts the pure authorization contract, exact typed declaration
+  preservation, and the repaired stdio subscription lifetime and buffering
+  behavior. It does not accept the full Wave 4 work order, full MCP coverage,
+  package completion, release readiness, or production authorization.
+- Protected HTTP routing, bearer extraction, RFC 9728 metadata and challenges,
+  JWT/JWKS or introspection, client authorization, `2025-11-25` compatibility,
+  Tasks/Apps, direct TS/Python client fixtures, full test helpers, logging, and
+  release hardening remain deferred. In particular, the constructible verifier
+  attestation is a trusted pure adapter assertion; it does not prove token
+  parsing, signature validation, issuer/expiry checks, key rotation, or HTTP
+  enforcement.
 
-## Final finding closure
+## Closure of the prior HIGH findings
 
-### Same-name replacement during establishment
+### Accepted · verifier attestation, exact admission, and registry-use rechecks
 
-- The prior HIGH finding is closed. `HubState` now owns a monotonic registry generation, and `HubGetServer` returns that generation with the immutable server and tool snapshot.
-- Accepted registration increments the generation at `src/relay/transport/http.gleam:161-177`. Accepted removal increments it at `src/relay/transport/http.gleam:180-193`; duplicate registration and absent-name removal leave it unchanged.
-- `RegisterSubscription` compares the snapshot generation with the current generation inside the serialized hub actor. A changed generation causes the runtime to unregister every snapshot tool, register every current tool, and enqueue one tools-list notification before the hub reports successful registration.
-- This complete current-state reconciliation preserves a removal followed by registration under the same name. It also covers net additions and removals without comparing handler closures or retaining mutation history.
+- `src/relay/authorization.gleam:69-75,94-135` makes the verifier return an
+  explicit attestation containing the principal, audiences, and actual scopes.
+- `src/relay/authorization.gleam:207-225` admits only a singleton audience equal
+  to the configured resource, checks every configured endpoint scope, rejects
+  absent, duplicate, additional, and wrong audiences, and retains the complete
+  attested scope list in the opaque grant.
+- `src/relay/authorization.gleam:242-253,272-335` checks the grant against the
+  protected registry's resource and endpoint scopes before tool lookup, policy,
+  argument decoding, or handler dispatch. Listing and dispatch both use this
+  check. Unknown, hidden, and execution-denied tools remain distinct outcomes.
+- `test/relay/authorization_test.gleam:11-116` exercises successful admission,
+  verifier rejection, wrong and additional audiences, retention of extra
+  attested scopes, cross-resource reuse rejection, and a stronger registry's
+  missing-scope rejection. The source ordering supplies the decisive
+  before-policy and before-dispatch guarantee.
 
-## Direct regression evidence
+### Accepted · complete valid frozen declaration fields
 
-- `http_subscription_reconciles_same_name_replacement_during_establishment_test` pauses the request context after the snapshot, removes `replace-me`, registers a replacement with changed metadata and handler output, and then releases admission.
-- The regression proves the acknowledged filter retains `toolsListChanged`, the stream receives `ToolsListChanged`, a subsequent listing contains `replacement metadata` and excludes `old metadata`, and a call returns `replacement handler`.
-- The empty-registry and populated-registry gate regressions still prove a net addition between snapshot and activation produces a notification and becomes visible to later requests.
-- The 128-cycle churn regression still proves subscription admission depends on the current registry and generation rather than server-lifetime mutation history.
-- The hub-death regression still proves `client.listen` returns an error when the hub stops during admission, so a failed registration cannot expose an acknowledged stream.
+- `src/relay/client.gleam:81-167` separates frozen `Icon`, generic
+  `Annotations`, and `ToolAnnotations` models. Tool, resource, resource-template,
+  and prompt declarations retain all fields in their frozen `2026-07-28`
+  shapes, including icons and `_meta`; arbitrary schemas and metadata remain
+  ordinary `json.Json`.
+- `src/relay/client.gleam:1290-1414,1631-1749` decodes generic
+  `lastModified`, every tool behavior hint, every icon field, optional prompt
+  arguments, and prompt-argument `title`. A missing prompt `arguments` member
+  becomes an empty list, which is an accepted representation of the optional
+  frozen member.
+- `test/fixtures/stdio/declaration-peer` and
+  `test/relay/client_test.gleam:338-390` provide a direct peer regression with
+  tool hints, generic annotations, all icon variants, arbitrary schema and
+  metadata members, and a conforming prompt without `arguments`.
 
-## Bound and cleanup guarantees
+### Accepted · stdio subscription cancellation and shared-child continuity
 
-- `HubState` contains only the current server, active subscriptions, and one generation integer. No change journal, historical `ContextTool`, or removed handler closure remains retained.
-- Reconciliation work is bounded by the snapshot and current registry sizes. A changed generation performs one pass over each list; prior churn count does not affect the work.
-- The SSE broker continues to hold all initial subscription frames. The handler releases them only after successful hub registration.
-- Registration timeout, hub death, and acknowledgement-release failure each queue `UnregisterSubscription` and stop the runtime, SSE actor, and broker. Same-sender mailbox ordering ensures a delayed successful registration is followed by its queued unregister cleanup.
-- The suite retains post-write disconnect and response-bound regressions. It does not contain a deterministic subscription-specific initial-flush failure injection, so that branch remains established by direct code inspection rather than a dedicated regression.
+- `src/relay/client.gleam:745-753` routes stdio close through the owning actor.
+  `src/relay/transport/stdio_client.gleam:398-425,754-794` sends a correlated
+  `notifications/cancelled` frame, records the subscription as closed, removes
+  only its buffered notifications and frames, and makes repeated close
+  idempotent.
+- `test/fixtures/stdio/subscription-lifecycle-peer` remains alive after the
+  subscription handshake and answers discovery only after observing a
+  cancellation. `test/relay/client_test.gleam:392-439` proves cancellation,
+  closed-handle rejection, and successful follow-up discovery on the shared
+  child.
 
-## Independent evidence
+### Accepted · FIFO retention, timeout preservation, bounds, and cleanup
 
-- `nix develop --command gleam test --target erlang` passed: **99 tests, 0 failures**. Expected untrusted-CA and broken-child diagnostics appeared.
-- `./scripts/conformance/run-server-suite.sh` passed: **109 emitted checks across 40 scenarios, 0 failed**. `input-required-result-missing-input-response` emitted zero checks and is not an independently asserted scenario pass.
-- The preceding focused review ran `nix develop --command python3 scripts/relay_schema_check.py`: **17** Relay messages matched the frozen schema and **40** malformed single-field mutations were rejected. The final repair does not change protocol encoding or the schema corpus.
-- `git diff --check 20ad8af` passed.
+- `src/relay/transport/stdio_client.gleam:60-68,350-395,567-721` carries the
+  evolved actor state in `AwaitError`, preserves it on notification timeout,
+  appends retained notifications in arrival order, and removes a matching
+  notification without reordering the rest.
+- `src/relay/transport/stdio_client.gleam:428-457,724-751` applies the 256-frame
+  bound and closes the retained child port before resetting state on idle
+  overflow or child exit. Active request, subscription, and notification waits
+  also close the retained port on terminal framing or buffer errors before
+  clearing the client state.
+- `test/fixtures/stdio/subscription-lifecycle-peer` emits two ordered
+  notifications for subscription B while subscription A is waiting.
+  `test/relay/client_test.gleam:392-439` proves A's timeout preserves both B
+  events and that B receives them FIFO. `test/fixtures/stdio/overflow-peer` and
+  `test/relay/client_test.gleam:441-455` exercise a deterministic 257-frame
+  burst and prove the owned client becomes terminal after cleanup.
 
-## Acceptance boundary
+## Independent gates
 
-- Accepted: HTTP `subscriptions/listen` capability negotiation for empty and populated registries; atomic snapshot-to-activation reconciliation for net additions, net removals, and same-name replacement; dynamic tool list-change delivery; current-registry-bounded reconciliation without retained history; acknowledgement withholding until hub registration; and terminal cleanup for registration failure, timeout, hub death, release failure, and later disconnect.
-- Previously accepted and unchanged: typed stdio request/response methods; explicit-CA HTTPS; the expanded modern wire corpus; retained HTTP backpressure and disconnect cancellation; and strict `2026-07-28` codec behavior.
-- Still incomplete: typed stdio subscriptions, owner-death and comprehensive process-count cleanup, official-peer client fixtures, remaining modern families and admission, authorization, `2025-11-25` compatibility, the public test kit, target matrices, soak/fuzz, and release hardening. These are package-completion gaps rather than blockers for the accepted subset.
+- `nix develop -c gleam test --target erlang`: **107 passed, 0 failed**. The
+  expected untrusted-CA and broken-child diagnostics appeared.
+- `./scripts/conformance/run-server-suite.sh`: **109 passed, 0 failed across 40
+  scenarios**. `input-required-result-missing-input-response` emitted the
+  documented zero checks. This suite covers the unprotected HTTP server and is
+  regression evidence, not evidence for the deferred protected HTTP surface.
+- `nix develop -c gleam check --target erlang`: pass.
+- `nix develop -c gleam format --check`: pass.
+- `nix develop -c python3 scripts/relay_schema_check.py`: **17 valid messages
+  passed; 40 malformed single-field mutations rejected**.
+- `nix develop -c python3 scripts/check_negative_fixtures.py`: **1/1 compiler
+  negative fixture passed**.
+- `nix develop -c ./scripts/verify_checksums.sh`: frozen MCP schema and sibling
+  dependency pins passed.
+- `nix flake check`: pass for the available `aarch64-darwin` checks; Nix reported
+  the other systems as incompatible and omitted them.
+- `git diff --check c293b53`: pass.
+
+## Review limits
+
+- The rereview read the complete dirty Relay working tree, including the new
+  untracked authorization test and stdio fixtures. It made no Relay source
+  edits, commits, remote changes, provider calls, or credential use.
+- The installed implementation-review skill could not run its prescribed
+  four-agent process because this task explicitly prohibited subagents and the
+  skill's referenced primitive files were absent. This report therefore uses a
+  direct focused rereview against the four prior HIGH findings and the supplied
+  acceptance boundary.

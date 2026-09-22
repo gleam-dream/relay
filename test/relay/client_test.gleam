@@ -301,6 +301,160 @@ pub fn stdio_client_skips_notifications_and_rejects_unrelated_responses_test() {
   should.equal(discovery, Error("stdio response ID did not match request"))
 }
 
+pub fn stdio_client_subscriptions_retain_ack_and_notifications_test() {
+  let assert Ok(peer) =
+    client.connect_stdio(client.StdioConfig(
+      executable: "./test/fixtures/stdio/subscription-peer",
+      args: [],
+      timeout_ms: 3000,
+      max_response_bytes: 65_536,
+    ))
+  let requested =
+    subscriptions.SubscriptionFilter(
+      tools_list_changed: True,
+      resources_list_changed: False,
+      prompts_list_changed: False,
+      resource_subscriptions: [],
+    )
+  let outcome = case client.listen(peer, requested) {
+    Error(reason) -> Error(reason)
+    Ok(subscription) -> {
+      let acknowledged = client.acknowledged_notifications(subscription)
+      let notification = client.next_notification(subscription, 1000)
+      client.close_subscription(subscription)
+      Ok(#(acknowledged, notification))
+    }
+  }
+  client.close(peer)
+  case outcome {
+    Error(_reason) -> should.fail()
+    Ok(#(acknowledged, notification)) -> {
+      should.be_true(acknowledged.tools_list_changed)
+      should.equal(notification, Ok(client.ToolsListChanged))
+    }
+  }
+}
+
+pub fn stdio_client_preserves_frozen_declaration_fields_test() {
+  let assert Ok(peer) =
+    client.connect_stdio(client.StdioConfig(
+      executable: "./test/fixtures/stdio/declaration-peer",
+      args: [],
+      timeout_ms: 3000,
+      max_response_bytes: 65_536,
+    ))
+  let assert Ok([tool]) = client.list_tool_declarations(peer)
+  let assert Ok([resource]) = client.list_resource_declarations(peer)
+  let assert Ok([template]) = client.list_resource_template_declarations(peer)
+  let assert Ok([prompt]) = client.list_prompt_declarations(peer)
+  client.close(peer)
+
+  should.equal(tool.name, "annotated")
+  case tool.annotations, tool.icons {
+    Some(client.ToolAnnotations(
+      title,
+      read_only,
+      destructive,
+      idempotent,
+      open_world,
+    )),
+      Some([
+        client.Icon(src, Some(mime_type), Some([size]), Some(client.IconDark)),
+      ])
+    -> {
+      should.equal(title, Some("Safe lookup"))
+      should.equal(read_only, Some(True))
+      should.equal(destructive, Some(False))
+      should.equal(idempotent, Some(True))
+      should.equal(open_world, Some(False))
+      should.equal(src, "https://example.test/tool.svg")
+      should.equal(mime_type, "image/svg+xml")
+      should.equal(size, "any")
+    }
+    _, _ -> should.fail()
+  }
+  case resource.annotations, resource.icons {
+    Some(client.Annotations(audience, priority, last_modified)),
+      Some([client.Icon(_, _, Some(["48x48"]), Some(client.IconLight))])
+    -> {
+      should.equal(audience, Some([content.UserRole]))
+      should.equal(priority, Some(0.5))
+      should.equal(last_modified, Some("2026-09-22T00:00:00Z"))
+    }
+    _, _ -> should.fail()
+  }
+  should.equal(template.uri_template, "memory://annotated/{name}")
+  should.be_true(template.icons != None)
+  should.equal(prompt.arguments, [])
+  should.be_true(prompt.icons != None)
+}
+
+pub fn stdio_subscription_is_ordered_cancellable_and_timeout_safe_test() {
+  let assert Ok(peer) =
+    client.connect_stdio(client.StdioConfig(
+      executable: "./test/fixtures/stdio/subscription-lifecycle-peer",
+      args: [],
+      timeout_ms: 3000,
+      max_response_bytes: 65_536,
+    ))
+  let requested =
+    subscriptions.SubscriptionFilter(
+      tools_list_changed: True,
+      resources_list_changed: False,
+      prompts_list_changed: True,
+      resource_subscriptions: [],
+    )
+  let assert Ok(first) = client.listen(peer, requested)
+  let assert Ok(second) = client.listen(peer, requested)
+
+  should.equal(
+    client.next_notification(first, 300),
+    Error("subscription notification timed out"),
+  )
+  should.equal(
+    client.next_notification(second, 1000),
+    Ok(client.ToolsListChanged),
+  )
+  should.equal(
+    client.next_notification(second, 1000),
+    Ok(client.PromptsListChanged),
+  )
+
+  client.close_subscription(second)
+  let discovery = client.discover(peer)
+  should.equal(
+    client.next_notification(second, 100),
+    Error("stdio subscription is closed"),
+  )
+  client.close_subscription(first)
+  client.close(peer)
+  case discovery {
+    Error(_) -> should.fail()
+    Ok(result) ->
+      should.equal(
+        result.server_info,
+        Some(client.ServerInfo("lifecycle-peer", "1")),
+      )
+  }
+}
+
+pub fn stdio_frame_overflow_closes_the_owned_child_test() {
+  let assert Ok(peer) =
+    client.connect_stdio(client.StdioConfig(
+      executable: "./test/fixtures/stdio/overflow-peer",
+      args: [],
+      timeout_ms: 3000,
+      max_response_bytes: 65_536,
+    ))
+  let first = client.discover(peer)
+  case first {
+    Error(reason) -> should.be_true(string.contains(reason, "buffer exceeded"))
+    Ok(_) -> should.fail()
+  }
+  should.equal(client.discover(peer), Error("stdio client is closed"))
+  client.close(peer)
+}
+
 pub fn gun_http_client_discovery_and_typed_call_test() {
   let policy =
     http.HttpPolicy(
@@ -387,24 +541,24 @@ pub fn gun_http_client_discovery_and_typed_call_test() {
 
   let assert Ok(tools) = client.list_tools(peer)
   should.equal(list.length(tools), 107)
-  should.be_true(list.any(tools, fn(tool) { string.contains(tool, "list-1") }))
+  should.be_true(
+    list.any(tools, fn(declaration) { declaration.name == "list-1" }),
+  )
   let assert Ok(resource_list) = client.list_resources(peer)
   should.be_true(
     list.any(resource_list, fn(resource) {
-      string.contains(resource, "memory://client-note")
+      resource.uri == "memory://client-note"
     }),
   )
   let assert Ok(template_list) = client.list_resource_templates(peer)
   should.be_true(
     list.any(template_list, fn(template) {
-      string.contains(template, "memory://client/{name}")
+      template.uri_template == "memory://client/{name}"
     }),
   )
   let assert Ok(prompt_list) = client.list_prompts(peer)
   should.be_true(
-    list.any(prompt_list, fn(prompt) {
-      string.contains(prompt, "client-prompt")
-    }),
+    list.any(prompt_list, fn(prompt) { prompt.name == "client-prompt" }),
   )
 
   let assert Ok(name) = relay.tool_name("echo")
@@ -644,7 +798,7 @@ pub fn http_subscription_receives_requested_list_change_test() {
           timeout_ms: 3000,
           max_response_bytes: 65_536,
         ))
-      let listed = client.list_tools(registry_peer)
+      let listed = client.list_tools_json(registry_peer)
       let called =
         client.call_tool(
           registry_peer,
@@ -655,7 +809,7 @@ pub fn http_subscription_receives_requested_list_change_test() {
         )
       let removed = http.unregister_tool(listener, dynamic_name)
       let removal_notification = client.next_notification(subscription, 1000)
-      let listed_after_removal = client.list_tools(registry_peer)
+      let listed_after_removal = client.list_tools_json(registry_peer)
       client.close(registry_peer)
       client.close_subscription(subscription)
       Ok(#(
@@ -811,7 +965,7 @@ fn assert_subscription_reconciles_tool_change(
       let listing_result = process.new_subject()
       let _ =
         process.spawn_unlinked(fn() {
-          process.send(listing_result, client.list_tools(registry_peer))
+          process.send(listing_result, client.list_tools_json(registry_peer))
         })
       let listing = process.receive(listing_result, within: 3000)
       client.close(registry_peer)
@@ -934,7 +1088,7 @@ pub fn http_subscription_reconciles_same_name_replacement_during_establishment_t
           timeout_ms: 3000,
           max_response_bytes: 65_536,
         ))
-      let listing = client.list_tools(registry_peer)
+      let listing = client.list_tools_json(registry_peer)
       let called =
         client.call_tool(
           registry_peer,
