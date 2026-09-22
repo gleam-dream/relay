@@ -33,7 +33,7 @@ pub type RuntimeError {
   RuntimeStopped
 }
 
-pub type RuntimeMessage(context) {
+type RuntimeMessage(context) {
   ReceiveFrame(
     exchange: ExchangeId,
     context: context,

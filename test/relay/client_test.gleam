@@ -5,13 +5,12 @@ import gleam/erlang/process
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/string
 import gleeunit
 import gleeunit/should
 import json/blueprint/codec
 import json/blueprint/number
-import relay
 import relay/client
 import relay/completion
 import relay/content
@@ -19,6 +18,7 @@ import relay/prompts
 import relay/resources
 import relay/server
 import relay/subscriptions
+import relay/tool
 import relay/transport/http
 
 @external(erlang, "relay_http_ffi", "disconnect_after_first_sse_event")
@@ -33,53 +33,121 @@ pub fn main() -> Nil {
   gleeunit.main()
 }
 
+fn open_http_client(
+  host: String,
+  port: Int,
+  path: String,
+  secure: Bool,
+  timeout_ms: Int,
+  max_response_bytes: Int,
+  ca_cert_file: Option(String),
+) -> Result(client.Client, client.ClientError) {
+  let scheme = case secure {
+    True -> "https://"
+    False -> "http://"
+  }
+  let url = scheme <> host <> ":" <> int.to_string(port) <> path
+  case client.http_config(url) {
+    Error(error) -> Error(error)
+    Ok(config) -> {
+      let config =
+        config
+        |> client.with_timeout(timeout_ms)
+        |> client.with_max_response_bytes(max_response_bytes)
+      let config = case ca_cert_file {
+        None -> config
+        Some(file) -> client.with_ca_cert_file(config, file)
+      }
+      client.connect_http(config)
+    }
+  }
+}
+
 fn local_server() -> server.Server(Nil) {
-  let assert Ok(name) = relay.tool_name("echo")
-  let assert Ok(echo_tool) =
-    relay.context_tool(
-      name,
-      relay.empty_metadata(),
-      codec.field("name", codec.string()),
-      codec.string(),
-      codec.object(codec.empty()),
-      fn(_context, value) { Ok("hello " <> value) },
-    )
-  let assert Ok(fail_name) = relay.tool_name("fail")
-  let assert Ok(fail_tool) =
-    relay.context_tool(
+  let assert Ok(name) = tool.tool_name("echo")
+  let assert Ok(echo_tool) = case
+    tool.definition(name, codec.field("name", codec.string()), codec.string())
+  {
+    Ok(definition) -> {
+      let definition = tool.with_metadata(definition, tool.empty_metadata())
+      Ok(
+        tool.handle_with_error_renderer(
+          definition,
+          fn(value) { Ok("hello " <> value) },
+          fn(application_error) {
+            case
+              codec.encode_json(codec.object(codec.empty()), application_error)
+            {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        ),
+      )
+    }
+    Error(error) -> Error(error)
+  }
+  let assert Ok(fail_name) = tool.tool_name("fail")
+  let assert Ok(fail_tool) = case
+    tool.definition(
       fail_name,
-      relay.empty_metadata(),
       codec.field("name", codec.string()),
       codec.string(),
-      fail_error_codec(),
-      fn(_context, _value) {
-        Error(#("not_found", "The requested record is unavailable."))
-      },
     )
-  let assert Ok(error_encoding_name) = relay.tool_name("error_encoding")
+  {
+    Ok(definition) -> {
+      let definition = tool.with_metadata(definition, tool.empty_metadata())
+      Ok(
+        tool.handle_with_error_renderer(
+          definition,
+          fn(_value) {
+            Error(#("not_found", "The requested record is unavailable."))
+          },
+          fn(application_error) {
+            case codec.encode_json(fail_error_codec(), application_error) {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        ),
+      )
+    }
+    Error(error) -> Error(error)
+  }
+  let assert Ok(error_encoding_name) = tool.tool_name("error_encoding")
   let assert Ok(error_codec) = codec.integer_between(0, 10)
-  let assert Ok(error_encoding_tool) =
-    relay.context_tool(
+  let assert Ok(error_encoding_tool) = case
+    tool.definition(
       error_encoding_name,
-      relay.empty_metadata(),
       codec.field("name", codec.string()),
       codec.string(),
-      error_codec,
-      fn(_context, _value) { Error(11) },
     )
-  let assert Ok(say_name) = relay.tool_name("say")
-  let assert Ok(say_tool) =
-    relay.context_tool_with_content(
-      say_name,
-      relay.empty_metadata(),
-      codec.field("name", codec.string()),
-      codec.string(),
-      codec.string(),
-      fn(_context, _value) {
-        Ok(#(None, [content.text_content("content-only reply")]))
-      },
-    )
-  let assert Ok(rich_name) = relay.tool_name("rich")
+  {
+    Ok(definition) -> {
+      let definition = tool.with_metadata(definition, tool.empty_metadata())
+      Ok(
+        tool.handle_with_error_renderer(
+          definition,
+          fn(_value) { Error(11) },
+          fn(application_error) {
+            case codec.encode_json(error_codec, application_error) {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        ),
+      )
+    }
+    Error(error) -> Error(error)
+  }
+  let assert Ok(say_name) = tool.tool_name("say")
+  let assert Ok(say_definition) =
+    tool.content_definition(say_name, codec.field("name", codec.string()))
+  let say_tool =
+    tool.handle_content(say_definition, fn(_value) {
+      Ok([content.text_content("content-only reply")])
+    })
+  let assert Ok(rich_name) = tool.tool_name("rich")
   let rich_blocks = [
     content.ImageContent("aGVsbG8=", "image/png", Some(rich_annotations())),
     content.AudioContent("AQID", "audio/wav", None),
@@ -101,40 +169,99 @@ fn local_server() -> server.Server(Nil) {
       None,
     )),
   ]
-  let assert Ok(rich_tool) =
-    relay.context_tool_with_content(
+  let assert Ok(rich_tool) = case
+    tool.definition(
       rich_name,
-      relay.empty_metadata(),
       codec.field("name", codec.string()),
       codec.string(),
-      codec.string(),
-      fn(_context, _value) { Ok(#(None, rich_blocks)) },
     )
-  let assert Ok(exact_name) = relay.tool_name("exact")
-  let assert Ok(exact_tool) =
-    relay.context_tool(
+  {
+    Ok(definition) -> {
+      let definition = tool.with_metadata(definition, tool.empty_metadata())
+      Ok({
+        let user_handler = fn(_context, _value) { Ok(#(None, rich_blocks)) }
+        let advanced_handler = fn(call, typed_input) {
+          let tool.HandlerCallContext(
+            application,
+            _input_responses,
+            _report_progress,
+          ) = call
+          case user_handler(application, typed_input) {
+            Ok(#(Some(output), blocks)) -> Ok(tool.Complete(output, blocks))
+            Ok(#(None, blocks)) -> Ok(tool.Content(blocks))
+          }
+        }
+        tool.handle_advanced_with_error_renderer(
+          definition,
+          advanced_handler,
+          fn(application_error) {
+            case codec.encode_json(codec.string(), application_error) {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        )
+      })
+    }
+    Error(error) -> Error(error)
+  }
+  let assert Ok(exact_name) = tool.tool_name("exact")
+  let assert Ok(exact_tool) = case
+    tool.definition(
       exact_name,
-      relay.empty_metadata(),
       codec.field("value", codec.number()),
       codec.number(),
-      codec.string(),
-      fn(_context, value) { Ok(value) },
     )
-  let assert Ok(slow_name) = relay.tool_name("slow")
-  let assert Ok(slow_tool) =
-    relay.context_tool(
+  {
+    Ok(definition) -> {
+      let definition = tool.with_metadata(definition, tool.empty_metadata())
+      Ok(
+        tool.handle_with_error_renderer(
+          definition,
+          fn(value) { Ok(value) },
+          fn(application_error) {
+            case codec.encode_json(codec.string(), application_error) {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        ),
+      )
+    }
+    Error(error) -> Error(error)
+  }
+  let assert Ok(slow_name) = tool.tool_name("slow")
+  let assert Ok(slow_tool) = case
+    tool.definition(
       slow_name,
-      relay.empty_metadata(),
       codec.field("name", codec.string()),
       codec.string(),
-      codec.object(codec.empty()),
-      fn(_context, _value) {
-        process.sleep(1500)
-        Ok("finished")
-      },
     )
+  {
+    Ok(definition) -> {
+      let definition = tool.with_metadata(definition, tool.empty_metadata())
+      Ok(
+        tool.handle_with_error_renderer(
+          definition,
+          fn(_value) {
+            process.sleep(1500)
+            Ok("finished")
+          },
+          fn(application_error) {
+            case
+              codec.encode_json(codec.object(codec.empty()), application_error)
+            {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        ),
+      )
+    }
+    Error(error) -> Error(error)
+  }
   let assert Ok(registry) =
-    relay.registry([
+    tool.registry([
       echo_tool,
       fail_tool,
       error_encoding_tool,
@@ -183,13 +310,11 @@ fn local_server() -> server.Server(Nil) {
         Some(False),
       ))
     })
-  server.server_with_services(
-    registry,
-    [readable],
-    [template],
-    [prompt],
-    Some(completion),
-  )
+  server.server(registry)
+  |> server.with_resources([readable])
+  |> server.with_resource_templates([template])
+  |> server.with_prompts([prompt])
+  |> server.with_completion(Some(completion))
 }
 
 fn rich_annotations() -> content.Annotations {
@@ -201,20 +326,40 @@ fn rich_annotations() -> content.Annotations {
   )
 }
 
-fn many_named_tools(count: Int) -> List(relay.ContextTool(Nil)) {
+fn many_named_tools(count: Int) -> List(tool.ContextTool(Nil)) {
   case count <= 0 {
     True -> []
     False -> {
-      let assert Ok(name) = relay.tool_name("list-" <> int.to_string(count))
-      let assert Ok(listed_tool) =
-        relay.context_tool(
+      let assert Ok(name) = tool.tool_name("list-" <> int.to_string(count))
+      let assert Ok(listed_tool) = case
+        tool.definition(
           name,
-          relay.empty_metadata(),
           codec.field("name", codec.string()),
           codec.string(),
-          codec.object(codec.empty()),
-          fn(_context, value) { Ok(value) },
         )
+      {
+        Ok(definition) -> {
+          let definition = tool.with_metadata(definition, tool.empty_metadata())
+          Ok(
+            tool.handle_with_error_renderer(
+              definition,
+              fn(value) { Ok(value) },
+              fn(application_error) {
+                case
+                  codec.encode_json(
+                    codec.object(codec.empty()),
+                    application_error,
+                  )
+                {
+                  Ok(text) -> text
+                  Error(_) -> "Tool execution failed."
+                }
+              },
+            ),
+          )
+        }
+        Error(error) -> Error(error)
+      }
       [listed_tool, ..many_named_tools(count - 1)]
     }
   }
@@ -230,29 +375,41 @@ fn fail_error_codec() -> codec.Codec(#(String, String)) {
 }
 
 pub fn http_client_uses_explicit_ca_for_tls_test() {
-  let assert Ok(listener) =
-    http.start_https_server(
-      local_server(),
-      http.HttpOptions(port: 0, host: "127.0.0.1"),
+  let assert Ok(listener) = {
+    let options = http.HttpOptions(port: 0, host: "127.0.0.1")
+    http.listener(local_server(), fn() { Nil })
+    |> http.with_options(options)
+    |> http.with_policy(http.local_http_policy(options.host))
+    |> http.with_tls(
       "test/fixtures/tls/localhost.crt",
       "test/fixtures/tls/localhost.key",
     )
-  let config =
-    client.ClientConfig(
-      host: "localhost",
-      port: http.http_server_port(listener),
-      path: "/",
-      secure: True,
-      timeout_ms: 3000,
-      max_response_bytes: 65_536,
+    |> http.start()
+  }
+  let untrusted_connection =
+    open_http_client(
+      "localhost",
+      http.http_server_port(listener),
+      "/",
+      True,
+      3000,
+      65_536,
+      None,
     )
-  let untrusted_connection = client.connect(config)
   case untrusted_connection {
     Ok(peer) -> client.close(peer)
     Error(_) -> Nil
   }
   let trusted_result =
-    client.connect_with_ca(config, "test/fixtures/tls/root-ca.crt")
+    open_http_client(
+      "localhost",
+      http.http_server_port(listener),
+      "/",
+      True,
+      3000,
+      65_536,
+      Some("test/fixtures/tls/root-ca.crt"),
+    )
   let discovery = case trusted_result {
     Error(client.InvalidClientConfiguration) ->
       Error("explicit CA connection had invalid configuration")
@@ -285,15 +442,17 @@ pub fn stdio_client_uses_typed_request_surface_test() {
       max_response_bytes: 65_536,
     ))
   let discovery = client.discover(peer)
-  let assert Ok(greet_name) = relay.tool_name("greet")
-  let call =
-    client.call_tool(
-      peer,
+  let assert Ok(greet_name) = tool.tool_name("greet")
+  let call = case
+    tool.definition(
       greet_name,
-      "stdio",
       codec.field("name", codec.string()),
       codec.string(),
     )
+  {
+    Ok(definition) -> client.call_definition(peer, definition, "stdio")
+    Error(_) -> client.ProtocolFailure("invalid local tool definition")
+  }
   client.close(peer)
   case discovery {
     Error(_) -> should.fail()
@@ -366,15 +525,15 @@ pub fn stdio_client_preserves_frozen_declaration_fields_test() {
       timeout_ms: 3000,
       max_response_bytes: 65_536,
     ))
-  let assert Ok([tool]) = client.list_tool_declarations(peer)
-  let assert Ok([resource]) = client.list_resource_declarations(peer)
-  let assert Ok([template]) = client.list_resource_template_declarations(peer)
-  let assert Ok([prompt]) = client.list_prompt_declarations(peer)
+  let assert Ok([tool]) = client.list_tools(peer)
+  let assert Ok([resource]) = client.list_resources(peer)
+  let assert Ok([template]) = client.list_resource_templates(peer)
+  let assert Ok([prompt]) = client.list_prompts(peer)
   client.close(peer)
 
   should.equal(tool.name, "annotated")
   case tool.annotations, tool.icons {
-    Some(client.ToolAnnotations(
+    Some(tool.ToolAnnotations(
       title,
       read_only,
       destructive,
@@ -487,21 +646,23 @@ pub fn gun_http_client_discovery_and_typed_call_test() {
       allowed_hosts: ["127.0.0.1"],
       allowed_origins: [],
     )
-  let assert Ok(listener) =
-    http.start_http_server_with_policy(
-      local_server(),
-      http.HttpOptions(port: 0, host: "127.0.0.1"),
-      policy,
-    )
+  let assert Ok(listener) = {
+    let options = http.HttpOptions(port: 0, host: "127.0.0.1")
+    http.listener(local_server(), fn() { Nil })
+    |> http.with_options(options)
+    |> http.with_policy(policy)
+    |> http.start()
+  }
   let assert Ok(peer) =
-    client.connect(client.ClientConfig(
-      host: "127.0.0.1",
-      port: http.http_server_port(listener),
-      path: "/",
-      secure: False,
-      timeout_ms: 3000,
-      max_response_bytes: 65_536,
-    ))
+    open_http_client(
+      "127.0.0.1",
+      http.http_server_port(listener),
+      "/",
+      False,
+      3000,
+      65_536,
+      None,
+    )
 
   let assert Ok(discovery) = client.discover(peer)
   should.be_true(list.contains(discovery.supported_versions, "2026-07-28"))
@@ -584,15 +745,13 @@ pub fn gun_http_client_discovery_and_typed_call_test() {
     list.any(prompt_list, fn(prompt) { prompt.name == "client-prompt" }),
   )
 
-  let assert Ok(name) = relay.tool_name("echo")
-  let outcome =
-    client.call_tool(
-      peer,
-      name,
-      "MCP",
-      codec.field("name", codec.string()),
-      codec.string(),
-    )
+  let assert Ok(name) = tool.tool_name("echo")
+  let outcome = case
+    tool.definition(name, codec.field("name", codec.string()), codec.string())
+  {
+    Ok(definition) -> client.call_definition(peer, definition, "MCP")
+    Error(_) -> client.ProtocolFailure("invalid local tool definition")
+  }
   should.equal(
     outcome,
     client.StructuredSuccess("hello MCP", [
@@ -600,15 +759,17 @@ pub fn gun_http_client_discovery_and_typed_call_test() {
     ]),
   )
 
-  let assert Ok(fail_name) = relay.tool_name("fail")
-  let failure =
-    client.call_tool(
-      peer,
+  let assert Ok(fail_name) = tool.tool_name("fail")
+  let failure = case
+    tool.definition(
       fail_name,
-      "MCP",
       codec.field("name", codec.string()),
       codec.string(),
     )
+  {
+    Ok(definition) -> client.call_definition(peer, definition, "MCP")
+    Error(_) -> client.ProtocolFailure("invalid local tool definition")
+  }
   case failure {
     client.ToolFailure([content.TextContent(error_json, None)]) ->
       codec.decode_json(fail_error_codec(), error_json)
@@ -628,40 +789,34 @@ pub fn gun_http_client_discovery_and_typed_call_test() {
     json.parse(error_response_text, dyn_decode.dynamic)
   dyn_decode.run(
     error_response,
-    dyn_decode.at(["error", "code"], dyn_decode.int),
+    dyn_decode.at(["result", "isError"], dyn_decode.bool),
   )
-  |> should.equal(Ok(-32_603))
-  dyn_decode.run(
-    error_response,
-    dyn_decode.at(["error", "message"], dyn_decode.string),
-  )
-  |> should.equal(Ok("Internal error."))
-  dyn_decode.run(error_response, dyn_decode.at(["result"], dyn_decode.dynamic))
-  |> should.be_error()
+  |> should.equal(Ok(True))
+  string.contains(error_response_text, "Tool execution failed.")
+  |> should.be_true()
 
-  let assert Ok(say_name) = relay.tool_name("say")
+  let assert Ok(say_name) = tool.tool_name("say")
+  let assert Ok(say_definition) =
+    tool.content_definition(say_name, codec.field("name", codec.string()))
   should.equal(
-    client.call_tool(
-      peer,
-      say_name,
-      "MCP",
-      codec.field("name", codec.string()),
-      codec.string(),
-    ),
-    client.ContentOnlySuccess([
+    client.call_content_definition(peer, say_definition, "MCP"),
+    Ok([
       content.TextContent("content-only reply", None),
     ]),
   )
 
-  let assert Ok(rich_name) = relay.tool_name("rich")
+  let assert Ok(rich_name) = tool.tool_name("rich")
   case
-    client.call_tool(
-      peer,
-      rich_name,
-      "MCP",
-      codec.field("name", codec.string()),
-      codec.string(),
-    )
+    case
+      tool.definition(
+        rich_name,
+        codec.field("name", codec.string()),
+        codec.string(),
+      )
+    {
+      Ok(definition) -> client.call_definition(peer, definition, "MCP")
+      Error(_) -> client.ProtocolFailure("invalid local tool definition")
+    }
   {
     client.ContentOnlySuccess(blocks) ->
       should.equal(blocks, [
@@ -692,58 +847,134 @@ pub fn gun_http_client_discovery_and_typed_call_test() {
     "1234567890123456789012345678901234567890.1234567890123456789"
   let assert Ok(number_limits) = number.number_limits(1024, 100, 1000)
   let assert Ok(exact) = number.parse_number(number_limits, exact_token)
-  let assert Ok(exact_name) = relay.tool_name("exact")
-  let exact_outcome =
-    client.call_tool(
-      peer,
+  let assert Ok(exact_name) = tool.tool_name("exact")
+  let exact_outcome = case
+    tool.definition(
       exact_name,
-      exact,
       codec.field("value", codec.number()),
       codec.number(),
     )
+  {
+    Ok(definition) -> client.call_definition(peer, definition, exact)
+    Error(_) -> client.ProtocolFailure("invalid local tool definition")
+  }
   case exact_outcome {
     client.StructuredSuccess(value, _) -> should.equal(value, exact)
     _ -> should.fail()
   }
 
   let assert Ok(timeout_peer) =
-    client.connect(client.ClientConfig(
-      host: "127.0.0.1",
-      port: http.http_server_port(listener),
-      path: "/",
-      secure: False,
-      timeout_ms: 1000,
-      max_response_bytes: 65_536,
-    ))
-  let assert Ok(slow_name) = relay.tool_name("slow")
+    open_http_client(
+      "127.0.0.1",
+      http.http_server_port(listener),
+      "/",
+      False,
+      1000,
+      65_536,
+      None,
+    )
+  let assert Ok(slow_name) = tool.tool_name("slow")
   should.equal(
-    client.call_tool(
-      timeout_peer,
-      slow_name,
-      "MCP",
-      codec.field("name", codec.string()),
-      codec.string(),
-    ),
+    case
+      tool.definition(
+        slow_name,
+        codec.field("name", codec.string()),
+        codec.string(),
+      )
+    {
+      Ok(definition) -> client.call_definition(timeout_peer, definition, "MCP")
+      Error(_) -> client.ProtocolFailure("invalid local tool definition")
+    },
     client.TransportFailure("request timed out"),
   )
   process.sleep(600)
   client.close(timeout_peer)
 
   let assert Ok(bounded_peer) =
-    client.connect(client.ClientConfig(
-      host: "127.0.0.1",
-      port: http.http_server_port(listener),
-      path: "/",
-      secure: False,
-      timeout_ms: 3000,
-      max_response_bytes: 8,
-    ))
+    open_http_client(
+      "127.0.0.1",
+      http.http_server_port(listener),
+      "/",
+      False,
+      3000,
+      8,
+      None,
+    )
   let assert Error(limit_reason) = client.discover(bounded_peer)
   should.equal(limit_reason, "response exceeded configured byte limit")
   client.close(bounded_peer)
 
   client.close(peer)
   http.stop_http_server(listener)
+}
+
+pub fn admitted_definition_uses_plain_mcp_errors_and_typed_client_call_test() {
+  let assert Ok(success_name) = tool.tool_name("definition_success")
+  let assert Ok(default_name) = tool.tool_name("definition_default_error")
+  let assert Ok(rendered_name) = tool.tool_name("definition_rendered_error")
+  let input = codec.field("name", codec.string())
+  let assert Ok(success_definition) =
+    tool.definition(success_name, input, codec.string())
+  let assert Ok(default_definition) =
+    tool.definition(default_name, input, codec.string())
+  let assert Ok(rendered_definition) =
+    tool.definition(rendered_name, input, codec.string())
+  let assert Ok(registry) =
+    tool.registry([
+      tool.handle(success_definition, fn(name) { Ok("hello " <> name) }),
+      tool.handle(default_definition, fn(_name) { Error("private secret") }),
+      tool.handle_with_error_renderer(
+        rendered_definition,
+        fn(_name) { Error("record missing") },
+        fn(error) { "Public: " <> error },
+      ),
+    ])
+  let policy =
+    http.HttpPolicy(
+      max_body_bytes: 4096,
+      max_response_bytes: 65_536,
+      request_timeout_ms: 3000,
+      allowed_hosts: ["127.0.0.1"],
+      allowed_origins: [],
+    )
+  let assert Ok(listener) = {
+    let options = http.HttpOptions(port: 0, host: "127.0.0.1")
+    http.listener(server.server(registry), fn() { Nil })
+    |> http.with_options(options)
+    |> http.with_policy(policy)
+    |> http.start()
+  }
+  let assert Ok(peer) =
+    open_http_client(
+      "127.0.0.1",
+      http.http_server_port(listener),
+      "/",
+      False,
+      3000,
+      65_536,
+      None,
+    )
+  let success = client.call_definition(peer, success_definition, "world")
+  let default_failure =
+    client.call_definition(peer, default_definition, "world")
+  let rendered_failure =
+    client.call_definition(peer, rendered_definition, "world")
+  client.close(peer)
+  http.stop_http_server(listener)
+  should.equal(
+    success,
+    client.StructuredSuccess("hello world", [
+      content.text_content("hello world"),
+    ]),
+  )
+  should.equal(
+    default_failure,
+    client.ToolFailure([content.text_content("Tool execution failed.")]),
+  )
+  should.equal(
+    rendered_failure,
+    client.ToolFailure([content.text_content("Public: record missing")]),
+  )
 }
 
 pub fn http_subscription_receives_requested_list_change_test() {
@@ -755,21 +986,23 @@ pub fn http_subscription_receives_requested_list_change_test() {
       allowed_hosts: ["127.0.0.1"],
       allowed_origins: [],
     )
-  let assert Ok(listener) =
-    http.start_http_server_with_policy(
-      local_server(),
-      http.HttpOptions(port: 0, host: "127.0.0.1"),
-      policy,
-    )
+  let assert Ok(listener) = {
+    let options = http.HttpOptions(port: 0, host: "127.0.0.1")
+    http.listener(local_server(), fn() { Nil })
+    |> http.with_options(options)
+    |> http.with_policy(policy)
+    |> http.start()
+  }
   let assert Ok(peer) =
-    client.connect(client.ClientConfig(
-      host: "127.0.0.1",
-      port: http.http_server_port(listener),
-      path: "/",
-      secure: False,
-      timeout_ms: 3000,
-      max_response_bytes: 65_536,
-    ))
+    open_http_client(
+      "127.0.0.1",
+      http.http_server_port(listener),
+      "/",
+      False,
+      3000,
+      65_536,
+      None,
+    )
 
   let raw_body =
     json.object([
@@ -825,36 +1058,62 @@ pub fn http_subscription_receives_requested_list_change_test() {
   let notification_result = case subscription_result {
     Error(reason) -> Error(reason)
     Ok(subscription) -> {
-      let assert Ok(dynamic_name) = relay.tool_name("late-bound")
-      let assert Ok(dynamic_tool) =
-        relay.context_tool(
+      let assert Ok(dynamic_name) = tool.tool_name("late-bound")
+      let assert Ok(dynamic_tool) = case
+        tool.definition(
           dynamic_name,
-          relay.tool_metadata("Registered after HTTP listener startup"),
           codec.field("name", codec.string()),
           codec.string(),
-          codec.string(),
-          fn(_context, _name) { Ok("arrived") },
         )
+      {
+        Ok(definition) -> {
+          let definition =
+            tool.with_metadata(
+              definition,
+              tool.ToolMetadata(
+                ..tool.empty_metadata(),
+                description: Some("Registered after HTTP listener startup"),
+              ),
+            )
+          Ok(
+            tool.handle_with_error_renderer(
+              definition,
+              fn(_name) { Ok("arrived") },
+              fn(application_error) {
+                case codec.encode_json(codec.string(), application_error) {
+                  Ok(text) -> text
+                  Error(_) -> "Tool execution failed."
+                }
+              },
+            ),
+          )
+        }
+        Error(error) -> Error(error)
+      }
       let registration = http.register_tool(listener, dynamic_tool)
       let received = client.next_notification(subscription, 1000)
       let assert Ok(registry_peer) =
-        client.connect(client.ClientConfig(
-          host: "127.0.0.1",
-          port: http.http_server_port(listener),
-          path: "/",
-          secure: False,
-          timeout_ms: 3000,
-          max_response_bytes: 65_536,
-        ))
+        open_http_client(
+          "127.0.0.1",
+          http.http_server_port(listener),
+          "/",
+          False,
+          3000,
+          65_536,
+          None,
+        )
       let listed = client.list_tools_json(registry_peer)
-      let called =
-        client.call_tool(
-          registry_peer,
+      let called = case
+        tool.definition(
           dynamic_name,
-          "caller",
           codec.field("name", codec.string()),
           codec.string(),
         )
+      {
+        Ok(definition) ->
+          client.call_definition(registry_peer, definition, "caller")
+        Error(_) -> client.ProtocolFailure("invalid local tool definition")
+      }
       let removed = http.unregister_tool(listener, dynamic_name)
       let removal_notification = client.next_notification(subscription, 1000)
       let listed_after_removal = client.list_tools_json(registry_peer)
@@ -916,7 +1175,7 @@ pub fn http_subscription_receives_requested_list_change_test() {
 }
 
 pub fn http_subscription_from_empty_registry_honors_first_tool_change_test() {
-  let assert Ok(registry) = relay.registry([])
+  let assert Ok(registry) = tool.registry([])
   assert_subscription_reconciles_tool_change(
     server.server(registry),
     "first-tool",
@@ -931,16 +1190,34 @@ fn assert_subscription_reconciles_tool_change(
   initial_server: server.Server(Nil),
   late_tool_name: String,
 ) -> Nil {
-  let assert Ok(name) = relay.tool_name(late_tool_name)
-  let assert Ok(late_tool) =
-    relay.context_tool(
-      name,
-      relay.tool_metadata("Registered during subscription establishment"),
-      codec.field("name", codec.string()),
-      codec.string(),
-      codec.string(),
-      fn(_context, _name) { Ok("arrived") },
-    )
+  let assert Ok(name) = tool.tool_name(late_tool_name)
+  let assert Ok(late_tool) = case
+    tool.definition(name, codec.field("name", codec.string()), codec.string())
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some("Registered during subscription establishment"),
+          ),
+        )
+      Ok(
+        tool.handle_with_error_renderer(
+          definition,
+          fn(_name) { Ok("arrived") },
+          fn(application_error) {
+            case codec.encode_json(codec.string(), application_error) {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        ),
+      )
+    }
+    Error(error) -> Error(error)
+  }
   let worker_ready = process.new_subject()
   let registration_result = process.new_subject()
   let _ =
@@ -969,23 +1246,24 @@ fn assert_subscription_reconciles_tool_change(
       allowed_hosts: ["127.0.0.1"],
       allowed_origins: [],
     )
-  let assert Ok(listener) =
-    http.start_http_server_with_context(
-      initial_server,
-      http.HttpOptions(port: 0, host: "127.0.0.1"),
-      context,
-      policy,
-    )
+  let assert Ok(listener) = {
+    let options = http.HttpOptions(port: 0, host: "127.0.0.1")
+    http.listener(initial_server, context)
+    |> http.with_options(options)
+    |> http.with_policy(policy)
+    |> http.start()
+  }
   process.send(command, #(listener, late_tool))
   let assert Ok(peer) =
-    client.connect(client.ClientConfig(
-      host: "127.0.0.1",
-      port: http.http_server_port(listener),
-      path: "/",
-      secure: False,
-      timeout_ms: 3000,
-      max_response_bytes: 65_536,
-    ))
+    open_http_client(
+      "127.0.0.1",
+      http.http_server_port(listener),
+      "/",
+      False,
+      3000,
+      65_536,
+      None,
+    )
   let requested =
     subscriptions.SubscriptionFilter(
       tools_list_changed: True,
@@ -1002,14 +1280,15 @@ fn assert_subscription_reconciles_tool_change(
       let acknowledged = client.acknowledged_notifications(subscription)
       let notification = client.next_notification(subscription, 1000)
       let assert Ok(registry_peer) =
-        client.connect(client.ClientConfig(
-          host: "127.0.0.1",
-          port: http.http_server_port(listener),
-          path: "/",
-          secure: False,
-          timeout_ms: 3000,
-          max_response_bytes: 65_536,
-        ))
+        open_http_client(
+          "127.0.0.1",
+          http.http_server_port(listener),
+          "/",
+          False,
+          3000,
+          65_536,
+          None,
+        )
       let listing_result = process.new_subject()
       let _ =
         process.spawn_unlinked(fn() {
@@ -1046,26 +1325,62 @@ fn assert_subscription_reconciles_tool_change(
 }
 
 pub fn http_subscription_reconciles_same_name_replacement_during_establishment_test() {
-  let assert Ok(name) = relay.tool_name("replace-me")
-  let assert Ok(old_tool) =
-    relay.context_tool(
-      name,
-      relay.tool_metadata("old metadata"),
-      codec.field("name", codec.string()),
-      codec.string(),
-      codec.string(),
-      fn(_context, _value) { Ok("old handler") },
-    )
-  let assert Ok(replacement_tool) =
-    relay.context_tool(
-      name,
-      relay.tool_metadata("replacement metadata"),
-      codec.field("name", codec.string()),
-      codec.string(),
-      codec.string(),
-      fn(_context, _value) { Ok("replacement handler") },
-    )
-  let assert Ok(registry) = relay.registry([old_tool])
+  let assert Ok(name) = tool.tool_name("replace-me")
+  let assert Ok(old_tool) = case
+    tool.definition(name, codec.field("name", codec.string()), codec.string())
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some("old metadata"),
+          ),
+        )
+      Ok(
+        tool.handle_with_error_renderer(
+          definition,
+          fn(_value) { Ok("old handler") },
+          fn(application_error) {
+            case codec.encode_json(codec.string(), application_error) {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        ),
+      )
+    }
+    Error(error) -> Error(error)
+  }
+  let assert Ok(replacement_tool) = case
+    tool.definition(name, codec.field("name", codec.string()), codec.string())
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some("replacement metadata"),
+          ),
+        )
+      Ok(
+        tool.handle_with_error_renderer(
+          definition,
+          fn(_value) { Ok("replacement handler") },
+          fn(application_error) {
+            case codec.encode_json(codec.string(), application_error) {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        ),
+      )
+    }
+    Error(error) -> Error(error)
+  }
+  let assert Ok(registry) = tool.registry([old_tool])
   let worker_ready = process.new_subject()
   let replacement_result = process.new_subject()
   let _ =
@@ -1089,11 +1404,11 @@ pub fn http_subscription_reconciles_same_name_replacement_during_establishment_t
     let _ = process.receive(released, within: 3000)
     Nil
   }
-  let assert Ok(listener) =
-    http.start_http_server_with_context(
-      server.server(registry),
-      http.HttpOptions(port: 0, host: "127.0.0.1"),
-      context,
+  let assert Ok(listener) = {
+    let options = http.HttpOptions(port: 0, host: "127.0.0.1")
+    http.listener(server.server(registry), context)
+    |> http.with_options(options)
+    |> http.with_policy(
       http.HttpPolicy(
         max_body_bytes: 4096,
         max_response_bytes: 65_536,
@@ -1102,16 +1417,19 @@ pub fn http_subscription_reconciles_same_name_replacement_during_establishment_t
         allowed_origins: [],
       ),
     )
+    |> http.start()
+  }
   process.send(command, #(listener, name, replacement_tool))
   let assert Ok(peer) =
-    client.connect(client.ClientConfig(
-      host: "127.0.0.1",
-      port: http.http_server_port(listener),
-      path: "/",
-      secure: False,
-      timeout_ms: 3000,
-      max_response_bytes: 65_536,
-    ))
+    open_http_client(
+      "127.0.0.1",
+      http.http_server_port(listener),
+      "/",
+      False,
+      3000,
+      65_536,
+      None,
+    )
   let requested =
     subscriptions.SubscriptionFilter(
       tools_list_changed: True,
@@ -1128,23 +1446,31 @@ pub fn http_subscription_reconciles_same_name_replacement_during_establishment_t
       let acknowledged = client.acknowledged_notifications(subscription)
       let notification = client.next_notification(subscription, 1000)
       let assert Ok(registry_peer) =
-        client.connect(client.ClientConfig(
-          host: "127.0.0.1",
-          port: http.http_server_port(listener),
-          path: "/",
-          secure: False,
-          timeout_ms: 3000,
-          max_response_bytes: 65_536,
-        ))
+        open_http_client(
+          "127.0.0.1",
+          http.http_server_port(listener),
+          "/",
+          False,
+          3000,
+          65_536,
+          None,
+        )
       let listing = client.list_tools_json(registry_peer)
-      let called =
-        client.call_tool(
-          registry_peer,
+      let called = case
+        tool.definition(
           name,
-          "replacement caller",
           codec.field("name", codec.string()),
           codec.string(),
         )
+      {
+        Ok(definition) ->
+          client.call_definition(
+            registry_peer,
+            definition,
+            "replacement caller",
+          )
+        Error(_) -> client.ProtocolFailure("invalid local tool definition")
+      }
       client.close(registry_peer)
       client.close_subscription(subscription)
       Ok(#(acknowledged, notification, listing, called))
@@ -1183,11 +1509,12 @@ pub fn http_subscription_reconciles_same_name_replacement_during_establishment_t
 }
 
 pub fn http_subscription_after_registry_churn_reconciles_current_state_test() {
-  let assert Ok(registry) = relay.registry([])
-  let assert Ok(listener) =
-    http.start_http_server_with_policy(
-      server.server(registry),
-      http.HttpOptions(port: 0, host: "127.0.0.1"),
+  let assert Ok(registry) = tool.registry([])
+  let assert Ok(listener) = {
+    let options = http.HttpOptions(port: 0, host: "127.0.0.1")
+    http.listener(server.server(registry), fn() { Nil })
+    |> http.with_options(options)
+    |> http.with_policy(
       http.HttpPolicy(
         max_body_bytes: 4096,
         max_response_bytes: 65_536,
@@ -1196,16 +1523,19 @@ pub fn http_subscription_after_registry_churn_reconciles_current_state_test() {
         allowed_origins: [],
       ),
     )
+    |> http.start()
+  }
   churn_registry(listener, 128)
   let assert Ok(peer) =
-    client.connect(client.ClientConfig(
-      host: "127.0.0.1",
-      port: http.http_server_port(listener),
-      path: "/",
-      secure: False,
-      timeout_ms: 3000,
-      max_response_bytes: 65_536,
-    ))
+    open_http_client(
+      "127.0.0.1",
+      http.http_server_port(listener),
+      "/",
+      False,
+      3000,
+      65_536,
+      None,
+    )
   let result =
     client.listen(
       peer,
@@ -1234,16 +1564,31 @@ fn churn_registry(listener: http.HttpServer(Nil), remaining: Int) -> Nil {
     True -> Nil
     False -> {
       let raw_name = "churn-" <> int.to_string(remaining)
-      let assert Ok(name) = relay.tool_name(raw_name)
-      let assert Ok(new_tool) =
-        relay.context_tool(
+      let assert Ok(name) = tool.tool_name(raw_name)
+      let assert Ok(new_tool) = case
+        tool.definition(
           name,
-          relay.empty_metadata(),
           codec.field("name", codec.string()),
           codec.string(),
-          codec.string(),
-          fn(_context, value) { Ok(value) },
         )
+      {
+        Ok(definition) -> {
+          let definition = tool.with_metadata(definition, tool.empty_metadata())
+          Ok(
+            tool.handle_with_error_renderer(
+              definition,
+              fn(value) { Ok(value) },
+              fn(application_error) {
+                case codec.encode_json(codec.string(), application_error) {
+                  Ok(text) -> text
+                  Error(_) -> "Tool execution failed."
+                }
+              },
+            ),
+          )
+        }
+        Error(error) -> Error(error)
+      }
       should.equal(http.register_tool(listener, new_tool), Ok(Nil))
       should.be_true(http.unregister_tool(listener, name))
       churn_registry(listener, remaining - 1)
@@ -1259,12 +1604,12 @@ pub fn http_subscription_registration_fails_when_hub_dies_test() {
     let _ = process.receive(release, within: 3000)
     Nil
   }
-  let assert Ok(registry) = relay.registry([])
-  let assert Ok(listener) =
-    http.start_http_server_with_context(
-      server.server(registry),
-      http.HttpOptions(port: 0, host: "127.0.0.1"),
-      context,
+  let assert Ok(registry) = tool.registry([])
+  let assert Ok(listener) = {
+    let options = http.HttpOptions(port: 0, host: "127.0.0.1")
+    http.listener(server.server(registry), context)
+    |> http.with_options(options)
+    |> http.with_policy(
       http.HttpPolicy(
         max_body_bytes: 4096,
         max_response_bytes: 65_536,
@@ -1273,15 +1618,18 @@ pub fn http_subscription_registration_fails_when_hub_dies_test() {
         allowed_origins: [],
       ),
     )
+    |> http.start()
+  }
   let assert Ok(peer) =
-    client.connect(client.ClientConfig(
-      host: "127.0.0.1",
-      port: http.http_server_port(listener),
-      path: "/",
-      secure: False,
-      timeout_ms: 3000,
-      max_response_bytes: 65_536,
-    ))
+    open_http_client(
+      "127.0.0.1",
+      http.http_server_port(listener),
+      "/",
+      False,
+      3000,
+      65_536,
+      None,
+    )
   let requested =
     subscriptions.SubscriptionFilter(
       tools_list_changed: True,

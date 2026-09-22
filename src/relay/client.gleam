@@ -9,22 +9,23 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import gleam/uri
 import json/blueprint/codec.{type Codec, decode, encode}
 import json/blueprint/parser as blueprint_parser
 import json/blueprint/value as blueprint_value
 import relay/completion
 import relay/content
+import relay/internal/protocol/v2026_07_28 as v2026
+import relay/internal/transport/stdio_client
 import relay/prompts
 import relay/protocol/jsonrpc.{RequestString}
-import relay/protocol/v2026_07_28 as v2026
 import relay/subscriptions.{type SubscriptionFilter, SubscriptionFilter}
 import relay/tool.{type ToolName}
-import relay/transport/stdio_client
 
 const protocol_version = "2026-07-28"
 
-/// HTTP connection settings for a modern Relay server.
-pub type ClientConfig {
+/// Validated connection parameters derived from one endpoint URL.
+type ClientConfig {
   ClientConfig(
     host: String,
     port: Int,
@@ -35,6 +36,202 @@ pub type ClientConfig {
   )
 }
 
+/// URL-derived HTTP settings with explicit bounds and optional CA trust.
+pub opaque type HttpClientConfig {
+  HttpClientConfig(connection: ClientConfig, ca_cert_file: Option(String))
+}
+
+@external(erlang, "relay_url_ffi", "valid_ipv6")
+fn valid_ipv6(host: String) -> Bool
+
+@external(erlang, "relay_url_ffi", "path_without_controls")
+fn path_without_controls(path: String) -> Bool
+
+fn parse_http_url(url: String) -> Result(uri.Uri, Nil) {
+  case
+    string.starts_with(string.lowercase(url), "http://[")
+    || string.starts_with(string.lowercase(url), "https://[")
+  {
+    False -> uri.parse(url)
+    True ->
+      case string.split_once(url, "[") {
+        Error(_) -> Error(Nil)
+        Ok(#(prefix, bracketed)) ->
+          case string.split_once(bracketed, "]") {
+            Error(_) -> Error(Nil)
+            Ok(#(address, suffix)) ->
+              case
+                valid_ipv6(address)
+                && {
+                  suffix == ""
+                  || string.starts_with(suffix, "/")
+                  || string.starts_with(suffix, ":")
+                }
+              {
+                False -> Error(Nil)
+                True ->
+                  case uri.parse(prefix <> "relay-ipv6.invalid" <> suffix) {
+                    Error(_) -> Error(Nil)
+                    Ok(parsed) ->
+                      Ok(uri.Uri(..parsed, host: Some("[" <> address <> "]")))
+                  }
+              }
+          }
+      }
+  }
+}
+
+/// Parses an absolute HTTP(S) endpoint. Query, fragment, and userinfo are not
+/// MCP endpoint components. A missing path becomes `/`.
+pub fn http_config(url: String) -> Result(HttpClientConfig, ClientError) {
+  case parse_http_url(url) {
+    Error(_) -> Error(InvalidClientConfiguration)
+    Ok(parsed) -> {
+      let secure = case parsed.scheme {
+        Some(scheme) -> string.lowercase(scheme) == "https"
+        None -> False
+      }
+      let scheme_valid = case parsed.scheme {
+        Some(scheme) -> {
+          let scheme = string.lowercase(scheme)
+          scheme == "http" || scheme == "https"
+        }
+        None -> False
+      }
+      case parsed.host {
+        Some(host) -> {
+          let port = case parsed.port {
+            Some(explicit) -> explicit
+            None if secure -> 443
+            None -> 80
+          }
+          let path = case parsed.path {
+            "" -> "/"
+            other -> other
+          }
+          case
+            scheme_valid
+            && parsed.userinfo == None
+            && parsed.query == None
+            && parsed.fragment == None
+            && valid_raw_authority(url)
+            && valid_url_host(host)
+            && valid_url_path(path)
+            && port > 0
+            && port < 65_536
+            && string.starts_with(path, "/")
+          {
+            False -> Error(InvalidClientConfiguration)
+            True ->
+              Ok(HttpClientConfig(
+                connection: ClientConfig(
+                  host: unbracket_host(host),
+                  port: port,
+                  path: path,
+                  secure: secure,
+                  timeout_ms: 30_000,
+                  max_response_bytes: 1_048_576,
+                ),
+                ca_cert_file: None,
+              ))
+          }
+        }
+        _ -> Error(InvalidClientConfiguration)
+      }
+    }
+  }
+}
+
+fn valid_raw_authority(url: String) -> Bool {
+  case string.split_once(url, "://") {
+    Error(_) -> False
+    Ok(#(_, rest)) -> {
+      let authority = case string.split_once(rest, "/") {
+        Ok(#(before_path, _)) -> before_path
+        Error(_) -> rest
+      }
+      authority != ""
+      && !string.ends_with(authority, ":")
+      && !string.contains(authority, "%")
+      && !string.contains(authority, "\\")
+    }
+  }
+}
+
+fn valid_url_path(path: String) -> Bool {
+  path_without_controls(path)
+  && valid_percent_escapes(string.to_graphemes(path))
+}
+
+fn valid_percent_escapes(chars: List(String)) -> Bool {
+  case chars {
+    [] -> True
+    ["%", first, second, ..rest] ->
+      is_hex_digit(first) && is_hex_digit(second) && valid_percent_escapes(rest)
+    ["%", ..] -> False
+    [_, ..rest] -> valid_percent_escapes(rest)
+  }
+}
+
+fn is_hex_digit(char: String) -> Bool {
+  string.contains("0123456789abcdefABCDEF", char)
+}
+
+fn valid_url_host(host: String) -> Bool {
+  host != ""
+  && path_without_controls(host)
+  && string.trim(host) == host
+  && !string.contains(host, " ")
+  && !string.contains(host, "\n")
+  && !string.contains(host, "\t")
+  && { !string.starts_with(host, "[") || string.ends_with(host, "]") }
+}
+
+fn unbracket_host(host: String) -> String {
+  case string.starts_with(host, "[") && string.ends_with(host, "]") {
+    True -> host |> string.drop_start(1) |> string.drop_end(1)
+    False -> host
+  }
+}
+
+/// Last timeout value wins; validation occurs before connecting.
+pub fn with_timeout(
+  config: HttpClientConfig,
+  timeout_ms: Int,
+) -> HttpClientConfig {
+  HttpClientConfig(
+    ..config,
+    connection: ClientConfig(..config.connection, timeout_ms: timeout_ms),
+  )
+}
+
+/// Last response limit wins; validation occurs before connecting.
+pub fn with_max_response_bytes(
+  config: HttpClientConfig,
+  max_response_bytes: Int,
+) -> HttpClientConfig {
+  HttpClientConfig(
+    ..config,
+    connection: ClientConfig(
+      ..config.connection,
+      max_response_bytes: max_response_bytes,
+    ),
+  )
+}
+
+/// Selects a CA certificate file for HTTPS. Plain HTTP rejects this setting.
+pub fn with_ca_cert_file(
+  config: HttpClientConfig,
+  ca_cert_file: String,
+) -> HttpClientConfig {
+  HttpClientConfig(..config, ca_cert_file: Some(ca_cert_file))
+}
+
+/// Connects using the URL-derived settings and optional explicit CA.
+pub fn connect_http(config: HttpClientConfig) -> Result(Client, ClientError) {
+  connect_with_ca_option(config.connection, config.ca_cert_file)
+}
+
 /// Configuration for a local stdio client process.
 pub type StdioConfig {
   StdioConfig(
@@ -43,6 +240,11 @@ pub type StdioConfig {
     timeout_ms: Int,
     max_response_bytes: Int,
   )
+}
+
+/// Bounded local stdio defaults; callers can update the public record by name.
+pub fn stdio_config(executable: String, args: List(String)) -> StdioConfig {
+  StdioConfig(executable, args, 30_000, 1_048_576)
 }
 
 /// Opaque owner-bound HTTP or local stdio client.
@@ -100,16 +302,6 @@ pub type Annotations {
   )
 }
 
-pub type ToolAnnotations {
-  ToolAnnotations(
-    title: Option(String),
-    read_only_hint: Option(Bool),
-    destructive_hint: Option(Bool),
-    idempotent_hint: Option(Bool),
-    open_world_hint: Option(Bool),
-  )
-}
-
 /// A typed tool declaration received from a peer. Schema documents remain
 /// ordinary Gleam JSON values because peers may use arbitrary JSON Schema.
 pub type ToolDeclaration {
@@ -119,7 +311,7 @@ pub type ToolDeclaration {
     description: Option(String),
     input_schema: json.Json,
     output_schema: Option(json.Json),
-    annotations: Option(ToolAnnotations),
+    annotations: Option(tool.ToolAnnotations),
     icons: Option(List(Icon)),
     meta: Option(json.Json),
   )
@@ -175,6 +367,16 @@ pub type ToolCallOutcome(output) {
   TransportFailure(reason: String)
   Cancelled
   InputEncodingFailure
+}
+
+/// A content-only definition cannot yield a typed structured value.
+pub type ContentCallError {
+  ContentToolFailure(List(content.ContentBlock))
+  ContentProtocolFailure(String)
+  ContentTransportFailure(String)
+  ContentCancelled
+  ContentInputEncodingFailure
+  UnexpectedStructuredContent
 }
 
 /// A correlated notification received on one live subscriptions/listen stream.
@@ -253,19 +455,6 @@ fn ffi_close(pid: process.Pid) -> Nil
 
 @external(erlang, "relay_gun_ffi", "unique_integer")
 fn ffi_unique_integer() -> Int
-
-/// Opens a reusable, owner-bound Gun HTTP/1.1 connection.
-pub fn connect(config: ClientConfig) -> Result(Client, ClientError) {
-  connect_with_ca_option(config, None)
-}
-
-/// Opens a reusable HTTPS connection trusted by the supplied CA certificate file.
-pub fn connect_with_ca(
-  config: ClientConfig,
-  ca_cert_file: String,
-) -> Result(Client, ClientError) {
-  connect_with_ca_option(config, Some(ca_cert_file))
-}
 
 fn connect_with_ca_option(
   config: ClientConfig,
@@ -354,11 +543,6 @@ pub fn close(client: Client) -> Nil {
   }
 }
 
-/// Cancels in-flight requests by closing the connection.
-pub fn cancel(client: Client) -> Nil {
-  close(client)
-}
-
 /// Discovers server capabilities and pins use to the retained 2026 revision.
 pub fn discover(client: Client) -> Result(Discovery, String) {
   let id = request_id()
@@ -410,10 +594,13 @@ pub fn raw_json_call(
 
 /// Traverses all tools/list pages and returns typed declarations.
 pub fn list_tools(client: Client) -> Result(List(ToolDeclaration), String) {
-  list_tool_declarations(client)
+  case list_json_pages(client, "tools/list", "tools") {
+    Error(reason) -> Error(reason)
+    Ok(items) -> decode_json_items(items, decode_tool_declaration)
+  }
 }
 
-/// Compatibility surface that preserves each declaration as checked JSON.
+/// Preserves each remote declaration as checked JSON for raw integrations.
 pub fn list_tools_json(client: Client) -> Result(List(String), String) {
   list_json_pages(client, "tools/list", "tools")
 }
@@ -422,60 +609,19 @@ pub fn list_tools_json(client: Client) -> Result(List(String), String) {
 pub fn list_resources(
   client: Client,
 ) -> Result(List(ResourceDeclaration), String) {
-  list_resource_declarations(client)
-}
-
-/// Compatibility surface that preserves each declaration as checked JSON.
-pub fn list_resources_json(client: Client) -> Result(List(String), String) {
-  list_json_pages(client, "resources/list", "resources")
-}
-
-/// Traverses all resources/templates/list pages as typed declarations.
-pub fn list_resource_templates(
-  client: Client,
-) -> Result(List(ResourceTemplateDeclaration), String) {
-  list_resource_template_declarations(client)
-}
-
-/// Compatibility surface that preserves each declaration as checked JSON.
-pub fn list_resource_templates_json(
-  client: Client,
-) -> Result(List(String), String) {
-  list_json_pages(client, "resources/templates/list", "resourceTemplates")
-}
-
-/// Traverses all prompts/list pages and returns typed declarations.
-pub fn list_prompts(client: Client) -> Result(List(PromptDeclaration), String) {
-  list_prompt_declarations(client)
-}
-
-/// Compatibility surface that preserves each declaration as checked JSON.
-pub fn list_prompts_json(client: Client) -> Result(List(String), String) {
-  list_json_pages(client, "prompts/list", "prompts")
-}
-
-/// Lists tools as typed declarations while retaining arbitrary JSON Schema.
-pub fn list_tool_declarations(
-  client: Client,
-) -> Result(List(ToolDeclaration), String) {
-  case list_json_pages(client, "tools/list", "tools") {
-    Error(reason) -> Error(reason)
-    Ok(items) -> decode_json_items(items, decode_tool_declaration)
-  }
-}
-
-/// Lists resources as typed declarations.
-pub fn list_resource_declarations(
-  client: Client,
-) -> Result(List(ResourceDeclaration), String) {
   case list_json_pages(client, "resources/list", "resources") {
     Error(reason) -> Error(reason)
     Ok(items) -> decode_json_items(items, decode_resource_declaration)
   }
 }
 
-/// Lists resource templates as typed declarations.
-pub fn list_resource_template_declarations(
+/// Preserves each remote declaration as checked JSON for raw integrations.
+pub fn list_resources_json(client: Client) -> Result(List(String), String) {
+  list_json_pages(client, "resources/list", "resources")
+}
+
+/// Traverses all resources/templates/list pages as typed declarations.
+pub fn list_resource_templates(
   client: Client,
 ) -> Result(List(ResourceTemplateDeclaration), String) {
   case
@@ -486,18 +632,27 @@ pub fn list_resource_template_declarations(
   }
 }
 
-/// Lists prompts as typed declarations.
-pub fn list_prompt_declarations(
+/// Preserves each remote declaration as checked JSON for raw integrations.
+pub fn list_resource_templates_json(
   client: Client,
-) -> Result(List(PromptDeclaration), String) {
+) -> Result(List(String), String) {
+  list_json_pages(client, "resources/templates/list", "resourceTemplates")
+}
+
+/// Traverses all prompts/list pages and returns typed declarations.
+pub fn list_prompts(client: Client) -> Result(List(PromptDeclaration), String) {
   case list_json_pages(client, "prompts/list", "prompts") {
     Error(reason) -> Error(reason)
     Ok(items) -> decode_json_items(items, decode_prompt_declaration)
   }
 }
 
-/// Calls a tool using the supplied input and output codecs.
-pub fn call_tool(
+/// Preserves each remote declaration as checked JSON for raw integrations.
+pub fn list_prompts_json(client: Client) -> Result(List(String), String) {
+  list_json_pages(client, "prompts/list", "prompts")
+}
+
+fn call_tool(
   client: Client,
   name: ToolName,
   input: input,
@@ -535,6 +690,57 @@ pub fn call_tool(
                       )
                   }
               }
+          }
+      }
+    }
+  }
+}
+
+/// Calls a tool using the same admitted native contract used at registration.
+pub fn call_definition(
+  client: Client,
+  definition: tool.Definition(input, output),
+  input: input,
+) -> ToolCallOutcome(output) {
+  call_tool(
+    client,
+    tool.definition_name(definition),
+    input,
+    tool.definition_input_codec(definition),
+    tool.definition_output_codec(definition),
+  )
+}
+
+/// Calls an admitted content-only tool without requiring an output codec.
+pub fn call_content_definition(
+  client: Client,
+  definition: tool.ContentDefinition(input),
+  input: input,
+) -> Result(List(content.ContentBlock), ContentCallError) {
+  case encode(tool.content_definition_input_codec(definition), input) {
+    Error(_) -> Error(ContentInputEncodingFailure)
+    Ok(arguments) -> {
+      let id = request_id()
+      let tool_name =
+        tool.content_definition_name(definition) |> tool.tool_name_to_string
+      let body =
+        request_envelope(id, "tools/call", [
+          #("name", json.string(tool_name)),
+          #("arguments", v2026.value_to_json(arguments)),
+        ])
+      case request(client, body, id, "tools/call", tool_name) {
+        Error("cancelled") -> Error(ContentCancelled)
+        Error(reason) -> Error(ContentTransportFailure(reason))
+        Ok(#(status, _)) if status != 200 ->
+          Error(ContentTransportFailure(
+            "tool call returned HTTP " <> int.to_string(status),
+          ))
+        Ok(#(_, bytes)) ->
+          case decode_tool_response(bytes, id) {
+            Error(reason) -> Error(ContentProtocolFailure(reason))
+            Ok(#(True, _, blocks)) -> Error(ContentToolFailure(blocks))
+            Ok(#(False, Some(_), _)) -> Error(UnexpectedStructuredContent)
+            Ok(#(False, None, blocks)) -> Ok(blocks)
           }
       }
     }
@@ -1314,7 +1520,7 @@ fn decode_declaration_annotations(
 
 fn decode_tool_annotations(
   value: Dynamic,
-) -> Result(Option(ToolAnnotations), String) {
+) -> Result(Option(tool.ToolAnnotations), String) {
   case
     dyn_decode.run(value, dyn_decode.at(["annotations"], dyn_decode.dynamic))
   {
@@ -1345,7 +1551,7 @@ fn decode_tool_annotations(
         "openWorldHint",
       ))
       Ok(
-        Some(ToolAnnotations(
+        Some(tool.ToolAnnotations(
           title,
           read_only_hint,
           destructive_hint,

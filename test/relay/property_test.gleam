@@ -1,31 +1,52 @@
 import gleam/bit_array
 import gleam/json
+import gleam/option.{Some}
 import gleeunit
 import gleeunit/should
 import json/blueprint/codec
-import relay
 import relay/protocol/jsonrpc.{RequestInteger, RequestString}
 import relay/server.{
   CloseExchange, EmitRequestAdmitted, ExchangeClosed, InvocationFinished,
   MessageReceived, OutcomeSuccess, StartInvocation, Write,
 }
+import relay/tool
 
 pub fn main() -> Nil {
   gleeunit.main()
 }
 
-fn sample_registry() -> relay.Registry(String) {
-  let assert Ok(name) = relay.tool_name("echo")
-  let assert Ok(t) =
-    relay.context_tool(
-      name,
-      relay.tool_metadata("Echoes input"),
-      codec.field("text", codec.string()),
-      codec.string(),
-      codec.object(codec.empty()),
-      fn(_ctx: String, text: String) { Ok(text) },
-    )
-  let assert Ok(reg) = relay.registry([t])
+fn sample_registry() -> tool.Registry(String) {
+  let assert Ok(name) = tool.tool_name("echo")
+  let assert Ok(t) = case
+    tool.definition(name, codec.field("text", codec.string()), codec.string())
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some("Echoes input"),
+          ),
+        )
+      Ok(
+        tool.handle_with_error_renderer(
+          definition,
+          fn(text: String) { Ok(text) },
+          fn(application_error) {
+            case
+              codec.encode_json(codec.object(codec.empty()), application_error)
+            {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        ),
+      )
+    }
+    Error(error) -> Error(error)
+  }
+  let assert Ok(reg) = tool.registry([t])
   reg
 }
 
@@ -211,20 +232,20 @@ pub fn no_output_after_terminal_state_property_test() {
 // Property 5: ToolName validated opaque invariant
 pub fn tool_name_invariants_property_test() {
   // Valid names
-  let assert Ok(n1) = relay.tool_name("valid_name")
-  relay.tool_name_to_string(n1) |> should.equal("valid_name")
+  let assert Ok(n1) = tool.tool_name("valid_name")
+  tool.tool_name_to_string(n1) |> should.equal("valid_name")
 
-  let assert Ok(n2) = relay.tool_name("my-tool.v1")
-  relay.tool_name_to_string(n2) |> should.equal("my-tool.v1")
+  let assert Ok(n2) = tool.tool_name("my-tool.v1")
+  tool.tool_name_to_string(n2) |> should.equal("my-tool.v1")
 
-  let assert Ok(n3) = relay.tool_name("namespace/tool")
-  relay.tool_name_to_string(n3) |> should.equal("namespace/tool")
+  let assert Ok(n3) = tool.tool_name("namespace/tool")
+  tool.tool_name_to_string(n3) |> should.equal("namespace/tool")
 
   // Invalid names: empty, invalid characters, whitespace
-  relay.tool_name("") |> should.be_error()
-  relay.tool_name("has spaces") |> should.be_error()
-  relay.tool_name("tool#bad") |> should.be_error()
-  relay.tool_name("tool@bad") |> should.be_error()
+  tool.tool_name("") |> should.be_error()
+  tool.tool_name("has spaces") |> should.be_error()
+  tool.tool_name("tool#bad") |> should.be_error()
+  tool.tool_name("tool@bad") |> should.be_error()
 }
 
 // Property 6: RequestId string and int representation

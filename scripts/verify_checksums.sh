@@ -23,7 +23,7 @@ echo "PASS: MCP 2026-07-28 schema checksum matches ($ACTUAL_SCHEMA_SHA256)"
 
 echo "==> Verifying sibling dependency pins..."
 # json_blueprint pin
-EXPECTED_BLUEPRINT_HEAD="d3f0708b61eddb4a4789c0476ab5384267814a51"
+EXPECTED_BLUEPRINT_HEAD="ca50b5a915aaa5e38ef68ff70b102f2dd3f2fe67"
 ACTUAL_BLUEPRINT_HEAD="$(git -C "$ROOT/../json_blueprint" rev-parse HEAD)"
 if [ "$ACTUAL_BLUEPRINT_HEAD" != "$EXPECTED_BLUEPRINT_HEAD" ]; then
     echo "FAIL: json_blueprint git head mismatch: got $ACTUAL_BLUEPRINT_HEAD, expected $EXPECTED_BLUEPRINT_HEAD" >&2
@@ -36,7 +36,7 @@ fi
 echo "PASS: json_blueprint pin matches (commit $ACTUAL_BLUEPRINT_HEAD, version 1.7.1, MIT)"
 
 # sinal pin
-EXPECTED_SINAL_HEAD="dd09933e5466628f7d46fa896c389f31ba7d4cb6"
+EXPECTED_SINAL_HEAD="1c50c93a3a93569eb60a246475261e20430018b7"
 ACTUAL_SINAL_HEAD="$(git -C "$ROOT/../sinal" rev-parse HEAD)"
 if [ "$ACTUAL_SINAL_HEAD" != "$EXPECTED_SINAL_HEAD" ]; then
     echo "FAIL: sinal git head mismatch: got $ACTUAL_SINAL_HEAD, expected $EXPECTED_SINAL_HEAD" >&2

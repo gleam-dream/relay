@@ -183,25 +183,17 @@ pub opaque type ProtectedRegistry(context, principal) {
   ProtectedRegistry(
     protection: ProtectionConfig,
     policy: ToolPolicy(context, principal),
-    registry: Option(tool.Registry(context)),
+    registry: tool.Registry(context),
   )
 }
 
-/// Resource-server protected registry constructor without a bound tool set.
+/// Binds a policy and endpoint protection to a typed tool registry.
 pub fn protect_registry(
-  protection: ProtectionConfig,
-  policy: ToolPolicy(context, principal),
-) -> ProtectedRegistry(context, principal) {
-  ProtectedRegistry(protection, policy, None)
-}
-
-/// Builds a protected registry backed by Relay's typed tool registry.
-pub fn protect_registry_with_tools(
   registry: tool.Registry(context),
   protection: ProtectionConfig,
   policy: ToolPolicy(context, principal),
 ) -> ProtectedRegistry(context, principal) {
-  ProtectedRegistry(protection, policy, Some(registry))
+  ProtectedRegistry(protection, policy, registry)
 }
 
 /// Verifies a bearer token and admits a granted request.
@@ -279,34 +271,30 @@ pub fn dispatch_granted(
   case grant_use(registry.protection, grant) {
     Error(reason) -> Error(GrantUseFailed(reason))
     Ok(Nil) ->
-      case registry.registry {
+      case
+        find_tool_declaration(tool.registered_tools(registry.registry), name)
+      {
         None -> Error(Inaccessible(UnknownTool))
-        Some(tools) ->
-          case find_tool_declaration(tool.registered_tools(tools), name) {
-            None -> Error(Inaccessible(UnknownTool))
-            Some(declaration) -> {
-              let visible = case registry.policy {
-                ToolPolicy(visibility, _) ->
-                  visibility(context, grant, declaration)
+        Some(declaration) -> {
+          let visible = case registry.policy {
+            ToolPolicy(visibility, _) -> visibility(context, grant, declaration)
+          }
+          case visible {
+            Hidden -> Error(Inaccessible(HiddenTool))
+            Visible -> {
+              let allowed = case registry.policy {
+                ToolPolicy(_, execution) ->
+                  execution(context, grant, declaration)
               }
-              case visible {
-                Hidden -> Error(Inaccessible(HiddenTool))
-                Visible -> {
-                  let allowed = case registry.policy {
-                    ToolPolicy(_, execution) ->
-                      execution(context, grant, declaration)
-                  }
-                  case allowed {
-                    ExecutionUnauthorized ->
-                      Error(Inaccessible(ExecutionDenied))
-                    ExecutionAuthorized ->
-                      tool.dispatch(tools, context, name, arguments)
-                      |> result.map_error(InvocationFailed)
-                  }
-                }
+              case allowed {
+                ExecutionUnauthorized -> Error(Inaccessible(ExecutionDenied))
+                ExecutionAuthorized ->
+                  tool.dispatch(registry.registry, context, name, arguments)
+                  |> result.map_error(InvocationFailed)
               }
             }
           }
+        }
       }
   }
 }
@@ -317,21 +305,17 @@ pub fn visible_declarations(
   grant: GrantedRequest(principal),
 ) -> Result(List(ToolDeclaration), GrantUseError) {
   use _ <- result.try(grant_use(registry.protection, grant))
-  case registry.registry {
-    None -> Ok([])
-    Some(tools) ->
-      list.filter_map(tool.registered_tools(tools), fn(candidate) {
-        let declaration = tool.tool_declaration_of(candidate)
-        case registry.policy {
-          ToolPolicy(visibility, _) ->
-            case visibility(context, grant, declaration) {
-              Visible -> Ok(declaration)
-              Hidden -> Error(Nil)
-            }
+  list.filter_map(tool.registered_tools(registry.registry), fn(candidate) {
+    let declaration = tool.tool_declaration_of(candidate)
+    case registry.policy {
+      ToolPolicy(visibility, _) ->
+        case visibility(context, grant, declaration) {
+          Visible -> Ok(declaration)
+          Hidden -> Error(Nil)
         }
-      })
-      |> Ok
-  }
+    }
+  })
+  |> Ok
 }
 
 fn find_tool_declaration(

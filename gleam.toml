@@ -2,6 +2,7 @@ name = "relay"
 version = "0.1.0"
 target = "erlang"
 gleam = ">= 1.18.0"
+internal_modules = ["relay/internal", "relay/internal/*"]
 licenses = ["Apache-2.0"]
 description = "A feature-complete Model Context Protocol (MCP) implementation for Gleam: server and client, stdio and Streamable HTTP."
 repository = { type = "github", user = "gleam-dream", repo = "relay" }

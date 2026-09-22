@@ -164,7 +164,7 @@ fn strip_trailing_cr(line: BitArray) -> BitArray {
 
 // Dedicated serialized writer actor
 
-pub type WriterMessage {
+type WriterMessage {
   WriteBytes(bytes: BitArray, reply: Subject(Result(Nil, StdioError)))
   CloseWriter(reply: Subject(Nil))
 }

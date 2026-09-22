@@ -1,31 +1,64 @@
 import gleam/bit_array
 import gleam/dynamic/decode
 import gleam/json
+import gleam/option.{Some}
 import gleeunit
 import gleeunit/should
 import json/blueprint/codec
-import relay
 import relay/server.{
   type Server, CancelInvocation, CloseExchange, EmitRequestAdmitted,
   MessageReceived, StartInvocation, Write,
 }
+import relay/tool
 
 pub fn main() -> Nil {
   gleeunit.main()
 }
 
 fn sample_server() -> Server(String) {
-  let assert Ok(name) = relay.tool_name("greet")
-  let assert Ok(greet_tool) =
-    relay.context_tool(
-      name,
-      relay.tool_metadata("Greets a user"),
-      codec.field("name", codec.string()),
-      codec.string(),
-      codec.object(codec.empty()),
-      fn(ctx: String, user: String) { Ok(ctx <> ": hello " <> user) },
-    )
-  let assert Ok(reg) = relay.registry([greet_tool])
+  let assert Ok(name) = tool.tool_name("greet")
+  let assert Ok(greet_tool) = case
+    tool.definition(name, codec.field("name", codec.string()), codec.string())
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some("Greets a user"),
+          ),
+        )
+      Ok({
+        let user_handler = fn(ctx: String, user: String) {
+          Ok(ctx <> ": hello " <> user)
+        }
+        tool.handle_advanced_with_error_renderer(
+          definition,
+          fn(call, typed_input) {
+            let tool.HandlerCallContext(
+              application,
+              _input_responses,
+              _report_progress,
+            ) = call
+            case user_handler(application, typed_input) {
+              Ok(output) -> Ok(tool.Complete(output, []))
+            }
+          },
+          fn(application_error) {
+            case
+              codec.encode_json(codec.object(codec.empty()), application_error)
+            {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        )
+      })
+    }
+    Error(error) -> Error(error)
+  }
+  let assert Ok(reg) = tool.registry([greet_tool])
   server.server(reg)
 }
 

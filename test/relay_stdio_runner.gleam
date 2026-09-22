@@ -1,52 +1,136 @@
 import gleam/erlang/process
+import gleam/option.{Some}
 import gleam/string
 import json/blueprint/codec
-import relay
 import relay/runtime.{RuntimeConfig}
 import relay/server
+import relay/tool
 import relay/transport/stdio
 
 @external(erlang, "erlang", "halt")
 fn ffi_halt(status: Int) -> Nil
 
 pub fn main() -> Nil {
-  let assert Ok(greet_name) = relay.tool_name("greet")
-  let assert Ok(greet_tool) =
-    relay.context_tool(
+  let assert Ok(greet_name) = tool.tool_name("greet")
+  let assert Ok(greet_tool) = case
+    tool.definition(
       greet_name,
-      relay.tool_metadata("Greets user"),
       codec.field("name", codec.string()),
       codec.string(),
-      codec.object(codec.empty()),
-      fn(ctx: String, user: String) { Ok(ctx <> ": hello " <> user) },
     )
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some("Greets user"),
+          ),
+        )
+      Ok({
+        let user_handler = fn(ctx: String, user: String) {
+          Ok(ctx <> ": hello " <> user)
+        }
+        tool.handle_advanced_with_error_renderer(
+          definition,
+          fn(call, typed_input) {
+            let tool.HandlerCallContext(
+              application,
+              _input_responses,
+              _report_progress,
+            ) = call
+            case user_handler(application, typed_input) {
+              Ok(output) -> Ok(tool.Complete(output, []))
+            }
+          },
+          fn(application_error) {
+            case
+              codec.encode_json(codec.object(codec.empty()), application_error)
+            {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        )
+      })
+    }
+    Error(error) -> Error(error)
+  }
 
-  let assert Ok(fail_name) = relay.tool_name("fail_tool")
-  let assert Ok(fail_tool) =
-    relay.context_tool(
+  let assert Ok(fail_name) = tool.tool_name("fail_tool")
+  let assert Ok(fail_tool) = case
+    tool.definition(
       fail_name,
-      relay.tool_metadata("Fails with tool error"),
       codec.field("msg", codec.string()),
       codec.string(),
-      codec.field("reason", codec.string()),
-      fn(_ctx: String, msg: String) { Error("application error: " <> msg) },
     )
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some("Fails with tool error"),
+          ),
+        )
+      Ok(
+        tool.handle_with_error_renderer(
+          definition,
+          fn(msg: String) { Error("application error: " <> msg) },
+          fn(application_error) {
+            case
+              codec.encode_json(
+                codec.field("reason", codec.string()),
+                application_error,
+              )
+            {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        ),
+      )
+    }
+    Error(error) -> Error(error)
+  }
 
-  let assert Ok(slow_name) = relay.tool_name("slow")
-  let assert Ok(slow_tool) =
-    relay.context_tool(
-      slow_name,
-      relay.tool_metadata("Delays its response"),
-      codec.field("ms", codec.int()),
-      codec.string(),
-      codec.object(codec.empty()),
-      fn(_ctx: String, delay_ms: Int) {
-        process.sleep(delay_ms)
-        Ok("slow response")
-      },
-    )
+  let assert Ok(slow_name) = tool.tool_name("slow")
+  let assert Ok(slow_tool) = case
+    tool.definition(slow_name, codec.field("ms", codec.int()), codec.string())
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some("Delays its response"),
+          ),
+        )
+      Ok(
+        tool.handle_with_error_renderer(
+          definition,
+          fn(delay_ms: Int) {
+            process.sleep(delay_ms)
+            Ok("slow response")
+          },
+          fn(application_error) {
+            case
+              codec.encode_json(codec.object(codec.empty()), application_error)
+            {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        ),
+      )
+    }
+    Error(error) -> Error(error)
+  }
 
-  let assert Ok(reg) = relay.registry([greet_tool, fail_tool, slow_tool])
+  let assert Ok(reg) = tool.registry([greet_tool, fail_tool, slow_tool])
   let s = server.server(reg)
   let runtime_config =
     RuntimeConfig(

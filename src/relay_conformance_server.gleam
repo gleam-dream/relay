@@ -9,12 +9,12 @@ import gleam/result
 import gleam/string
 import json/blueprint/codec
 import json/blueprint/value
-import relay
 import relay/completion
 import relay/content
 import relay/prompts
 import relay/resources
 import relay/server
+import relay/tool
 import relay/transport/http
 
 const png_1x1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p2sAAAAASUVORK5CYII="
@@ -22,12 +22,14 @@ const png_1x1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8
 const wav_silence = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA="
 
 pub fn main() -> Nil {
-  let assert Ok(registry) = relay.registry(test_tools())
-  let assert Ok(listener) =
-    http.start_http_server(
-      conformance_server(registry),
-      http.HttpOptions(port: 0, host: "127.0.0.1"),
-    )
+  let assert Ok(registry) = tool.registry(test_tools())
+  let assert Ok(listener) = {
+    let options = http.HttpOptions(port: 0, host: "127.0.0.1")
+    http.listener(conformance_server(registry), fn() { Nil })
+    |> http.with_options(options)
+    |> http.with_policy(http.local_http_policy(options.host))
+    |> http.start()
+  }
   io.println(
     "RELAY_CONFORMANCE_URL=http://127.0.0.1:"
     <> int.to_string(http.http_server_port(listener))
@@ -41,7 +43,7 @@ fn keep_alive() -> Nil {
   keep_alive()
 }
 
-fn conformance_server(registry: relay.Registry(Nil)) -> server.Server(Nil) {
+fn conformance_server(registry: tool.Registry(Nil)) -> server.Server(Nil) {
   let text_resource =
     resources.ContextResource(
       resource: resources.Resource(
@@ -218,13 +220,11 @@ fn conformance_server(registry: relay.Registry(Nil)) -> server.Server(Nil) {
         Some(False),
       ))
     })
-  server.server_with_services(
-    registry,
-    [text_resource, binary_resource],
-    [template],
-    prompts,
-    Some(completion),
-  )
+  server.server(registry)
+  |> server.with_resources([text_resource, binary_resource])
+  |> server.with_resource_templates([template])
+  |> server.with_prompts(prompts)
+  |> server.with_completion(Some(completion))
 }
 
 fn conformance_prompt(
@@ -245,7 +245,7 @@ fn conformance_prompt(
   )
 }
 
-fn test_tools() -> List(relay.ContextTool(Nil)) {
+fn test_tools() -> List(tool.ContextTool(Nil)) {
   [
     content_tool("test_simple_text", [
       content.text_content("This is a simple text response for testing."),
@@ -291,9 +291,9 @@ fn test_tools() -> List(relay.ContextTool(Nil)) {
     streaming_elicitation_tool(),
     input_required_tool("test_input_required_result_elicitation", fn(responses) {
       case responses {
-        Some(_) -> relay.complete_output(Nil)
+        Some(_) -> tool.Complete(Nil, [])
         None ->
-          relay.request_input(
+          tool.NeedsInput(
             dict.from_list([
               #("user_name", elicitation_request("What is your name?", "name")),
             ]),
@@ -302,9 +302,9 @@ fn test_tools() -> List(relay.ContextTool(Nil)) {
     }),
     input_required_tool("test_input_required_result_sampling", fn(responses) {
       case responses {
-        Some(_) -> relay.complete_output(Nil)
+        Some(_) -> tool.Complete(Nil, [])
         None ->
-          relay.request_input(
+          tool.NeedsInput(
             dict.from_list([
               #(
                 "capital_question",
@@ -316,13 +316,13 @@ fn test_tools() -> List(relay.ContextTool(Nil)) {
     }),
     input_required_tool("test_input_required_result_list_roots", fn(responses) {
       case responses {
-        Some(_) -> relay.complete_output(Nil)
+        Some(_) -> tool.Complete(Nil, [])
         None ->
-          relay.request_input(
+          tool.NeedsInput(
             dict.from_list([
               #(
                 "client_roots",
-                relay.input_request("roots/list", json.object([])),
+                tool.InputRequest("roots/list", json.object([])),
               ),
             ]),
           )
@@ -332,9 +332,9 @@ fn test_tools() -> List(relay.ContextTool(Nil)) {
       "test_input_required_result_request_state",
       fn(responses) {
         case responses {
-          Some(_) -> relay.complete_output(Nil)
+          Some(_) -> tool.Complete(Nil, [])
           None ->
-            relay.request_input(
+            tool.NeedsInput(
               dict.from_list([
                 #("confirm", elicitation_request("Please confirm", "ok")),
               ]),
@@ -346,9 +346,9 @@ fn test_tools() -> List(relay.ContextTool(Nil)) {
       "test_input_required_result_multiple_inputs",
       fn(responses) {
         case responses {
-          Some(_) -> relay.complete_output(Nil)
+          Some(_) -> tool.Complete(Nil, [])
           None ->
-            relay.request_input(
+            tool.NeedsInput(
               dict.from_list([
                 #(
                   "user_name",
@@ -357,7 +357,7 @@ fn test_tools() -> List(relay.ContextTool(Nil)) {
                 #("greeting", sampling_request("Generate a greeting", 50)),
                 #(
                   "client_roots",
-                  relay.input_request("roots/list", json.object([])),
+                  tool.InputRequest("roots/list", json.object([])),
                 ),
               ]),
             )
@@ -368,11 +368,11 @@ fn test_tools() -> List(relay.ContextTool(Nil)) {
       case responses {
         Some(received) ->
           case response_has_key(received, "step2") {
-            True -> relay.complete_output(Nil)
+            True -> tool.Complete(Nil, [])
             False ->
               case response_has_key(received, "step1") {
                 True ->
-                  relay.request_input(
+                  tool.NeedsInput(
                     dict.from_list([
                       #(
                         "step2",
@@ -384,7 +384,7 @@ fn test_tools() -> List(relay.ContextTool(Nil)) {
                     ]),
                   )
                 False ->
-                  relay.request_input(
+                  tool.NeedsInput(
                     dict.from_list([
                       #(
                         "step1",
@@ -398,7 +398,7 @@ fn test_tools() -> List(relay.ContextTool(Nil)) {
               }
           }
         _ ->
-          relay.request_input(
+          tool.NeedsInput(
             dict.from_list([
               #(
                 "step1",
@@ -412,9 +412,9 @@ fn test_tools() -> List(relay.ContextTool(Nil)) {
       "test_input_required_result_tampered_state",
       fn(responses) {
         case responses {
-          Some(_) -> relay.complete_output(Nil)
+          Some(_) -> tool.Complete(Nil, [])
           None ->
-            relay.request_input(
+            tool.NeedsInput(
               dict.from_list([
                 #("confirm", elicitation_request("Please confirm", "ok")),
               ]),
@@ -425,7 +425,7 @@ fn test_tools() -> List(relay.ContextTool(Nil)) {
     input_required_tool(
       "test_input_required_result_capabilities",
       fn(_responses) {
-        relay.request_input(
+        tool.NeedsInput(
           dict.from_list([
             #("name", elicitation_request("What is your name?", "name")),
             #("sample", sampling_request("What should happen next?", 50)),
@@ -437,8 +437,8 @@ fn test_tools() -> List(relay.ContextTool(Nil)) {
   ]
 }
 
-fn json_schema_tool() -> relay.ContextTool(Nil) {
-  let assert Ok(name) = relay.tool_name("json_schema_2020_12_tool")
+fn json_schema_tool() -> tool.ContextTool(Nil) {
+  let assert Ok(name) = tool.tool_name("json_schema_2020_12_tool")
   let schema =
     value.Object([
       #("$schema", value.String("https://json-schema.org/draft/2020-12/schema")),
@@ -527,21 +527,51 @@ fn json_schema_tool() -> relay.ContextTool(Nil) {
       ),
       #("additionalProperties", value.Bool(False)),
     ])
-  let assert Ok(tool) =
-    relay.context_tool_with_input_schema(
+  let assert Ok(tool) = case
+    tool.definition(
       name,
-      relay.tool_metadata("Preserves the JSON Schema 2020-12 vocabulary"),
       codec.object(codec.empty()),
       codec.object(codec.empty()),
-      codec.object(codec.empty()),
-      schema,
-      fn(_context, _input) { Ok(Nil) },
     )
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some("Preserves the JSON Schema 2020-12 vocabulary"),
+          ),
+        )
+      case tool.with_input_schema_override(definition, schema) {
+        Ok(definition) ->
+          Ok(
+            tool.handle_with_error_renderer(
+              definition,
+              fn(_input) { Ok(Nil) },
+              fn(application_error) {
+                case
+                  codec.encode_json(
+                    codec.object(codec.empty()),
+                    application_error,
+                  )
+                {
+                  Ok(text) -> text
+                  Error(_) -> "Tool execution failed."
+                }
+              },
+            ),
+          )
+        Error(error) -> Error(error)
+      }
+    }
+    Error(error) -> Error(error)
+  }
   tool
 }
 
-fn custom_header_tool() -> relay.ContextTool(Nil) {
-  let assert Ok(name) = relay.tool_name("test_custom_header")
+fn custom_header_tool() -> tool.ContextTool(Nil) {
+  let assert Ok(name) = tool.tool_name("test_custom_header")
   let schema =
     value.Object([
       #("type", value.String("object")),
@@ -560,78 +590,183 @@ fn custom_header_tool() -> relay.ContextTool(Nil) {
       #("required", value.Array([value.String("payload")])),
       #("additionalProperties", value.Bool(False)),
     ])
-  let assert Ok(tool) =
-    relay.context_tool_with_input_schema(
+  let assert Ok(tool) = case
+    tool.definition(
       name,
-      relay.tool_metadata("Validates an x-mcp-header parameter"),
       codec.field("payload", codec.string()),
       codec.object(codec.empty()),
-      codec.object(codec.empty()),
-      schema,
-      fn(_context, _payload) { Ok(Nil) },
     )
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some("Validates an x-mcp-header parameter"),
+          ),
+        )
+      case tool.with_input_schema_override(definition, schema) {
+        Ok(definition) ->
+          Ok(
+            tool.handle_with_error_renderer(
+              definition,
+              fn(_payload) { Ok(Nil) },
+              fn(application_error) {
+                case
+                  codec.encode_json(
+                    codec.object(codec.empty()),
+                    application_error,
+                  )
+                {
+                  Ok(text) -> text
+                  Error(_) -> "Tool execution failed."
+                }
+              },
+            ),
+          )
+        Error(error) -> Error(error)
+      }
+    }
+    Error(error) -> Error(error)
+  }
   tool
 }
 
 fn input_required_tool(
   name: String,
-  handler: fn(Option(value.Value)) -> relay.InputHandlerResult(Nil),
-) -> relay.ContextTool(Nil) {
-  let assert Ok(tool_name) = relay.tool_name(name)
-  let assert Ok(tool) =
-    relay.context_tool_with_inputs(
+  handler: fn(Option(value.Value)) -> tool.HandlerResult(Nil),
+) -> tool.ContextTool(Nil) {
+  let assert Ok(tool_name) = tool.tool_name(name)
+  let assert Ok(tool) = case
+    tool.definition(
       tool_name,
-      relay.tool_metadata("Input continuation fixture for the pinned suite"),
       codec.object(codec.empty()),
       codec.object(codec.empty()),
-      codec.object(codec.empty()),
-      fn(_context, _input, responses) { Ok(handler(responses)) },
     )
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some("Input continuation fixture for the pinned suite"),
+          ),
+        )
+      Ok(
+        tool.handle_advanced(definition, fn(call, _input) {
+          let tool.HandlerCallContext(_application, responses, _report_progress) =
+            call
+          Ok(handler(responses))
+        }),
+      )
+    }
+    Error(error) -> Error(error)
+  }
   tool
 }
 
-fn capability_tool() -> relay.ContextTool(Nil) {
-  let assert Ok(name) = relay.tool_name("test_missing_capability")
-  let assert Ok(tool) =
-    relay.context_tool(
+fn capability_tool() -> tool.ContextTool(Nil) {
+  let assert Ok(name) = tool.tool_name("test_missing_capability")
+  let assert Ok(tool) = case
+    tool.definition(
       name,
-      relay.tool_metadata_requiring_client_capabilities(
-        "Requires a client sampling capability",
-        ["sampling"],
-      ),
       codec.object(codec.empty()),
       codec.object(codec.empty()),
-      codec.object(codec.empty()),
-      fn(_context, _input) { Ok(Nil) },
     )
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.ToolMetadata(
+              ..tool.empty_metadata(),
+              description: Some("Requires a client sampling capability"),
+            ),
+            required_client_capabilities: ["sampling"],
+          ),
+        )
+      Ok(
+        tool.handle_with_error_renderer(
+          definition,
+          fn(_input) { Ok(Nil) },
+          fn(application_error) {
+            case
+              codec.encode_json(codec.object(codec.empty()), application_error)
+            {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        ),
+      )
+    }
+    Error(error) -> Error(error)
+  }
   tool
 }
 
-fn streaming_elicitation_tool() -> relay.ContextTool(Nil) {
-  let assert Ok(name) = relay.tool_name("test_streaming_elicitation")
-  let assert Ok(tool) =
-    relay.context_tool_with_progress(
+fn streaming_elicitation_tool() -> tool.ContextTool(Nil) {
+  let assert Ok(name) = tool.tool_name("test_streaming_elicitation")
+  let assert Ok(tool) = case
+    tool.definition(
       name,
-      relay.tool_metadata("Reports progress without independent requests"),
       codec.object(codec.empty()),
       codec.object(codec.empty()),
-      codec.object(codec.empty()),
-      fn(_context, _input, report_progress) {
-        report_progress(10)
-        process.sleep(20)
-        report_progress(20)
-        Ok(Nil)
-      },
     )
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some("Reports progress without independent requests"),
+          ),
+        )
+      Ok({
+        let user_handler = fn(_context, _input, report_progress) {
+          report_progress(10)
+          process.sleep(20)
+          report_progress(20)
+          Ok(Nil)
+        }
+        let advanced_handler = fn(call, typed_input) {
+          let tool.HandlerCallContext(
+            application,
+            _input_responses,
+            report_progress,
+          ) = call
+          user_handler(application, typed_input, report_progress)
+          |> result.map(fn(output) { tool.Complete(output, []) })
+        }
+        tool.handle_advanced_with_error_renderer(
+          definition,
+          advanced_handler,
+          fn(application_error) {
+            case
+              codec.encode_json(codec.object(codec.empty()), application_error)
+            {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        )
+      })
+    }
+    Error(error) -> Error(error)
+  }
   tool
 }
 
-fn elicitation_request(message: String, field: String) -> relay.InputRequest {
+fn elicitation_request(message: String, field: String) -> tool.InputRequest {
   let field_type = case field == "ok" {
     True -> "boolean"
     False -> "string"
   }
-  relay.input_request(
+  tool.InputRequest(
     "elicitation/create",
     json.object([
       #("message", json.string(message)),
@@ -652,8 +787,8 @@ fn elicitation_request(message: String, field: String) -> relay.InputRequest {
   )
 }
 
-fn sampling_request(message: String, max_tokens: Int) -> relay.InputRequest {
-  relay.input_request(
+fn sampling_request(message: String, max_tokens: Int) -> tool.InputRequest {
+  tool.InputRequest(
     "sampling/createMessage",
     json.object([
       #(
@@ -694,55 +829,153 @@ fn response_has_key(responses: value.Value, key: String) -> Bool {
 fn content_tool(
   name: String,
   blocks: List(content.ContentBlock),
-) -> relay.ContextTool(Nil) {
-  let assert Ok(tool_name) = relay.tool_name(name)
-  let assert Ok(tool) =
-    relay.context_tool_with_content(
+) -> tool.ContextTool(Nil) {
+  let assert Ok(tool_name) = tool.tool_name(name)
+  let assert Ok(tool) = case
+    tool.definition(
       tool_name,
-      relay.tool_metadata("Fixture used by the pinned MCP conformance suite"),
       codec.object(codec.empty()),
       codec.object(codec.empty()),
-      codec.object(codec.empty()),
-      fn(_context, _input) { Ok(#(None, blocks)) },
     )
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some(
+              "Fixture used by the pinned MCP conformance suite",
+            ),
+          ),
+        )
+      Ok({
+        let user_handler = fn(_context, _input) { Ok(#(None, blocks)) }
+        let advanced_handler = fn(call, typed_input) {
+          let tool.HandlerCallContext(
+            application,
+            _input_responses,
+            _report_progress,
+          ) = call
+          case user_handler(application, typed_input) {
+            Ok(#(Some(output), blocks)) -> Ok(tool.Complete(output, blocks))
+            Ok(#(None, blocks)) -> Ok(tool.Content(blocks))
+          }
+        }
+        tool.handle_advanced_with_error_renderer(
+          definition,
+          advanced_handler,
+          fn(application_error) {
+            case
+              codec.encode_json(codec.object(codec.empty()), application_error)
+            {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        )
+      })
+    }
+    Error(error) -> Error(error)
+  }
   tool
 }
 
-fn error_tool(name: String) -> relay.ContextTool(Nil) {
-  let assert Ok(tool_name) = relay.tool_name(name)
-  let assert Ok(tool) =
-    relay.context_tool(
+fn error_tool(name: String) -> tool.ContextTool(Nil) {
+  let assert Ok(tool_name) = tool.tool_name(name)
+  let assert Ok(tool) = case
+    tool.definition(
       tool_name,
-      relay.tool_metadata("Fixture used by the pinned MCP conformance suite"),
       codec.object(codec.empty()),
       codec.object(codec.empty()),
-      codec.object(codec.empty()),
-      fn(_context, _input) { Error(Nil) },
     )
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some(
+              "Fixture used by the pinned MCP conformance suite",
+            ),
+          ),
+        )
+      Ok(
+        tool.handle_with_error_renderer(
+          definition,
+          fn(_input) { Error(Nil) },
+          fn(application_error) {
+            case
+              codec.encode_json(codec.object(codec.empty()), application_error)
+            {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        ),
+      )
+    }
+    Error(error) -> Error(error)
+  }
   tool
 }
 
-fn progress_tool() -> relay.ContextTool(Nil) {
-  let assert Ok(name) = relay.tool_name("test_tool_with_progress")
-  let assert Ok(tool) =
-    relay.context_tool_with_progress(
+fn progress_tool() -> tool.ContextTool(Nil) {
+  let assert Ok(name) = tool.tool_name("test_tool_with_progress")
+  let assert Ok(tool) = case
+    tool.definition(
       name,
-      relay.tool_metadata(
-        "Reports ordered progress for the pinned conformance suite",
-      ),
       codec.object(codec.empty()),
       codec.object(codec.empty()),
-      codec.object(codec.empty()),
-      fn(_context, _input, report_progress) {
-        report_progress(25)
-        process.sleep(25)
-        report_progress(50)
-        process.sleep(25)
-        report_progress(75)
-        process.sleep(25)
-        report_progress(100)
-        Ok(Nil)
-      },
     )
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some(
+              "Reports ordered progress for the pinned conformance suite",
+            ),
+          ),
+        )
+      Ok({
+        let user_handler = fn(_context, _input, report_progress) {
+          report_progress(25)
+          process.sleep(25)
+          report_progress(50)
+          process.sleep(25)
+          report_progress(75)
+          process.sleep(25)
+          report_progress(100)
+          Ok(Nil)
+        }
+        let advanced_handler = fn(call, typed_input) {
+          let tool.HandlerCallContext(
+            application,
+            _input_responses,
+            report_progress,
+          ) = call
+          user_handler(application, typed_input, report_progress)
+          |> result.map(fn(output) { tool.Complete(output, []) })
+        }
+        tool.handle_advanced_with_error_renderer(
+          definition,
+          advanced_handler,
+          fn(application_error) {
+            case
+              codec.encode_json(codec.object(codec.empty()), application_error)
+            {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        )
+      })
+    }
+    Error(error) -> Error(error)
+  }
   tool
 }

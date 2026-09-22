@@ -1,73 +1,62 @@
 # relay
 
-An MCP implementation in Gleam. Wave 2 source work is in progress and remains unaccepted. The five findings from the independent subset review are closed with regressions. The pinned official server HTTP requirements suite passes; this is not a claim of complete MCP conformance.
+Relay implements the frozen MCP `2026-07-28` revision in Gleam. Its public surface has a pure server reducer, typed tools and services, bounded stdio and Streamable HTTP transports, a typed client, and optional authorization primitives.
 
-## Implemented surface
-
-- MCP `2026-07-28` discovery, tool listing/calls, resource and template listing/reading, prompt listing/get, and completion are handled by the sans-I/O server core. It validates per-request log-level metadata; it does not implement `logging/setLevel` or advertise log-message emission. Typed contextual tools use JSON Blueprint codecs. Tool replies support structured output, content-only output, text, image, audio, resource links, and embedded resources.
-- Local unprotected stdio uses newline-delimited JSON-RPC frames, bounded chunk reads, split UTF-8 handling, serialized stdout, and stderr diagnostics. The OTP runtime owns tool workers, timeouts, cancellation, terminal suppression, and Sinal observations. An asynchronous broken-stdout regression proves the transport stops while stdin is idle.
-- A thin Mist adapter accepts bounded POST requests, checks JSON and MCP headers, Host/Origin allow-lists and media negotiation, and returns JSON or live request-scoped SSE responses. SSE writes apply acknowledgement backpressure, bounded response size and duration, and disconnect cancellation. Cursor tokens are opaque, server-bound and family-scoped.
-- A Gun HTTP client supports revision discovery, checked raw JSON-RPC calls, paginated raw `tools/list` declarations, codec-typed tool calls, typed resource reads, prompt gets, and completion requests. Tool outcomes distinguish structured success, content-only success, tool failure, protocol failure, transport failure, and cancellation. Content decodes as typed text, image, audio, resource-link, and embedded-resource blocks, including annotations.
-
-The pinned `@modelcontextprotocol/conformance@0.2.0-alpha.10` server suite runs all 40 HTTP requirement scenarios against the local endpoint: 106 checks pass and 0 fail. One scenario emits no checks for this specification version, so the result does not establish full conformance. Resource subscriptions/listen, list-change notifications, dynamic catalogue updates and log-message emission remain outstanding. Multi-round tool and prompt input is supported with signed continuation state and capability filtering; resource-read continuation is rejected. The typed client has no stdio transport or subscription methods. TLS is implemented for Gun but has not been exercised against a local TLS peer.
-
-> [!WARNING]
-> **Unprotected transport:** the available stdio and HTTP entry points do not verify bearer tokens or enforce resource authorization. Bind them only to trusted local environments until protected routing is implemented.
-
-Resource-server and client authorization, legacy `2025-11-25` compatibility, later protocol extensions, and the public scripted test kit remain later-wave work. Relay does not yet claim full MCP conformance or production readiness.
-
-## Usage Example
+## Native tools
 
 ```gleam
 import json/blueprint/codec
-import relay
 import relay/server
+import relay/tool
 import relay/transport/stdio
 
 pub fn main() {
-  // 1. Define a tool with validated name and Blueprint codecs
-  let assert Ok(greet_name) = relay.tool_name("greet")
-  let assert Ok(greet_tool) =
-    relay.context_tool(
-      greet_name,
-      relay.tool_metadata("Greets the user by name"),
-      codec.field("name", codec.string()),
-      codec.string(),
-      codec.object(codec.empty()),
-      fn(_ctx: String, name: String) { Ok("Hello, " <> name <> "!") },
-    )
-
-  // 2. Build the registry and pure server
-  let assert Ok(reg) = relay.registry([greet_tool])
-  let s = server.server(reg)
-
-  // 3. Launch the local unprotected stdio server
-  let config = stdio.default_stdio_config()
-  let _ = stdio.run_local_unprotected_stdio_server(s, config, "my_app_context")
+  let assert Ok(name) = tool.tool_name("greet")
+  let assert Ok(definition) =
+    tool.definition(name, codec.field("name", codec.string()), codec.string())
+  let definition =
+    definition |> tool.with_description("Greets the user by name")
+  let bound = tool.handle(definition, fn(name) { Ok("Hello, " <> name <> "!") })
+  let assert Ok(registry) = tool.registry([bound])
+  let service = server.server(registry)
+  let _ = stdio.run_local_unprotected_stdio_server(
+    service,
+    stdio.default_stdio_config(),
+    Nil,
+  )
 }
 ```
 
-## Verification & Toolchain
+The same `Definition(input, output)` supplies `client.call_definition` and the input/output codecs used by an application-owned LLM adapter. Remote JSON Schema documents do not reconstruct native types, and provider tool names need their own admission checks. A caller-supplied object schema can be attached with `tool.with_input_schema_override`; the input codec still validates every call.
 
-All tests, schema validations, negative compiler checks, and checksum verifications run deterministically via the dev shell:
+`tool.handle` exposes the generic message `Tool execution failed.` for application errors. `tool.handle_with_error_renderer` deliberately publishes a caller-rendered message. A renderer may return JSON text, for example `codec.encode_json(error_codec, error)`, when a peer needs an encoded error shape; no error codec is required for registration. `tool.handle_advanced` and its renderer variant receive `HandlerCallContext`, which carries per-invocation application context, client input responses, and a progress callback. `HandlerResult` distinguishes structured output with content, content-only output, and another input round.
+
+A content-only tool uses `tool.content_definition(name, input_codec)` and `tool.handle_content`. It has no dummy output codec or structured result promise. `client.call_content_definition` returns `Result(List(ContentBlock), ContentCallError)`. For a content-only handler that needs per-invocation context or progress, use `tool.handle_content_advanced`. Metadata is a caller-owned `ToolMetadata` value; `tool.content_with_metadata` attaches it to the admitted content definition. Annotation hints compose independently with `tool.empty_annotations` and the hint modifiers. `None` omits a hint; `Some(False)` publishes false.
+
+## Services and transports
+
+`server.server(registry)` creates an immutable description. `server.with_resources`, `server.with_resource_templates`, and `server.with_prompts` replace their respective lists; `server.with_completion` sets or clears completion. Each modifier preserves the registry, custom dispatch, and unrelated services. The public reducer (`server.step`) and runtime (`runtime.start`, `runtime.send_frame`, `runtime.stop`) support distinct custom transport implementations.
+
+`http.listener(service, fn() { context })` starts with a local ephemeral bind and local Host/Origin policy. Apply `http.with_options`, `http.with_policy`, and optionally `http.with_tls`, then call `http.start`. Changing bind options does not widen the policy or add authentication. Startup checks bounds, bind interface, and readable TLS files before allocating the runtime hub.
+
+`client.http_config("https://localhost:8443/")` derives host, port, path, and TLS from an absolute HTTP(S) URL. It rejects userinfo, query, fragment, malformed authority/path, and invalid ports; a missing path becomes `/`. `client.with_timeout`, `client.with_max_response_bytes`, and `client.with_ca_cert_file` change explicit settings before `client.connect_http`; a CA setting on plain HTTP is rejected. For a local child process, `client.stdio_config(executable, args)` supplies bounded timeout and response defaults, with named record updates available for different limits before `client.connect_stdio`.
+
+The server handles discovery, typed tool calls, rich text/image/audio/resource content, resources/templates, prompts, completion, progress, multi-round tool and prompt input, subscriptions, and bounded request-scoped SSE. The client offers typed listings, paginated checked JSON listings, typed resource/prompt/completion operations, raw checked JSON-RPC calls, and live subscriptions. The stdio transport serializes stdout and isolates diagnostics on stderr. Sinal events cover admission, rejection, invocation lifecycle, and exchange closure.
+
+The currently available stdio and HTTP listeners are unprotected. The authorization module provides verifier, grant, policy, and protected-registry primitives, but those listeners do not yet enforce bearer grants. Bind them to trusted local environments. Relay does not claim complete MCP conformance or production readiness. Legacy `2025-11-25` support, `logging/setLevel`, and resource-read continuation remain outside this implementation.
+
+The pinned `@modelcontextprotocol/conformance@0.2.0-alpha.10` Streamable HTTP server suite previously reported 109 passed checks and 0 failures across 40 requirement scenarios. One scenario emits no checks for this revision, so this result does not establish complete conformance.
+
+## Verification
 
 ```bash
-# 1. Full Erlang-targeted test suite
-nix develop --command gleam test --target erlang
-
-# 2. Negative compiler fixture check (asserts wrong handler/codec pairing fails at compile time)
-nix develop --command python3 scripts/check_negative_fixtures.py
-
-# 3. Official frozen MCP 2026-07-28 JSON Schema validation and single-mutation negative tests
-nix develop --command python3 scripts/relay_schema_check.py
-
-# 4. Deterministic upstream schema & sibling dependency pin checksum verification
-nix develop --command ./scripts/verify_checksums.sh
-
-# 5. Full repository formatting and flake check
 nix develop --command gleam format --check src test
-nix flake check
-
-# 6. Pinned official Streamable HTTP server requirements
+nix develop --command gleam check
+nix develop --command gleam build
+nix develop --command gleam test
+nix develop --command python3 scripts/check_negative_fixtures.py
+nix develop --command python3 scripts/relay_schema_check.py
+nix develop --command ./scripts/verify_checksums.sh
 ./scripts/conformance/run-server-suite.sh
+nix flake check
 ```

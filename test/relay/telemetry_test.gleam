@@ -12,11 +12,10 @@ pub fn frame_rejected_observation_test() {
   let subj = process.new_subject()
   let assert Ok(hid) = sinal.handler_id("test_frame_rejected")
   let ev = telemetry.frame_rejected_event()
-  let h =
-    sinal.handler(fn(_ev, _meas, meta: telemetry.FrameRejectedMeta) {
-      process.send(subj, meta)
-      Ok(Nil)
-    })
+  let h = fn(_ev, _meas, meta: telemetry.FrameRejectedMeta) {
+    process.send(subj, meta)
+    Ok(Nil)
+  }
 
   let assert Ok(att) = sinal.attach(hid, ev, h, fn(_, _) { Nil })
 
@@ -33,11 +32,10 @@ pub fn request_admitted_observation_test() {
   let subj = process.new_subject()
   let assert Ok(hid) = sinal.handler_id("test_request_admitted")
   let ev = telemetry.request_admitted_event()
-  let h =
-    sinal.handler(fn(_ev, _meas, meta: telemetry.RequestAdmittedMeta) {
-      process.send(subj, meta)
-      Ok(Nil)
-    })
+  let h = fn(_ev, _meas, meta: telemetry.RequestAdmittedMeta) {
+    process.send(subj, meta)
+    Ok(Nil)
+  }
 
   let assert Ok(att) = sinal.attach(hid, ev, h, fn(_, _) { Nil })
 
@@ -56,26 +54,22 @@ pub fn invocation_lifecycle_observation_test() {
 
   let assert Ok(hid1) = sinal.handler_id("test_inv_started")
   let ev1 = telemetry.invocation_started_event()
-  let h1 =
-    sinal.handler(fn(_ev, _meas, meta: telemetry.InvocationStartedMeta) {
-      process.send(started_subj, meta)
-      Ok(Nil)
-    })
+  let h1 = fn(_ev, _meas, meta: telemetry.InvocationStartedMeta) {
+    process.send(started_subj, meta)
+    Ok(Nil)
+  }
   let assert Ok(att1) = sinal.attach(hid1, ev1, h1, fn(_, _) { Nil })
 
   let assert Ok(hid2) = sinal.handler_id("test_inv_completed")
   let ev2 = telemetry.invocation_completed_event()
-  let h2 =
-    sinal.handler(
-      fn(
-        _ev,
-        meas: telemetry.InvocationCompletedMeasurements,
-        meta: telemetry.InvocationCompletedMeta,
-      ) {
-        process.send(completed_subj, #(meas, meta))
-        Ok(Nil)
-      },
-    )
+  let h2 = fn(
+    _ev,
+    meas: telemetry.InvocationCompletedMeasurements,
+    meta: telemetry.InvocationCompletedMeta,
+  ) {
+    process.send(completed_subj, #(meas, meta))
+    Ok(Nil)
+  }
   let assert Ok(att2) = sinal.attach(hid2, ev2, h2, fn(_, _) { Nil })
 
   telemetry.emit_invocation_started(1, 10, "greet")
@@ -102,31 +96,28 @@ pub fn crash_and_cancel_observation_test() {
 
   let assert Ok(hid_can) = sinal.handler_id("test_cancel")
   let ev_can = telemetry.invocation_cancelled_event()
-  let h_can =
-    sinal.handler(fn(_ev, _meas, meta: telemetry.InvocationCancelledMeta) {
-      process.send(cancel_subj, meta)
-      Ok(Nil)
-    })
+  let h_can = fn(_ev, _meas, meta: telemetry.InvocationCancelledMeta) {
+    process.send(cancel_subj, meta)
+    Ok(Nil)
+  }
   let assert Ok(att_can) =
     sinal.attach(hid_can, ev_can, h_can, fn(_, _) { Nil })
 
   let assert Ok(hid_cra) = sinal.handler_id("test_crash")
   let ev_cra = telemetry.invocation_crashed_event()
-  let h_cra =
-    sinal.handler(fn(_ev, _meas, meta: telemetry.InvocationCrashedMeta) {
-      process.send(crash_subj, meta)
-      Ok(Nil)
-    })
+  let h_cra = fn(_ev, _meas, meta: telemetry.InvocationCrashedMeta) {
+    process.send(crash_subj, meta)
+    Ok(Nil)
+  }
   let assert Ok(att_cra) =
     sinal.attach(hid_cra, ev_cra, h_cra, fn(_, _) { Nil })
 
   let assert Ok(hid_clo) = sinal.handler_id("test_close")
   let ev_clo = telemetry.exchange_closed_event()
-  let h_clo =
-    sinal.handler(fn(_ev, _meas, meta: telemetry.ExchangeClosedMeta) {
-      process.send(close_subj, meta)
-      Ok(Nil)
-    })
+  let h_clo = fn(_ev, _meas, meta: telemetry.ExchangeClosedMeta) {
+    process.send(close_subj, meta)
+    Ok(Nil)
+  }
   let assert Ok(att_clo) =
     sinal.attach(hid_clo, ev_clo, h_clo, fn(_, _) { Nil })
 

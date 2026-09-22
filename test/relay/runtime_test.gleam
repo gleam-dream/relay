@@ -4,14 +4,16 @@ import gleam/dynamic
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/json
+import gleam/option.{Some}
+import gleam/result
 import gleam/string
 import gleeunit
 import gleeunit/should
 import json/blueprint/codec
-import relay
 import relay/runtime.{RuntimeConfig}
 import relay/server
 import relay/telemetry
+import relay/tool
 import sinal
 
 type ProgressBurstNotice {
@@ -34,45 +36,125 @@ pub fn main() -> Nil {
 }
 
 fn sample_server() -> server.Server(String) {
-  let assert Ok(greet_name) = relay.tool_name("greet")
-  let assert Ok(greet_tool) =
-    relay.context_tool(
+  let assert Ok(greet_name) = tool.tool_name("greet")
+  let assert Ok(greet_tool) = case
+    tool.definition(
       greet_name,
-      relay.tool_metadata("Greets a user"),
       codec.field("name", codec.string()),
       codec.string(),
-      codec.object(codec.empty()),
-      fn(ctx: String, user: String) { Ok(ctx <> ": hello " <> user) },
     )
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some("Greets a user"),
+          ),
+        )
+      Ok({
+        let user_handler = fn(ctx: String, user: String) {
+          Ok(ctx <> ": hello " <> user)
+        }
+        tool.handle_advanced_with_error_renderer(
+          definition,
+          fn(call, typed_input) {
+            let tool.HandlerCallContext(
+              application,
+              _input_responses,
+              _report_progress,
+            ) = call
+            case user_handler(application, typed_input) {
+              Ok(output) -> Ok(tool.Complete(output, []))
+            }
+          },
+          fn(application_error) {
+            case
+              codec.encode_json(codec.object(codec.empty()), application_error)
+            {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        )
+      })
+    }
+    Error(error) -> Error(error)
+  }
 
-  let assert Ok(crash_name) = relay.tool_name("crash")
-  let assert Ok(crash_tool) =
-    relay.context_tool(
+  let assert Ok(crash_name) = tool.tool_name("crash")
+  let assert Ok(crash_tool) = case
+    tool.definition(
       crash_name,
-      relay.tool_metadata("Always crashes"),
       codec.field("name", codec.string()),
       codec.string(),
-      codec.object(codec.empty()),
-      fn(_ctx: String, _user: String) {
-        panic as "Deliberate handler crash: secret-token-7B3F"
-      },
     )
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some("Always crashes"),
+          ),
+        )
+      Ok(
+        tool.handle_with_error_renderer(
+          definition,
+          fn(_user: String) {
+            panic as "Deliberate handler crash: secret-token-7B3F"
+          },
+          fn(application_error) {
+            case
+              codec.encode_json(codec.object(codec.empty()), application_error)
+            {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        ),
+      )
+    }
+    Error(error) -> Error(error)
+  }
 
-  let assert Ok(slow_name) = relay.tool_name("slow")
-  let assert Ok(slow_tool) =
-    relay.context_tool(
-      slow_name,
-      relay.tool_metadata("Slow handler"),
-      codec.field("ms", codec.int()),
-      codec.string(),
-      codec.object(codec.empty()),
-      fn(_ctx: String, ms: Int) {
-        process.sleep(ms)
-        Ok("finished slow")
-      },
-    )
+  let assert Ok(slow_name) = tool.tool_name("slow")
+  let assert Ok(slow_tool) = case
+    tool.definition(slow_name, codec.field("ms", codec.int()), codec.string())
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some("Slow handler"),
+          ),
+        )
+      Ok(
+        tool.handle_with_error_renderer(
+          definition,
+          fn(ms: Int) {
+            process.sleep(ms)
+            Ok("finished slow")
+          },
+          fn(application_error) {
+            case
+              codec.encode_json(codec.object(codec.empty()), application_error)
+            {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        ),
+      )
+    }
+    Error(error) -> Error(error)
+  }
 
-  let assert Ok(reg) = relay.registry([greet_tool, crash_tool, slow_tool])
+  let assert Ok(reg) = tool.registry([greet_tool, crash_tool, slow_tool])
   server.server(reg)
 }
 
@@ -204,11 +286,10 @@ pub fn runtime_crash_isolation_test() {
   let crash_subj = process.new_subject()
   let assert Ok(crash_hid) = sinal.handler_id("runtime_crash_redaction")
   let crash_event = telemetry.invocation_crashed_event()
-  let crash_handler =
-    sinal.handler(fn(_ev, _meas, meta: telemetry.InvocationCrashedMeta) {
-      process.send(crash_subj, meta)
-      Ok(Nil)
-    })
+  let crash_handler = fn(_ev, _meas, meta: telemetry.InvocationCrashedMeta) {
+    process.send(crash_subj, meta)
+    Ok(Nil)
+  }
   let assert Ok(crash_attachment) =
     sinal.attach(crash_hid, crash_event, crash_handler, fn(_, _) { Nil })
   let config = runtime.default_config()
@@ -268,11 +349,10 @@ pub fn request_admitted_runtime_observation_test() {
   let event_subj = process.new_subject()
   let assert Ok(hid) = sinal.handler_id("runtime_request_admitted")
   let ev = telemetry.request_admitted_event()
-  let handler =
-    sinal.handler(fn(_ev, _meas, meta: telemetry.RequestAdmittedMeta) {
-      process.send(event_subj, meta)
-      Ok(Nil)
-    })
+  let handler = fn(_ev, _meas, meta: telemetry.RequestAdmittedMeta) {
+    process.send(event_subj, meta)
+    Ok(Nil)
+  }
   let assert Ok(att) = sinal.attach(hid, ev, handler, fn(_, _) { Nil })
   let assert Ok(rt) =
     runtime.start(sample_server(), runtime.default_config(), fn(_bytes) { Nil })
@@ -470,21 +550,48 @@ pub fn runtime_progress_backpressure_bounds_mailbox_test() {
   let notices = process.new_subject()
   let observations = process.new_subject()
   let gate = start_sink_gate()
-  let assert Ok(name) = relay.tool_name("progress_burst")
-  let assert Ok(tool) =
-    relay.context_tool_with_progress(
+  let assert Ok(name) = tool.tool_name("progress_burst")
+  let assert Ok(tool) = case
+    tool.definition(
       name,
-      relay.empty_metadata(),
       codec.object(codec.empty()),
       codec.object(codec.empty()),
-      codec.object(codec.empty()),
-      fn(notices, _input, report_progress) {
-        report_progress_burst(report_progress, 1, 128)
-        process.send(notices, ProgressBurstFinished)
-        Ok(Nil)
-      },
     )
-  let assert Ok(registry) = relay.registry([tool])
+  {
+    Ok(definition) -> {
+      let definition = tool.with_metadata(definition, tool.empty_metadata())
+      Ok({
+        let user_handler = fn(notices, _input, report_progress) {
+          report_progress_burst(report_progress, 1, 128)
+          process.send(notices, ProgressBurstFinished)
+          Ok(Nil)
+        }
+        let advanced_handler = fn(call, typed_input) {
+          let tool.HandlerCallContext(
+            application,
+            _input_responses,
+            report_progress,
+          ) = call
+          user_handler(application, typed_input, report_progress)
+          |> result.map(fn(output) { tool.Complete(output, []) })
+        }
+        tool.handle_advanced_with_error_renderer(
+          definition,
+          advanced_handler,
+          fn(application_error) {
+            case
+              codec.encode_json(codec.object(codec.empty()), application_error)
+            {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        )
+      })
+    }
+    Error(error) -> Error(error)
+  }
+  let assert Ok(registry) = tool.registry([tool])
   let config =
     RuntimeConfig(..runtime.default_config(), invocation_timeout_ms: 5000)
   let assert Ok(rt) =

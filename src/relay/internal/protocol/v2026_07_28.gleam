@@ -17,6 +17,7 @@ import relay/content.{
   type ContentBlock, type ResourceContents, content_block_to_json,
   resource_contents_to_json,
 }
+import relay/internal/schema
 import relay/logging.{type LogLevel, parse_level, permits}
 import relay/prompts.{
   type Prompt, type PromptResult, prompt_message_to_json, prompt_to_json,
@@ -29,7 +30,6 @@ import relay/resources.{
   type Resource, type ResourceTemplate, resource_template_to_json,
   resource_to_json,
 }
-import relay/schema
 import relay/subscriptions.{type SubscriptionFilter}
 import relay/tool.{
   type InputRequest, type ToolDeclaration, type ToolName, InputRequest,

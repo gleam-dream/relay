@@ -5,12 +5,13 @@ import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/json
 import gleam/list
+import gleam/option.{Some}
 import gleeunit
 import gleeunit/should
 import json/blueprint/codec
-import relay
 import relay/runtime.{RuntimeConfig}
 import relay/server.{ExchangeClosed, MessageReceived}
+import relay/tool
 
 pub fn main() -> Nil {
   gleeunit.main()
@@ -32,36 +33,76 @@ fn repeat(times: Int, f: fn(Int) -> Nil) -> Nil {
   }
 }
 
-fn sample_registry() -> relay.Registry(String) {
-  let assert Ok(name) = relay.tool_name("echo")
-  let assert Ok(t) =
-    relay.context_tool(
-      name,
-      relay.tool_metadata("Echoes"),
-      codec.field("val", codec.string()),
-      codec.string(),
-      codec.object(codec.empty()),
-      fn(_ctx: String, val: String) { Ok(val) },
-    )
-  let assert Ok(reg) = relay.registry([t])
+fn sample_registry() -> tool.Registry(String) {
+  let assert Ok(name) = tool.tool_name("echo")
+  let assert Ok(t) = case
+    tool.definition(name, codec.field("val", codec.string()), codec.string())
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some("Echoes"),
+          ),
+        )
+      Ok(
+        tool.handle_with_error_renderer(
+          definition,
+          fn(val: String) { Ok(val) },
+          fn(application_error) {
+            case
+              codec.encode_json(codec.object(codec.empty()), application_error)
+            {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        ),
+      )
+    }
+    Error(error) -> Error(error)
+  }
+  let assert Ok(reg) = tool.registry([t])
   reg
 }
 
-fn slow_registry(delay_ms: Int) -> relay.Registry(String) {
-  let assert Ok(name) = relay.tool_name("slow_tool")
-  let assert Ok(t) =
-    relay.context_tool(
-      name,
-      relay.tool_metadata("Sleeps and echoes"),
-      codec.field("val", codec.string()),
-      codec.string(),
-      codec.object(codec.empty()),
-      fn(_ctx: String, val: String) {
-        process.sleep(delay_ms)
-        Ok(val)
-      },
-    )
-  let assert Ok(reg) = relay.registry([t])
+fn slow_registry(delay_ms: Int) -> tool.Registry(String) {
+  let assert Ok(name) = tool.tool_name("slow_tool")
+  let assert Ok(t) = case
+    tool.definition(name, codec.field("val", codec.string()), codec.string())
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some("Sleeps and echoes"),
+          ),
+        )
+      Ok(
+        tool.handle_with_error_renderer(
+          definition,
+          fn(val: String) {
+            process.sleep(delay_ms)
+            Ok(val)
+          },
+          fn(application_error) {
+            case
+              codec.encode_json(codec.object(codec.empty()), application_error)
+            {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        ),
+      )
+    }
+    Error(error) -> Error(error)
+  }
+  let assert Ok(reg) = tool.registry([t])
   reg
 }
 

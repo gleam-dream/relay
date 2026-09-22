@@ -6,9 +6,9 @@ import gleam/json
 import gleam/string
 import gleeunit
 import gleeunit/should
-import relay
 import relay/runtime
 import relay/server
+import relay/tool
 import relay/transport/stdio.{Frame, FrameOversized, InvalidTrailingBytes}
 
 pub fn main() -> Nil {
@@ -183,7 +183,7 @@ pub fn writer_failure_is_returned_as_a_typed_terminal_error_test() {
 }
 
 pub fn oversized_frame_refusal_write_failure_stops_the_stream_test() {
-  let assert Ok(registry) = relay.registry([])
+  let assert Ok(registry) = tool.registry([])
   let assert Ok(rt) =
     runtime.start(server.server(registry), runtime.default_config(), fn(_bytes) {
       Nil

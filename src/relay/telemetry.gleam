@@ -1,8 +1,6 @@
-import gleam/dynamic
-import gleam/dynamic/decode
 import gleam/erlang/atom
 import sinal.{type Event}
-import sinal/fields.{type Fields}
+import sinal/fields
 
 pub type FrameRejectedMeta {
   FrameRejectedMeta(exchange_id: Int, reason: String)
@@ -36,26 +34,6 @@ pub type ExchangeClosedMeta {
   ExchangeClosedMeta(exchange_id: Int)
 }
 
-fn int_field(name: String) -> Fields(Int) {
-  let key = atom.create(name)
-  fields.field(key, fn(n: Int) { Ok(dynamic.int(n)) }, fn(dyn) {
-    case decode.run(dyn, decode.int) {
-      Ok(n) -> Ok(n)
-      Error(_) -> Error(fields.FieldDecodeError("expected int"))
-    }
-  })
-}
-
-fn string_field(name: String) -> Fields(String) {
-  let key = atom.create(name)
-  fields.field(key, fn(s: String) { Ok(dynamic.string(s)) }, fn(dyn) {
-    case decode.run(dyn, decode.string) {
-      Ok(s) -> Ok(s)
-      Error(_) -> Error(fields.FieldDecodeError("expected string"))
-    }
-  })
-}
-
 // Descriptors
 
 pub fn frame_rejected_event() -> Event(Nil, FrameRejectedMeta) {
@@ -65,7 +43,10 @@ pub fn frame_rejected_event() -> Event(Nil, FrameRejectedMeta) {
     atom.create("rejected"),
   ]
   let assert Ok(meta_pair) =
-    fields.pair(int_field("exchange_id"), string_field("reason"))
+    fields.pair(
+      fields.int(atom.create("exchange_id")),
+      fields.string(atom.create("reason")),
+    )
   let meta =
     fields.imap(
       meta_pair,
@@ -83,7 +64,10 @@ pub fn request_admitted_event() -> Event(Nil, RequestAdmittedMeta) {
     atom.create("admitted"),
   ]
   let assert Ok(meta_pair) =
-    fields.pair(int_field("exchange_id"), string_field("method"))
+    fields.pair(
+      fields.int(atom.create("exchange_id")),
+      fields.string(atom.create("method")),
+    )
   let meta =
     fields.imap(
       meta_pair,
@@ -101,8 +85,11 @@ pub fn invocation_started_event() -> Event(Nil, InvocationStartedMeta) {
     atom.create("started"),
   ]
   let assert Ok(p1) =
-    fields.pair(int_field("exchange_id"), int_field("invocation_id"))
-  let assert Ok(p2) = fields.pair(p1, string_field("tool_name"))
+    fields.pair(
+      fields.int(atom.create("exchange_id")),
+      fields.int(atom.create("invocation_id")),
+    )
+  let assert Ok(p2) = fields.pair(p1, fields.string(atom.create("tool_name")))
   let meta =
     fields.imap(
       p2,
@@ -127,13 +114,16 @@ pub fn invocation_completed_event() -> Event(
   ]
   let meas =
     fields.imap(
-      int_field("duration_ms"),
+      fields.int(atom.create("duration_ms")),
       fn(d) { InvocationCompletedMeasurements(d) },
       fn(m) { m.duration_ms },
     )
   let assert Ok(p1) =
-    fields.pair(int_field("exchange_id"), int_field("invocation_id"))
-  let assert Ok(p2) = fields.pair(p1, string_field("status"))
+    fields.pair(
+      fields.int(atom.create("exchange_id")),
+      fields.int(atom.create("invocation_id")),
+    )
+  let assert Ok(p2) = fields.pair(p1, fields.string(atom.create("status")))
   let meta =
     fields.imap(
       p2,
@@ -155,7 +145,7 @@ pub fn invocation_cancelled_event() -> Event(Nil, InvocationCancelledMeta) {
   ]
   let meta =
     fields.imap(
-      int_field("invocation_id"),
+      fields.int(atom.create("invocation_id")),
       fn(id) { InvocationCancelledMeta(id) },
       fn(m) { m.invocation_id },
     )
@@ -170,7 +160,10 @@ pub fn invocation_crashed_event() -> Event(Nil, InvocationCrashedMeta) {
     atom.create("crashed"),
   ]
   let assert Ok(meta_pair) =
-    fields.pair(int_field("invocation_id"), string_field("reason"))
+    fields.pair(
+      fields.int(atom.create("invocation_id")),
+      fields.string(atom.create("reason")),
+    )
   let meta =
     fields.imap(
       meta_pair,
@@ -189,7 +182,7 @@ pub fn exchange_closed_event() -> Event(Nil, ExchangeClosedMeta) {
   ]
   let meta =
     fields.imap(
-      int_field("exchange_id"),
+      fields.int(atom.create("exchange_id")),
       fn(id) { ExchangeClosedMeta(id) },
       fn(m) { m.exchange_id },
     )

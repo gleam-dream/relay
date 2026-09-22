@@ -7,8 +7,8 @@ import gleam/string
 import gleeunit
 import gleeunit/should
 import json/blueprint/codec
-import relay
 import relay/server
+import relay/tool
 import relay/transport/http
 
 pub fn main() -> Nil {
@@ -101,7 +101,7 @@ fn headers_with_name(
 }
 
 fn empty_server() -> server.Server(Nil) {
-  let assert Ok(registry) = relay.registry([])
+  let assert Ok(registry) = tool.registry([])
   server.server(registry)
 }
 
@@ -114,12 +114,13 @@ pub fn streamable_http_loopback_test() {
       allowed_hosts: ["127.0.0.1"],
       allowed_origins: ["http://127.0.0.1"],
     )
-  let assert Ok(listener) =
-    http.start_http_server_with_policy(
-      empty_server(),
-      http.HttpOptions(port: 0, host: "127.0.0.1"),
-      policy,
-    )
+  let assert Ok(listener) = {
+    let options = http.HttpOptions(port: 0, host: "127.0.0.1")
+    http.listener(empty_server(), fn() { Nil })
+    |> http.with_options(options)
+    |> http.with_policy(policy)
+    |> http.start()
+  }
   let port = http.http_server_port(listener)
   let body = envelope("server/discover", True, [])
   let assert Ok(#(200, response_headers, response_body)) =
@@ -295,12 +296,13 @@ pub fn streamable_http_loopback_test() {
       allowed_hosts: ["127.0.0.1"],
       allowed_origins: ["http://127.0.0.1"],
     )
-  let assert Ok(capped_listener) =
-    http.start_http_server_with_policy(
-      empty_server(),
-      http.HttpOptions(port: 0, host: "127.0.0.1"),
-      capped_policy,
-    )
+  let assert Ok(capped_listener) = {
+    let options = http.HttpOptions(port: 0, host: "127.0.0.1")
+    http.listener(empty_server(), fn() { Nil })
+    |> http.with_options(options)
+    |> http.with_policy(capped_policy)
+    |> http.start()
+  }
   let assert Ok(#(200, capped_headers, capped_body)) =
     local_request(
       http.http_server_port(capped_listener),
@@ -349,13 +351,13 @@ pub fn live_sse_progress_burst_disconnect_cancels_worker_test() {
       allowed_origins: ["http://127.0.0.1"],
     )
   let notices = process.new_subject()
-  let assert Ok(listener) =
-    http.start_http_server_with_context(
-      burst_progress_server(),
-      http.HttpOptions(port: 0, host: "127.0.0.1"),
-      fn() { notices },
-      policy,
-    )
+  let assert Ok(listener) = {
+    let options = http.HttpOptions(port: 0, host: "127.0.0.1")
+    http.listener(burst_progress_server(), fn() { notices })
+    |> http.with_options(options)
+    |> http.with_policy(policy)
+    |> http.start()
+  }
   let assert Ok(200) =
     disconnect_after_first_sse_event(
       http.http_server_port(listener),
@@ -407,21 +409,48 @@ fn progress_call_envelope() -> BitArray {
 }
 
 fn burst_progress_server() -> server.Server(process.Subject(ProgressNotice)) {
-  let assert Ok(name) = relay.tool_name("disconnect_probe")
-  let assert Ok(tool) =
-    relay.context_tool_with_progress(
+  let assert Ok(name) = tool.tool_name("disconnect_probe")
+  let assert Ok(tool) = case
+    tool.definition(
       name,
-      relay.empty_metadata(),
       codec.object(codec.empty()),
       codec.object(codec.empty()),
-      codec.object(codec.empty()),
-      fn(notices, _input, report_progress) {
-        process.send(notices, ProgressBurstStarted(process.self()))
-        report_http_progress_burst(notices, report_progress, 1, 100_000)
-        Ok(Nil)
-      },
     )
-  let assert Ok(registry) = relay.registry([tool])
+  {
+    Ok(definition) -> {
+      let definition = tool.with_metadata(definition, tool.empty_metadata())
+      Ok({
+        let user_handler = fn(notices, _input, report_progress) {
+          process.send(notices, ProgressBurstStarted(process.self()))
+          report_http_progress_burst(notices, report_progress, 1, 100_000)
+          Ok(Nil)
+        }
+        let advanced_handler = fn(call, typed_input) {
+          let tool.HandlerCallContext(
+            application,
+            _input_responses,
+            report_progress,
+          ) = call
+          user_handler(application, typed_input, report_progress)
+          |> result.map(fn(output) { tool.Complete(output, []) })
+        }
+        tool.handle_advanced_with_error_renderer(
+          definition,
+          advanced_handler,
+          fn(application_error) {
+            case
+              codec.encode_json(codec.object(codec.empty()), application_error)
+            {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        )
+      })
+    }
+    Error(error) -> Error(error)
+  }
+  let assert Ok(registry) = tool.registry([tool])
   server.server(registry)
 }
 

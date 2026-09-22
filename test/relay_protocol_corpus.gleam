@@ -4,41 +4,92 @@ import gleam/json
 import gleam/option.{None, Some}
 import gleam/string
 import json/blueprint/codec
-import relay
 import relay/completion
 import relay/content
+import relay/internal/protocol/v2026_07_28 as v2026
 import relay/prompts
 import relay/protocol/jsonrpc.{RequestString}
-import relay/protocol/v2026_07_28 as v2026
 import relay/resources
 import relay/server
 import relay/subscriptions
+import relay/tool
 
 pub fn main() -> Nil {
   // 1. Tool setup
-  let assert Ok(greet_name) = relay.tool_name("greet")
-  let assert Ok(greet_tool) =
-    relay.context_tool(
+  let assert Ok(greet_name) = tool.tool_name("greet")
+  let assert Ok(greet_tool) = case
+    tool.definition(
       greet_name,
-      relay.tool_metadata("Greets the user"),
       codec.field("name", codec.string()),
       codec.string(),
-      codec.object(codec.empty()),
-      fn(_ctx: String, name: String) { Ok("Hello " <> name) },
     )
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some("Greets the user"),
+          ),
+        )
+      Ok(
+        tool.handle_with_error_renderer(
+          definition,
+          fn(name: String) { Ok("Hello " <> name) },
+          fn(application_error) {
+            case
+              codec.encode_json(codec.object(codec.empty()), application_error)
+            {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        ),
+      )
+    }
+    Error(error) -> Error(error)
+  }
 
-  let assert Ok(fail_name) = relay.tool_name("fail_tool")
-  let assert Ok(fail_tool) =
-    relay.context_tool(
+  let assert Ok(fail_name) = tool.tool_name("fail_tool")
+  let assert Ok(fail_tool) = case
+    tool.definition(
       fail_name,
-      relay.tool_metadata("Fails with application error"),
       codec.field("msg", codec.string()),
       codec.string(),
-      codec.field("reason", codec.string()),
-      fn(_ctx: String, msg: String) { Error("application error: " <> msg) },
     )
+  {
+    Ok(definition) -> {
+      let definition =
+        tool.with_metadata(
+          definition,
+          tool.ToolMetadata(
+            ..tool.empty_metadata(),
+            description: Some("Fails with application error"),
+          ),
+        )
+      Ok(
+        tool.handle_with_error_renderer(
+          definition,
+          fn(msg: String) { Error("application error: " <> msg) },
+          fn(application_error) {
+            case
+              codec.encode_json(
+                codec.field("reason", codec.string()),
+                application_error,
+              )
+            {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        ),
+      )
+    }
+    Error(error) -> Error(error)
+  }
 
-  let assert Ok(reg) = relay.registry([greet_tool, fail_tool])
+  let assert Ok(reg) = tool.registry([greet_tool, fail_tool])
 
   // 1. Discover response
   let disc_wire =
@@ -47,7 +98,7 @@ pub fn main() -> Nil {
   emit("discover", "DiscoverResultResponse", disc_wire)
 
   // 2. Tools list response
-  let decls = relay.declarations(reg, "corpus")
+  let decls = tool.declarations(reg, "corpus")
   let list_wire =
     v2026.encode_tools_list_response(RequestString("list-1"), decls)
     |> json.to_string()
@@ -57,7 +108,7 @@ pub fn main() -> Nil {
   let assert Ok(args_val) =
     codec.encode(codec.field("name", codec.string()), "World")
   let assert Ok(call_success_val) =
-    relay.dispatch(reg, "corpus", greet_name, args_val)
+    tool.dispatch(reg, "corpus", greet_name, args_val)
   let call_success_wire =
     v2026.encode_call_success_response(
       RequestString("call-1"),
@@ -136,7 +187,7 @@ pub fn main() -> Nil {
 
   // Service results below pass through server admission, dispatch and response
   // encoding, so the gate checks the actual delivered wire shapes.
-  let assert Ok(empty_registry) = relay.registry([])
+  let assert Ok(empty_registry) = tool.registry([])
   let resource =
     resources.resource(
       "memory://corpus/one",
@@ -170,13 +221,11 @@ pub fn main() -> Nil {
       Ok(completion.CompletionValues([argument.value], Some(1), Some(False)))
     })
   let service_server =
-    server.server_with_services(
-      empty_registry,
-      [resource],
-      [template],
-      [prompt],
-      Some(completion),
-    )
+    server.server(empty_registry)
+    |> server.with_resources([resource])
+    |> server.with_resource_templates([template])
+    |> server.with_prompts([prompt])
+    |> server.with_completion(Some(completion))
 
   let #(service_server, delivered) =
     deliver(service_server, "resources/list", [])

@@ -5,9 +5,9 @@ import gleam/string
 import gleeunit
 import gleeunit/should
 import json/blueprint/codec
-import relay
 import relay/content
 import relay/server
+import relay/tool
 
 pub fn main() -> Nil {
   gleeunit.main()
@@ -80,17 +80,42 @@ pub fn rich_content_families_survive_server_wire_encoding_test() {
       annotations: None,
     )),
   ]
-  let assert Ok(name) = relay.tool_name("rich")
-  let assert Ok(tool) =
-    relay.context_tool_with_content(
-      name,
-      relay.empty_metadata(),
-      codec.object(codec.empty()),
-      codec.string(),
-      codec.string(),
-      fn(_context, _input) { Ok(#(Some("structured"), blocks)) },
-    )
-  let assert Ok(registry) = relay.registry([tool])
+  let assert Ok(name) = tool.tool_name("rich")
+  let assert Ok(tool) = case
+    tool.definition(name, codec.object(codec.empty()), codec.string())
+  {
+    Ok(definition) -> {
+      let definition = tool.with_metadata(definition, tool.empty_metadata())
+      Ok({
+        let user_handler = fn(_context, _input) {
+          Ok(#(Some("structured"), blocks))
+        }
+        let advanced_handler = fn(call, typed_input) {
+          let tool.HandlerCallContext(
+            application,
+            _input_responses,
+            _report_progress,
+          ) = call
+          case user_handler(application, typed_input) {
+            Ok(#(Some(output), blocks)) -> Ok(tool.Complete(output, blocks))
+            Ok(#(None, blocks)) -> Ok(tool.Content(blocks))
+          }
+        }
+        tool.handle_advanced_with_error_renderer(
+          definition,
+          advanced_handler,
+          fn(application_error) {
+            case codec.encode_json(codec.string(), application_error) {
+              Ok(text) -> text
+              Error(_) -> "Tool execution failed."
+            }
+          },
+        )
+      })
+    }
+    Error(error) -> Error(error)
+  }
+  let assert Ok(registry) = tool.registry([tool])
   let metadata =
     json.object([
       #("io.modelcontextprotocol/protocolVersion", json.string("2026-07-28")),

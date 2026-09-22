@@ -2,13 +2,14 @@ import gleam/dict.{type Dict}
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/string
 import json/blueprint/codec.{
   type Codec, type DecodeError, type EncodeError, type Schema,
 }
 import json/blueprint/value.{type Value}
 import relay/content.{type ContentBlock}
-import relay/schema
+import relay/internal/schema
 
 /// Validated, opaque tool identifier.
 pub opaque type ToolName {
@@ -35,11 +36,6 @@ pub fn tool_name(raw: String) -> Result(ToolName, ToolNameError) {
         False -> Error(InvalidCharacters(raw))
       }
   }
-}
-
-/// Unchecked constructor for internal trusted tool names.
-pub fn tool_name_from_trusted(name: String) -> ToolName {
-  ToolName(name)
 }
 
 pub fn tool_name_to_string(tool_name: ToolName) -> String {
@@ -145,20 +141,33 @@ pub fn empty_annotations() -> ToolAnnotations {
   )
 }
 
-pub fn tool_annotations(
-  title: Option(String),
-  read_only_hint: Option(Bool),
-  destructive_hint: Option(Bool),
-  idempotent_hint: Option(Bool),
-  open_world_hint: Option(Bool),
+/// Changes one annotation hint while preserving all other hints.
+pub fn with_read_only_hint(
+  annotations: ToolAnnotations,
+  hint: Option(Bool),
 ) -> ToolAnnotations {
-  ToolAnnotations(
-    title: title,
-    read_only_hint: read_only_hint,
-    destructive_hint: destructive_hint,
-    idempotent_hint: idempotent_hint,
-    open_world_hint: open_world_hint,
-  )
+  ToolAnnotations(..annotations, read_only_hint: hint)
+}
+
+pub fn with_destructive_hint(
+  annotations: ToolAnnotations,
+  hint: Option(Bool),
+) -> ToolAnnotations {
+  ToolAnnotations(..annotations, destructive_hint: hint)
+}
+
+pub fn with_idempotent_hint(
+  annotations: ToolAnnotations,
+  hint: Option(Bool),
+) -> ToolAnnotations {
+  ToolAnnotations(..annotations, idempotent_hint: hint)
+}
+
+pub fn with_open_world_hint(
+  annotations: ToolAnnotations,
+  hint: Option(Bool),
+) -> ToolAnnotations {
+  ToolAnnotations(..annotations, open_world_hint: hint)
 }
 
 pub fn tool_annotations_to_json(annotations: ToolAnnotations) -> json.Json {
@@ -196,46 +205,6 @@ pub type ToolMetadata {
   )
 }
 
-pub fn tool_metadata(description: String) -> ToolMetadata {
-  ToolMetadata(
-    description: Some(description),
-    title: None,
-    annotations: None,
-    required_client_capabilities: [],
-  )
-}
-
-pub fn tool_metadata_with_title(
-  description: String,
-  title: String,
-) -> ToolMetadata {
-  ToolMetadata(
-    description: Some(description),
-    title: Some(title),
-    annotations: None,
-    required_client_capabilities: [],
-  )
-}
-
-pub fn tool_metadata_with_annotations(
-  metadata: ToolMetadata,
-  annotations: ToolAnnotations,
-) -> ToolMetadata {
-  ToolMetadata(..metadata, annotations: Some(annotations))
-}
-
-pub fn tool_metadata_requiring_client_capabilities(
-  description: String,
-  capabilities: List(String),
-) -> ToolMetadata {
-  ToolMetadata(
-    description: Some(description),
-    title: None,
-    annotations: None,
-    required_client_capabilities: capabilities,
-  )
-}
-
 pub fn empty_metadata() -> ToolMetadata {
   ToolMetadata(
     description: None,
@@ -250,6 +219,187 @@ pub type ToolAdmissionError {
   InputSchemaMustBeObject(String)
   MissingOutputSchema
   UnsupportedSchemaFeature(String)
+}
+
+/// Admitted native tool contract. Codecs remain tied to the same definition
+/// used for listing, registration, and typed client calls.
+pub opaque type Definition(input, output) {
+  Definition(
+    name: ToolName,
+    metadata: ToolMetadata,
+    input: Codec(input),
+    output: Codec(output),
+    input_schema: Schema,
+    input_schema_override: Option(Value),
+    output_schema: Schema,
+  )
+}
+
+/// An admitted tool whose result consists only of content blocks.
+pub opaque type ContentDefinition(input) {
+  ContentDefinition(
+    name: ToolName,
+    metadata: ToolMetadata,
+    input: Codec(input),
+    input_schema: Schema,
+    input_schema_override: Option(Value),
+  )
+}
+
+pub fn content_definition(
+  name: ToolName,
+  input: Codec(input),
+) -> Result(ContentDefinition(input), ToolAdmissionError) {
+  use input_schema <- result.try(admit_input(input))
+  Ok(ContentDefinition(name, empty_metadata(), input, input_schema, None))
+}
+
+/// Reuses the same composable metadata value as a structured definition.
+pub fn content_with_metadata(
+  definition: ContentDefinition(input),
+  metadata: ToolMetadata,
+) -> ContentDefinition(input) {
+  ContentDefinition(..definition, metadata: metadata)
+}
+
+pub fn content_definition_name(
+  definition: ContentDefinition(input),
+) -> ToolName {
+  definition.name
+}
+
+pub fn content_definition_input_codec(
+  definition: ContentDefinition(input),
+) -> Codec(input) {
+  definition.input
+}
+
+/// A caller supplied schema augments discovery; the codec still decodes calls.
+pub fn with_input_schema_override(
+  definition: Definition(input, output),
+  input_schema: Value,
+) -> Result(Definition(input, output), ToolAdmissionError) {
+  case input_schema {
+    value.Object(_) ->
+      Ok(Definition(..definition, input_schema_override: Some(input_schema)))
+    _ -> Error(InputSchemaMustBeObject("non-object"))
+  }
+}
+
+/// Validates the schemas once, before a handler is bound or a call is made.
+pub fn definition(
+  name: ToolName,
+  input: Codec(input),
+  output: Codec(output),
+) -> Result(Definition(input, output), ToolAdmissionError) {
+  use admitted_input <- result.try(admit_input(input))
+  use admitted_output <- result.try(admit_output(output))
+  Ok(Definition(
+    name,
+    empty_metadata(),
+    input,
+    output,
+    admitted_input,
+    None,
+    admitted_output,
+  ))
+}
+
+pub fn definition_name(definition: Definition(input, output)) -> ToolName {
+  definition.name
+}
+
+pub fn definition_metadata(
+  definition: Definition(input, output),
+) -> ToolMetadata {
+  definition.metadata
+}
+
+pub fn definition_input_codec(
+  definition: Definition(input, output),
+) -> Codec(input) {
+  definition.input
+}
+
+pub fn definition_output_codec(
+  definition: Definition(input, output),
+) -> Codec(output) {
+  definition.output
+}
+
+pub fn with_metadata(
+  definition: Definition(input, output),
+  metadata: ToolMetadata,
+) -> Definition(input, output) {
+  Definition(..definition, metadata: metadata)
+}
+
+/// Definition modifiers are independent and preserve unrelated metadata.
+pub fn with_description(
+  definition: Definition(input, output),
+  description: String,
+) -> Definition(input, output) {
+  Definition(
+    ..definition,
+    metadata: ToolMetadata(
+      ..definition.metadata,
+      description: Some(description),
+    ),
+  )
+}
+
+pub fn with_title(
+  definition: Definition(input, output),
+  title: String,
+) -> Definition(input, output) {
+  Definition(
+    ..definition,
+    metadata: ToolMetadata(..definition.metadata, title: Some(title)),
+  )
+}
+
+pub fn with_annotations(
+  definition: Definition(input, output),
+  annotations: ToolAnnotations,
+) -> Definition(input, output) {
+  Definition(
+    ..definition,
+    metadata: ToolMetadata(
+      ..definition.metadata,
+      annotations: Some(annotations),
+    ),
+  )
+}
+
+pub fn with_required_client_capabilities(
+  definition: Definition(input, output),
+  capabilities: List(String),
+) -> Definition(input, output) {
+  Definition(
+    ..definition,
+    metadata: ToolMetadata(
+      ..definition.metadata,
+      required_client_capabilities: capabilities,
+    ),
+  )
+}
+
+fn admit_input(input: Codec(input)) -> Result(Schema, ToolAdmissionError) {
+  case schema.validate_input_schema(codec.schema(input)) {
+    Error(schema.MissingSchema) -> Error(MissingInputSchema)
+    Error(schema.SchemaMustBeObject(kind)) ->
+      Error(InputSchemaMustBeObject(kind))
+    Ok(admitted) -> Ok(admitted)
+  }
+}
+
+fn admit_output(output: Codec(output)) -> Result(Schema, ToolAdmissionError) {
+  case schema.validate_output_schema(codec.schema(output)) {
+    Error(schema.MissingSchema) -> Error(MissingOutputSchema)
+    Error(schema.SchemaMustBeObject(kind)) ->
+      Error(UnsupportedSchemaFeature(kind))
+    Ok(admitted) -> Ok(admitted)
+  }
 }
 
 /// Retained tool declaration for discovery and tool listing.
@@ -275,10 +425,20 @@ pub type InputRequest {
   InputRequest(method: String, params: json.Json)
 }
 
-/// Result returned by a handler that can pause for client-provided input.
-pub type InputHandlerResult(output) {
-  CompleteOutput(output)
-  RequestInput(Dict(String, InputRequest))
+/// Everything an advanced handler may need during one invocation.
+pub type HandlerCallContext(context) {
+  HandlerCallContext(
+    application: context,
+    input_responses: Option(Value),
+    report_progress: ProgressReporter,
+  )
+}
+
+/// A structured result may also carry rich content, or request another round.
+pub type HandlerResult(output) {
+  Complete(output, List(ContentBlock))
+  Content(List(ContentBlock))
+  NeedsInput(Dict(String, InputRequest))
 }
 
 /// Callback available to handlers that report ordered, non-negative progress.
@@ -303,279 +463,202 @@ pub type RegistryError {
 pub type DispatchError {
   UnknownTool(ToolName)
   InvalidInput(DecodeError)
-  ApplicationFailure(Value)
+  PublicApplicationFailure(String)
   ContentOnlyOutput
   InvalidOutput(EncodeError)
-  ErrorEncodingFailure(EncodeError)
   InputRequiredOutput
 }
 
-/// Constructs a typed contextual tool after validating input schema object root and output schema.
-pub fn context_tool(
-  name: ToolName,
-  metadata: ToolMetadata,
-  input: Codec(input),
-  output: Codec(output),
-  error: Codec(application_error),
-  handler: fn(context, input) -> Result(output, application_error),
-) -> Result(ContextTool(context), ToolAdmissionError) {
-  case schema.validate_input_schema(codec.schema(input)) {
-    Error(schema.MissingSchema) -> Error(MissingInputSchema)
-    Error(schema.SchemaMustBeObject(kind)) ->
-      Error(InputSchemaMustBeObject(kind))
-    Ok(admitted_input_schema) -> {
-      case schema.validate_output_schema(codec.schema(output)) {
-        Error(schema.MissingSchema) -> Error(MissingOutputSchema)
-        Error(schema.SchemaMustBeObject(kind)) ->
-          Error(UnsupportedSchemaFeature(kind))
-        Ok(admitted_output_schema) -> {
-          let decl =
-            ToolDeclaration(
-              name: name,
-              metadata: metadata,
-              input_schema: admitted_input_schema,
-              input_schema_override: None,
-              output_schema: Some(admitted_output_schema),
-            )
-          let invoke_fn = fn(
-            ctx: context,
-            raw_input: Value,
-            _input_responses: Option(Value),
-            _report_progress: ProgressReporter,
-          ) -> Result(ToolOutput, DispatchError) {
-            case codec.decode(input, raw_input) {
-              Error(dec_err) -> Error(InvalidInput(dec_err))
-              Ok(typed_input) ->
-                case handler(ctx, typed_input) {
-                  Ok(typed_output) ->
-                    case codec.encode(output, typed_output) {
-                      Ok(encoded_val) ->
-                        Ok(StructuredWithContent(encoded_val, []))
-                      Error(enc_err) -> Error(InvalidOutput(enc_err))
-                    }
-                  Error(app_err) ->
-                    case codec.encode(error, app_err) {
-                      Ok(encoded_err) -> Error(ApplicationFailure(encoded_err))
-                      Error(enc_err) -> Error(ErrorEncodingFailure(enc_err))
-                    }
-                }
-            }
-          }
-          Ok(ContextTool(name: name, declaration: decl, invoke: invoke_fn))
-        }
-      }
+/// Binds a native handler to an admitted definition. The default message is
+/// deliberately independent of the handler's private error value.
+pub fn handle(
+  definition: Definition(input, output),
+  handler: fn(input) -> Result(output, application_error),
+) -> ContextTool(context) {
+  handle_with_error_renderer(definition, handler, fn(_error) {
+    "Tool execution failed."
+  })
+}
+
+/// Renders an application error before its native type is erased by registration.
+pub fn handle_with_error_renderer(
+  definition: Definition(input, output),
+  handler: fn(input) -> Result(output, application_error),
+  render_error: fn(application_error) -> String,
+) -> ContextTool(context) {
+  let declaration =
+    ToolDeclaration(
+      name: definition.name,
+      metadata: definition.metadata,
+      input_schema: definition.input_schema,
+      input_schema_override: definition.input_schema_override,
+      output_schema: Some(definition.output_schema),
+    )
+  let invoke = fn(
+    _context: context,
+    raw_input: Value,
+    _input_responses: Option(Value),
+    _report_progress: ProgressReporter,
+  ) -> Result(ToolOutput, DispatchError) {
+    use typed_input <- result.try(
+      codec.decode(definition.input, raw_input)
+      |> result.map_error(InvalidInput),
+    )
+    use typed_output <- result.try(
+      handler(typed_input)
+      |> result.map_error(fn(error) {
+        PublicApplicationFailure(render_error(error))
+      }),
+    )
+    codec.encode(definition.output, typed_output)
+    |> result.map(fn(value) { StructuredWithContent(value, []) })
+    |> result.map_error(InvalidOutput)
+  }
+  ContextTool(definition.name, declaration, invoke)
+}
+
+/// Binds rich content, progress, and multi-round input to one admitted contract.
+pub fn handle_advanced(
+  definition: Definition(input, output),
+  handler: fn(HandlerCallContext(context), input) ->
+    Result(HandlerResult(output), application_error),
+) -> ContextTool(context) {
+  handle_advanced_with_error_renderer(definition, handler, fn(_error) {
+    "Tool execution failed."
+  })
+}
+
+pub fn handle_advanced_with_error_renderer(
+  definition: Definition(input, output),
+  handler: fn(HandlerCallContext(context), input) ->
+    Result(HandlerResult(output), application_error),
+  render_error: fn(application_error) -> String,
+) -> ContextTool(context) {
+  let declaration =
+    ToolDeclaration(
+      name: definition.name,
+      metadata: definition.metadata,
+      input_schema: definition.input_schema,
+      input_schema_override: definition.input_schema_override,
+      output_schema: Some(definition.output_schema),
+    )
+  let invoke = fn(
+    context: context,
+    raw_input: Value,
+    input_responses: Option(Value),
+    report_progress: ProgressReporter,
+  ) -> Result(ToolOutput, DispatchError) {
+    use typed_input <- result.try(
+      codec.decode(definition.input, raw_input)
+      |> result.map_error(InvalidInput),
+    )
+    use handler_result <- result.try(
+      handler(
+        HandlerCallContext(context, input_responses, report_progress),
+        typed_input,
+      )
+      |> result.map_error(fn(error) {
+        PublicApplicationFailure(render_error(error))
+      }),
+    )
+    case handler_result {
+      Complete(output, blocks) ->
+        codec.encode(definition.output, output)
+        |> result.map(fn(value) { StructuredWithContent(value, blocks) })
+        |> result.map_error(InvalidOutput)
+      Content(blocks) -> Ok(ContentOnly(blocks))
+      NeedsInput(requests) -> Ok(InputRequired(requests))
     }
   }
+  ContextTool(definition.name, declaration, invoke)
 }
 
-/// Constructs a tool that returns content blocks and optionally structured output.
-/// The output codec remains required so any structured response is schema checked.
-pub fn context_tool_with_content(
-  name: ToolName,
-  metadata: ToolMetadata,
-  input: Codec(input),
-  output: Codec(output),
-  error: Codec(application_error),
-  handler: fn(context, input) ->
-    Result(#(Option(output), List(ContentBlock)), application_error),
-) -> Result(ContextTool(context), ToolAdmissionError) {
-  case schema.validate_input_schema(codec.schema(input)) {
-    Error(schema.MissingSchema) -> Error(MissingInputSchema)
-    Error(schema.SchemaMustBeObject(kind)) ->
-      Error(InputSchemaMustBeObject(kind))
-    Ok(admitted_input_schema) ->
-      case schema.validate_output_schema(codec.schema(output)) {
-        Error(schema.MissingSchema) -> Error(MissingOutputSchema)
-        Error(schema.SchemaMustBeObject(kind)) ->
-          Error(UnsupportedSchemaFeature(kind))
-        Ok(admitted_output_schema) -> {
-          let declaration =
-            ToolDeclaration(
-              name: name,
-              metadata: metadata,
-              input_schema: admitted_input_schema,
-              input_schema_override: None,
-              output_schema: Some(admitted_output_schema),
-            )
-          let invoke = fn(
-            ctx: context,
-            raw_input: Value,
-            _input_responses: Option(Value),
-            _report_progress: ProgressReporter,
-          ) -> Result(ToolOutput, DispatchError) {
-            case codec.decode(input, raw_input) {
-              Error(dec_err) -> Error(InvalidInput(dec_err))
-              Ok(typed_input) ->
-                case handler(ctx, typed_input) {
-                  Ok(#(None, blocks)) -> Ok(ContentOnly(blocks))
-                  Ok(#(Some(value), blocks)) ->
-                    case codec.encode(output, value) {
-                      Ok(encoded) -> Ok(StructuredWithContent(encoded, blocks))
-                      Error(enc_err) -> Error(InvalidOutput(enc_err))
-                    }
-                  Error(app_err) ->
-                    case codec.encode(error, app_err) {
-                      Ok(encoded_err) -> Error(ApplicationFailure(encoded_err))
-                      Error(enc_err) -> Error(ErrorEncodingFailure(enc_err))
-                    }
-                }
-            }
-          }
-          Ok(ContextTool(name, declaration, invoke))
-        }
-      }
-  }
+pub fn handle_content(
+  definition: ContentDefinition(input),
+  handler: fn(input) -> Result(List(ContentBlock), application_error),
+) -> ContextTool(context) {
+  handle_content_with_error_renderer(definition, handler, fn(_error) {
+    "Tool execution failed."
+  })
 }
 
-/// Constructs a typed tool whose handler can report progress while it runs.
-pub fn context_tool_with_progress(
-  name: ToolName,
-  metadata: ToolMetadata,
-  input: Codec(input),
-  output: Codec(output),
-  error: Codec(application_error),
-  handler: fn(context, input, ProgressReporter) ->
-    Result(output, application_error),
-) -> Result(ContextTool(context), ToolAdmissionError) {
-  case schema.validate_input_schema(codec.schema(input)) {
-    Error(schema.MissingSchema) -> Error(MissingInputSchema)
-    Error(schema.SchemaMustBeObject(kind)) ->
-      Error(InputSchemaMustBeObject(kind))
-    Ok(admitted_input_schema) ->
-      case schema.validate_output_schema(codec.schema(output)) {
-        Error(schema.MissingSchema) -> Error(MissingOutputSchema)
-        Error(schema.SchemaMustBeObject(kind)) ->
-          Error(UnsupportedSchemaFeature(kind))
-        Ok(admitted_output_schema) -> {
-          let declaration =
-            ToolDeclaration(
-              name: name,
-              metadata: metadata,
-              input_schema: admitted_input_schema,
-              input_schema_override: None,
-              output_schema: Some(admitted_output_schema),
-            )
-          let invoke = fn(
-            ctx: context,
-            raw_input: Value,
-            _input_responses: Option(Value),
-            report_progress: ProgressReporter,
-          ) -> Result(ToolOutput, DispatchError) {
-            case codec.decode(input, raw_input) {
-              Error(dec_err) -> Error(InvalidInput(dec_err))
-              Ok(typed_input) ->
-                case handler(ctx, typed_input, report_progress) {
-                  Ok(typed_output) ->
-                    case codec.encode(output, typed_output) {
-                      Ok(encoded_val) ->
-                        Ok(StructuredWithContent(encoded_val, []))
-                      Error(enc_err) -> Error(InvalidOutput(enc_err))
-                    }
-                  Error(app_err) ->
-                    case codec.encode(error, app_err) {
-                      Ok(encoded_err) -> Error(ApplicationFailure(encoded_err))
-                      Error(enc_err) -> Error(ErrorEncodingFailure(enc_err))
-                    }
-                }
-            }
-          }
-          Ok(ContextTool(name, declaration, invoke))
-        }
-      }
+pub fn handle_content_with_error_renderer(
+  definition: ContentDefinition(input),
+  handler: fn(input) -> Result(List(ContentBlock), application_error),
+  render_error: fn(application_error) -> String,
+) -> ContextTool(context) {
+  let declaration =
+    ToolDeclaration(
+      definition.name,
+      definition.metadata,
+      definition.input_schema,
+      definition.input_schema_override,
+      None,
+    )
+  let invoke = fn(
+    _context: context,
+    raw_input: Value,
+    _input_responses: Option(Value),
+    _report_progress: ProgressReporter,
+  ) -> Result(ToolOutput, DispatchError) {
+    use typed_input <- result.try(
+      codec.decode(definition.input, raw_input)
+      |> result.map_error(InvalidInput),
+    )
+    handler(typed_input)
+    |> result.map(ContentOnly)
+    |> result.map_error(fn(error) {
+      PublicApplicationFailure(render_error(error))
+    })
   }
+  ContextTool(definition.name, declaration, invoke)
 }
 
-/// Constructs a typed tool handler that can request input and resume with client responses.
-pub fn context_tool_with_inputs(
-  name: ToolName,
-  metadata: ToolMetadata,
-  input: Codec(input),
-  output: Codec(output),
-  error: Codec(application_error),
-  handler: fn(context, input, Option(Value)) ->
-    Result(InputHandlerResult(output), application_error),
-) -> Result(ContextTool(context), ToolAdmissionError) {
-  case schema.validate_input_schema(codec.schema(input)) {
-    Error(schema.MissingSchema) -> Error(MissingInputSchema)
-    Error(schema.SchemaMustBeObject(kind)) ->
-      Error(InputSchemaMustBeObject(kind))
-    Ok(admitted_input_schema) ->
-      case schema.validate_output_schema(codec.schema(output)) {
-        Error(schema.MissingSchema) -> Error(MissingOutputSchema)
-        Error(schema.SchemaMustBeObject(kind)) ->
-          Error(UnsupportedSchemaFeature(kind))
-        Ok(admitted_output_schema) -> {
-          let declaration =
-            ToolDeclaration(
-              name: name,
-              metadata: metadata,
-              input_schema: admitted_input_schema,
-              input_schema_override: None,
-              output_schema: Some(admitted_output_schema),
-            )
-          let invoke = fn(
-            ctx: context,
-            raw_input: Value,
-            input_responses: Option(Value),
-            _report_progress: ProgressReporter,
-          ) -> Result(ToolOutput, DispatchError) {
-            case codec.decode(input, raw_input) {
-              Error(dec_err) -> Error(InvalidInput(dec_err))
-              Ok(typed_input) ->
-                case handler(ctx, typed_input, input_responses) {
-                  Ok(CompleteOutput(typed_output)) ->
-                    case codec.encode(output, typed_output) {
-                      Ok(encoded) -> Ok(StructuredWithContent(encoded, []))
-                      Error(enc_err) -> Error(InvalidOutput(enc_err))
-                    }
-                  Ok(RequestInput(input_requests)) ->
-                    Ok(InputRequired(input_requests))
-                  Error(app_err) ->
-                    case codec.encode(error, app_err) {
-                      Ok(encoded_err) -> Error(ApplicationFailure(encoded_err))
-                      Error(enc_err) -> Error(ErrorEncodingFailure(enc_err))
-                    }
-                }
-            }
-          }
-          Ok(ContextTool(name, declaration, invoke))
-        }
-      }
-  }
+/// Content-only handler with per-invocation context, progress, and input replies.
+pub fn handle_content_advanced(
+  definition: ContentDefinition(input),
+  handler: fn(HandlerCallContext(context), input) ->
+    Result(List(ContentBlock), application_error),
+) -> ContextTool(context) {
+  handle_content_advanced_with_error_renderer(definition, handler, fn(_error) {
+    "Tool execution failed."
+  })
 }
 
-/// Constructs a typed tool with an explicit input schema document.
-///
-/// The codec still validates every invocation. This constructor preserves schema
-/// vocabulary that a codec cannot express, such as custom annotations and
-/// Draft 2020-12 composition keywords.
-pub fn context_tool_with_input_schema(
-  name: ToolName,
-  metadata: ToolMetadata,
-  input: Codec(input),
-  output: Codec(output),
-  error: Codec(application_error),
-  input_schema: Value,
-  handler: fn(context, input) -> Result(output, application_error),
-) -> Result(ContextTool(context), ToolAdmissionError) {
-  case input_schema {
-    value.Object(_) ->
-      case context_tool(name, metadata, input, output, error, handler) {
-        Error(admission_error) -> Error(admission_error)
-        Ok(context_tool) -> {
-          let ContextTool(tool_name, declaration, invoke) = context_tool
-          Ok(ContextTool(
-            tool_name,
-            ToolDeclaration(
-              ..declaration,
-              input_schema_override: Some(input_schema),
-            ),
-            invoke,
-          ))
-        }
-      }
-    _ -> Error(InputSchemaMustBeObject("non-object"))
+pub fn handle_content_advanced_with_error_renderer(
+  definition: ContentDefinition(input),
+  handler: fn(HandlerCallContext(context), input) ->
+    Result(List(ContentBlock), application_error),
+  render_error: fn(application_error) -> String,
+) -> ContextTool(context) {
+  let declaration =
+    ToolDeclaration(
+      definition.name,
+      definition.metadata,
+      definition.input_schema,
+      definition.input_schema_override,
+      None,
+    )
+  let invoke = fn(
+    context: context,
+    raw_input: Value,
+    input_responses: Option(Value),
+    report_progress: ProgressReporter,
+  ) -> Result(ToolOutput, DispatchError) {
+    use typed_input <- result.try(
+      codec.decode(definition.input, raw_input)
+      |> result.map_error(InvalidInput),
+    )
+    handler(
+      HandlerCallContext(context, input_responses, report_progress),
+      typed_input,
+    )
+    |> result.map(ContentOnly)
+    |> result.map_error(fn(error) {
+      PublicApplicationFailure(render_error(error))
+    })
   }
+  ContextTool(definition.name, declaration, invoke)
 }
 
 pub fn tool_name_of(tool: ContextTool(context)) -> ToolName {

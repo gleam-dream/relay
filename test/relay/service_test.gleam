@@ -8,20 +8,20 @@ import gleam/option.{None, Some}
 import gleam/string
 import gleeunit
 import gleeunit/should
-import relay
 import relay/completion
 import relay/content
+import relay/internal/subscriptions_state as subscription_state
 import relay/prompts
 import relay/resources
 import relay/server
-import relay/subscriptions
+import relay/tool
 
 pub fn main() -> Nil {
   gleeunit.main()
 }
 
 fn sample_server() -> server.Server(String) {
-  let assert Ok(registry) = relay.registry([])
+  let assert Ok(registry) = tool.registry([])
   let resource =
     resources.resource("memory://notes/1", "note", fn(_context, uri) {
       Ok([content.TextResourceContents(uri, "the note", Some("text/plain"))])
@@ -50,13 +50,11 @@ fn sample_server() -> server.Server(String) {
         Some(False),
       ))
     })
-  server.server_with_services(
-    registry,
-    [resource],
-    [template],
-    [prompt],
-    Some(completion),
-  )
+  server.server(registry)
+  |> server.with_resources([resource])
+  |> server.with_resource_templates([template])
+  |> server.with_prompts([prompt])
+  |> server.with_completion(Some(completion))
 }
 
 fn wire_request(
@@ -231,20 +229,20 @@ fn is_ok(value: Result(a, b)) -> Bool {
 
 pub fn resource_subscription_registry_is_idempotent_and_owner_scoped_test() {
   let assert Ok(uri) = resources.resource_uri("memory://notes/42")
-  let store = subscriptions.new()
-  let store = subscriptions.subscribe(store, "client-a", uri)
-  let store = subscriptions.subscribe(store, "client-a", uri)
-  let store = subscriptions.subscribe(store, "client-b", uri)
-  subscriptions.count(store) |> should.equal(2)
-  subscriptions.owners_for_resource(store, uri)
+  let store = subscription_state.new()
+  let store = subscription_state.subscribe(store, "client-a", uri)
+  let store = subscription_state.subscribe(store, "client-a", uri)
+  let store = subscription_state.subscribe(store, "client-b", uri)
+  subscription_state.count(store) |> should.equal(2)
+  subscription_state.owners_for_resource(store, uri)
   |> list.contains("client-a")
   |> should.be_true
 
-  let store = subscriptions.unsubscribe(store, "client-a", uri)
-  subscriptions.is_subscribed(store, "client-a", uri) |> should.be_false
-  subscriptions.is_subscribed(store, "client-b", uri) |> should.be_true
-  let store = subscriptions.close_owner(store, "client-b")
-  subscriptions.count(store) |> should.equal(0)
+  let store = subscription_state.unsubscribe(store, "client-a", uri)
+  subscription_state.is_subscribed(store, "client-a", uri) |> should.be_false
+  subscription_state.is_subscribed(store, "client-b", uri) |> should.be_true
+  let store = subscription_state.close_owner(store, "client-b")
+  subscription_state.count(store) |> should.equal(0)
 }
 
 fn many_resources(count: Int) -> List(resources.ContextResource(String)) {
@@ -264,9 +262,13 @@ fn many_resources(count: Int) -> List(resources.ContextResource(String)) {
 }
 
 pub fn pagination_cursor_is_opaque_and_family_scoped_test() {
-  let assert Ok(registry) = relay.registry([])
+  let assert Ok(registry) = tool.registry([])
   let s =
-    server.server_with_services(registry, many_resources(101), [], [], None)
+    server.server(registry)
+    |> server.with_resources(many_resources(101))
+    |> server.with_resource_templates([])
+    |> server.with_prompts([])
+    |> server.with_completion(None)
   let ex = server.fresh_exchange()
   let #(s1, effects) =
     server.step(

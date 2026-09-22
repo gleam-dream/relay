@@ -13,10 +13,16 @@ import gleam/string
 import gleam/string_tree
 import gleam/uri
 import mist
-import relay/protocol/v2026_07_28 as v2026
+import relay/internal/protocol/v2026_07_28 as v2026
 import relay/runtime
 import relay/server as server_mod
 import relay/tool as relay_tool
+
+@external(erlang, "relay_url_ffi", "valid_bind_host")
+fn valid_bind_host(host: String) -> Bool
+
+@external(erlang, "relay_url_ffi", "readable_file")
+fn readable_file(path: String) -> Bool
 
 /// Streamable HTTP listener options. Bind `host` to a loopback interface for
 /// local development; remote listeners should use an explicit policy.
@@ -35,11 +41,63 @@ pub type HttpPolicy {
   )
 }
 
+/// One description of a modern HTTP listener. Defaults bind a local ephemeral
+/// port and retain the local Host/Origin policy; callers must supply a wider
+/// policy explicitly when they need one. This value does not authorize requests.
+pub opaque type HttpListener(context) {
+  HttpListener(
+    server: server_mod.Server(context),
+    options: HttpOptions,
+    policy: HttpPolicy,
+    context: fn() -> context,
+    tls: Option(#(String, String)),
+  )
+}
+
+pub fn listener(
+  server: server_mod.Server(context),
+  context: fn() -> context,
+) -> HttpListener(context) {
+  let host = "127.0.0.1"
+  HttpListener(
+    server: server,
+    options: HttpOptions(port: 0, host: host),
+    policy: local_http_policy(host),
+    context: context,
+    tls: None,
+  )
+}
+
+/// Replaces bind options. The policy is retained and is never widened here.
+pub fn with_options(
+  listener: HttpListener(context),
+  options: HttpOptions,
+) -> HttpListener(context) {
+  HttpListener(..listener, options: options)
+}
+
+/// Replaces the complete policy, including Host and Origin allow-lists.
+pub fn with_policy(
+  listener: HttpListener(context),
+  policy: HttpPolicy,
+) -> HttpListener(context) {
+  HttpListener(..listener, policy: policy)
+}
+
+/// Selects TLS certificate and key files for this listener.
+pub fn with_tls(
+  listener: HttpListener(context),
+  certfile: String,
+  keyfile: String,
+) -> HttpListener(context) {
+  HttpListener(..listener, tls: Some(#(certfile, keyfile)))
+}
+
 pub opaque type HttpServer(context) {
   HttpServer(pid: process.Pid, port: Int, hub: HubHandle(context))
 }
 
-pub opaque type HubHandle(context) {
+type HubHandle(context) {
   HubHandle(process.Subject(HubMessage(context)))
 }
 
@@ -366,120 +424,50 @@ pub fn local_http_policy(host: String) -> HttpPolicy {
   )
 }
 
-/// Starts the local, unprotected modern Streamable HTTP endpoint.
-pub fn start_http_server(
-  server: server_mod.Server(Nil),
-  options: HttpOptions,
-) -> Result(HttpServer(Nil), String) {
-  start_http_server_with_policy(
-    server,
-    options,
-    local_http_policy(options.host),
-  )
-}
-
-pub fn start_http_server_with_policy(
-  server: server_mod.Server(Nil),
-  options: HttpOptions,
-  policy: HttpPolicy,
-) -> Result(HttpServer(Nil), String) {
-  start_http_server_with_context(server, options, fn() { Nil }, policy)
-}
-
-/// Starts the modern endpoint with an application-owned request context.
-pub fn start_http_server_with_context(
-  server: server_mod.Server(context),
-  options: HttpOptions,
-  context: fn() -> context,
-  policy: HttpPolicy,
+/// Validates the entire description before allocating the hub or listener.
+pub fn start(
+  listener: HttpListener(context),
 ) -> Result(HttpServer(context), String) {
-  case valid_policy(policy) {
+  case valid_listener(listener) {
     False ->
-      Error("Relay HTTP limits and allow-lists must be non-empty and positive")
-    True -> {
-      case start_hub(server) {
+      Error("Invalid Relay HTTP listener options, policy, or TLS settings")
+    True ->
+      case start_hub(listener.server) {
         Error(_) -> Error("Relay subscription hub failed to start")
         Ok(hub) -> {
           let port_subject = process.new_subject()
-          let handler = fn(req) { handle_request(req, context, policy, hub) }
+          let handler = fn(req) {
+            handle_request(req, listener.context, listener.policy, hub)
+          }
           let builder =
             mist.new(handler)
-            |> mist.port(options.port)
-            |> mist.bind(options.host)
-            |> mist.after_start(fn(port, _scheme, _interface) {
+            |> mist.port(listener.options.port)
+            |> mist.bind(listener.options.host)
+          let builder = case listener.tls {
+            None -> builder
+            Some(#(certfile, keyfile)) ->
+              mist.with_tls(builder, certfile, keyfile)
+          }
+          let builder =
+            mist.after_start(builder, fn(port, _scheme, _interface) {
               process.send(port_subject, port)
             })
           start_listener(builder, port_subject, hub)
         }
       }
-    }
   }
 }
 
-/// Starts the secure modern endpoint with TLS certificates and default local policy.
-pub fn start_https_server(
-  server: server_mod.Server(Nil),
-  options: HttpOptions,
-  certfile: String,
-  keyfile: String,
-) -> Result(HttpServer(Nil), String) {
-  start_https_server_with_policy(
-    server,
-    options,
-    local_http_policy(options.host),
-    certfile,
-    keyfile,
-  )
-}
-
-/// Starts the secure modern endpoint with TLS certificates and explicit policy.
-pub fn start_https_server_with_policy(
-  server: server_mod.Server(Nil),
-  options: HttpOptions,
-  policy: HttpPolicy,
-  certfile: String,
-  keyfile: String,
-) -> Result(HttpServer(Nil), String) {
-  start_https_server_with_context(
-    server,
-    options,
-    fn() { Nil },
-    policy,
-    certfile,
-    keyfile,
-  )
-}
-
-/// Starts the secure modern endpoint with TLS certificates, context, and policy.
-pub fn start_https_server_with_context(
-  server: server_mod.Server(context),
-  options: HttpOptions,
-  context: fn() -> context,
-  policy: HttpPolicy,
-  certfile: String,
-  keyfile: String,
-) -> Result(HttpServer(context), String) {
-  case valid_policy(policy) {
-    False ->
-      Error("Relay HTTP limits and allow-lists must be non-empty and positive")
-    True -> {
-      case start_hub(server) {
-        Error(_) -> Error("Relay subscription hub failed to start")
-        Ok(hub) -> {
-          let port_subject = process.new_subject()
-          let handler = fn(req) { handle_request(req, context, policy, hub) }
-          let builder =
-            mist.new(handler)
-            |> mist.port(options.port)
-            |> mist.bind(options.host)
-            |> mist.with_tls(certfile, keyfile)
-            |> mist.after_start(fn(port, _scheme, _interface) {
-              process.send(port_subject, port)
-            })
-          start_listener(builder, port_subject, hub)
-        }
-      }
-    }
+fn valid_listener(listener: HttpListener(context)) -> Bool {
+  let options = listener.options
+  valid_policy(listener.policy)
+  && valid_bind_host(options.host)
+  && options.port >= 0
+  && options.port < 65_536
+  && case listener.tls {
+    None -> True
+    Some(#(certfile, keyfile)) ->
+      readable_file(certfile) && readable_file(keyfile)
   }
 }
 

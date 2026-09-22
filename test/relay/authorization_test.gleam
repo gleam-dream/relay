@@ -1,8 +1,8 @@
 import gleeunit
 import gleeunit/should
 import json/blueprint/value
-import relay
 import relay/authorization
+import relay/tool
 
 pub fn main() -> Nil {
   gleeunit.main()
@@ -80,8 +80,10 @@ pub fn retains_attested_scopes_and_rechecks_registry_requirements_test() {
       fn(_context, _grant, _declaration) { authorization.Visible },
       fn(_context, _grant, _declaration) { authorization.ExecutionAuthorized },
     )
+  let assert Ok(tools) = tool.registry([])
   let wrong_resource =
     authorization.protect_registry(
+      tools,
       authorization.protection_config(other, []),
       policy,
     )
@@ -89,7 +91,7 @@ pub fn retains_attested_scopes_and_rechecks_registry_requirements_test() {
     authorization.visible_declarations(wrong_resource, Nil, grant),
     Error(authorization.GrantResourceMismatch),
   )
-  let assert Ok(name) = relay.tool_name("missing")
+  let assert Ok(name) = tool.tool_name("missing")
   should.equal(
     authorization.dispatch_granted(wrong_resource, Nil, grant, name, value.Null),
     Error(authorization.GrantUseFailed(authorization.GrantResourceMismatch)),
@@ -97,6 +99,7 @@ pub fn retains_attested_scopes_and_rechecks_registry_requirements_test() {
 
   let stronger =
     authorization.protect_registry(
+      tools,
       authorization.protection_config(resource, [write]),
       policy,
     )

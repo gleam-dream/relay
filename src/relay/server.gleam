@@ -11,18 +11,19 @@ import relay/completion.{
   type CompletionValues, type ContextCompletion, ContextCompletion,
 }
 import relay/content.{type ContentBlock, type ResourceContents}
+import relay/internal/protocol/v2026_07_28 as v2026
+import relay/internal/subscriptions_state as subscription_state
 import relay/prompts.{
   type ContextPrompt, type Prompt, type PromptError, ContextPrompt,
   ContextPromptWithInputs,
 }
 import relay/protocol/jsonrpc.{type ProgressToken, type RequestId}
-import relay/protocol/v2026_07_28 as v2026
 import relay/resources.{
   type ContextResource, type ContextResourceTemplate, type Resource,
   type ResourceError, type ResourceTemplate, ContextResource,
   ContextResourceTemplate,
 }
-import relay/subscriptions.{type SubscriptionFilter, type Subscriptions}
+import relay/subscriptions.{type SubscriptionFilter}
 import relay/tool.{
   type ContextTool, type DispatchError, type Registry, type RegistryError,
   type ToolName,
@@ -87,7 +88,19 @@ pub fn http_custom_headers_valid(
   arguments: Value,
   header_lookup: fn(String) -> Option(String),
 ) -> Bool {
-  let tool_name = tool.tool_name_from_trusted(name)
+  case tool.tool_name(name) {
+    Error(_) -> False
+    Ok(tool_name) ->
+      custom_headers_valid_for_tool(server, tool_name, arguments, header_lookup)
+  }
+}
+
+fn custom_headers_valid_for_tool(
+  server: Server(context),
+  tool_name: ToolName,
+  arguments: Value,
+  header_lookup: fn(String) -> Option(String),
+) -> Bool {
   case tool.input_schema_document(server.registry, tool_name) {
     None -> True
     Some(value.Object(schema_fields)) -> {
@@ -223,7 +236,7 @@ pub type InvocationOutcome {
   OutcomeSuccess(Value)
   OutcomeContentSuccess(List(ContentBlock))
   OutcomeStructuredContentSuccess(Value, List(ContentBlock))
-  OutcomeApplicationError(Value)
+  OutcomePublicApplicationError(String)
   OutcomeJsonSuccess(json.Json)
   OutcomeJsonError(json.Json)
   OutcomeInvalidInput
@@ -368,7 +381,8 @@ pub fn perform(invocation: Invocation(context)) -> ServerInput(context) {
             request_state,
           ))
         }
-        Error(tool.ApplicationFailure(val)) -> OutcomeApplicationError(val)
+        Error(tool.PublicApplicationFailure(message)) ->
+          OutcomePublicApplicationError(message)
         Error(tool.ContentOnlyOutput) ->
           OutcomeInternalError("Invalid tool result")
         Error(tool.InputRequiredOutput) ->
@@ -377,8 +391,6 @@ pub fn perform(invocation: Invocation(context)) -> ServerInput(context) {
         Error(tool.UnknownTool(_)) -> OutcomeInvalidInput
         Error(tool.InvalidOutput(_)) ->
           OutcomeInternalError("Invalid tool output")
-        Error(tool.ErrorEncodingFailure(_)) ->
-          OutcomeInternalError("Failed to encode tool error")
       }
     ResourceWork(read, uri) ->
       case read(context, uri) {
@@ -471,21 +483,11 @@ pub opaque type Server(context) {
     completion: Option(ContextCompletion(context)),
     cursor_key: BitArray,
     exchanges: List(ExchangeRecord),
-    subscriptions: Subscriptions,
+    subscriptions: subscription_state.Subscriptions,
   )
 }
 
 pub fn server(registry: Registry(context)) -> Server(context) {
-  server_with_services(registry, [], [], [], None)
-}
-
-pub fn server_with_services(
-  registry: Registry(context),
-  resources: List(ContextResource(context)),
-  resource_templates: List(ContextResourceTemplate(context)),
-  prompts: List(ContextPrompt(context)),
-  completion: Option(ContextCompletion(context)),
-) -> Server(context) {
   Server(
     registry: registry,
     dispatch: fn(ctx, name, args, input_responses, report_progress) {
@@ -498,14 +500,46 @@ pub fn server_with_services(
         report_progress,
       )
     },
-    resources: resources,
-    resource_templates: resource_templates,
-    prompts: prompts,
-    completion: completion,
+    resources: [],
+    resource_templates: [],
+    prompts: [],
+    completion: None,
     cursor_key: ffi_new_cursor_key(),
     exchanges: [],
-    subscriptions: subscriptions.new(),
+    subscriptions: subscription_state.new(),
   )
+}
+
+/// Replaces the resource list without changing tools, dispatch, or other services.
+pub fn with_resources(
+  server: Server(context),
+  resources: List(ContextResource(context)),
+) -> Server(context) {
+  Server(..server, resources: resources)
+}
+
+/// Replaces the resource-template list without changing other services.
+pub fn with_resource_templates(
+  server: Server(context),
+  resource_templates: List(ContextResourceTemplate(context)),
+) -> Server(context) {
+  Server(..server, resource_templates: resource_templates)
+}
+
+/// Replaces the prompt list without changing other services.
+pub fn with_prompts(
+  server: Server(context),
+  prompts: List(ContextPrompt(context)),
+) -> Server(context) {
+  Server(..server, prompts: prompts)
+}
+
+/// Sets or clears completion without changing other services.
+pub fn with_completion(
+  server: Server(context),
+  completion: Option(ContextCompletion(context)),
+) -> Server(context) {
+  Server(..server, completion: completion)
 }
 
 pub fn server_with_dispatch(
@@ -533,7 +567,7 @@ pub fn server_with_dispatch(
     completion: None,
     cursor_key: ffi_new_cursor_key(),
     exchanges: [],
-    subscriptions: subscriptions.new(),
+    subscriptions: subscription_state.new(),
   )
 }
 
@@ -996,7 +1030,7 @@ fn handle_message_received(
             )
           let owner = exchange_id_to_string(exchange)
           let next_subs =
-            subscriptions.listen(
+            subscription_state.listen(
               server.subscriptions,
               owner,
               id,
@@ -1277,7 +1311,7 @@ fn handle_client_cancellation(
     Some(StreamExchange(ex_id, req_id, _)) -> {
       let owner = exchange_id_to_string(ex_id)
       let next_subs =
-        subscriptions.close_stream(server.subscriptions, owner, req_id)
+        subscription_state.close_stream(server.subscriptions, owner, req_id)
       let next_exchanges =
         list.filter(updated_notify, fn(rec) {
           case rec {
@@ -1319,11 +1353,8 @@ fn handle_invocation_finished(
           )
         OutcomeJsonSuccess(response) -> response
         OutcomeJsonError(response) -> response
-        OutcomeApplicationError(error) ->
-          v2026.encode_call_error_response(
-            request_id,
-            application_error_text(error),
-          )
+        OutcomePublicApplicationError(message) ->
+          v2026.encode_call_error_response(request_id, message)
         OutcomeInvalidInput ->
           jsonrpc.error_to_json(Some(request_id), jsonrpc.invalid_params())
         OutcomeInternalError(_) ->
@@ -1337,12 +1368,6 @@ fn handle_invocation_finished(
     }
     _ -> #(server, [])
   }
-}
-
-fn application_error_text(error: Value) -> String {
-  // The declared error codec has already produced this JSON value. Keeping its
-  // exact JSON representation in text content lets clients decode it again.
-  json.to_string(v2026.value_to_json(error))
 }
 
 fn handle_invocation_progress(
@@ -1394,7 +1419,7 @@ fn handle_exchange_closed(
     Some(StreamExchange(ex, req_id, _)) -> {
       let owner = exchange_id_to_string(ex)
       let next_subs =
-        subscriptions.close_stream(server.subscriptions, owner, req_id)
+        subscription_state.close_stream(server.subscriptions, owner, req_id)
       let next =
         list.filter(exchanges, fn(rec) {
           case rec {
@@ -1415,7 +1440,10 @@ fn handle_notify_resource_updated(
   uri: String,
 ) -> #(Server(context), List(ServerEffect(context))) {
   let subscribers =
-    subscriptions.stream_subscribers_for_resource(server.subscriptions, uri)
+    subscription_state.stream_subscribers_for_resource(
+      server.subscriptions,
+      uri,
+    )
   let effects =
     list.filter_map(subscribers, fn(pair) {
       let #(owner, sub_id) = pair
@@ -1435,7 +1463,7 @@ fn handle_notify_tools_list_changed(
   server: Server(context),
 ) -> #(Server(context), List(ServerEffect(context))) {
   let subscribers =
-    subscriptions.stream_subscribers_for_tools(server.subscriptions)
+    subscription_state.stream_subscribers_for_tools(server.subscriptions)
   let effects =
     list.filter_map(subscribers, fn(pair) {
       let #(owner, sub_id) = pair
@@ -1455,7 +1483,7 @@ fn handle_notify_resources_list_changed(
   server: Server(context),
 ) -> #(Server(context), List(ServerEffect(context))) {
   let subscribers =
-    subscriptions.stream_subscribers_for_resources(server.subscriptions)
+    subscription_state.stream_subscribers_for_resources(server.subscriptions)
   let effects =
     list.filter_map(subscribers, fn(pair) {
       let #(owner, sub_id) = pair
@@ -1475,7 +1503,7 @@ fn handle_notify_prompts_list_changed(
   server: Server(context),
 ) -> #(Server(context), List(ServerEffect(context))) {
   let subscribers =
-    subscriptions.stream_subscribers_for_prompts(server.subscriptions)
+    subscription_state.stream_subscribers_for_prompts(server.subscriptions)
   let effects =
     list.filter_map(subscribers, fn(pair) {
       let #(owner, sub_id) = pair
@@ -1523,7 +1551,7 @@ fn handle_terminate_subscription(
     Some(StreamExchange(ex, req_id, _)) -> {
       let owner = exchange_id_to_string(ex)
       let next_subs =
-        subscriptions.close_stream(server.subscriptions, owner, req_id)
+        subscription_state.close_stream(server.subscriptions, owner, req_id)
       let next_exchanges =
         list.filter(server.exchanges, fn(rec) {
           case rec {

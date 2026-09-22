@@ -7,9 +7,9 @@ import gleeunit
 import gleeunit/should
 import json/blueprint/number
 import json/blueprint/value
+import relay/internal/protocol/v2026_07_28 as v2026
 import relay/logging.{Debug, Warning}
 import relay/protocol/jsonrpc.{ProgressInteger, RequestInteger, RequestString}
-import relay/protocol/v2026_07_28 as v2026
 
 pub fn main() -> Nil {
   gleeunit.main()
