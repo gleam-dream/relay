@@ -1319,10 +1319,10 @@ fn handle_invocation_finished(
           )
         OutcomeJsonSuccess(response) -> response
         OutcomeJsonError(response) -> response
-        OutcomeApplicationError(_) ->
+        OutcomeApplicationError(error) ->
           v2026.encode_call_error_response(
             request_id,
-            "The tool reported an error.",
+            application_error_text(error),
           )
         OutcomeInvalidInput ->
           jsonrpc.error_to_json(Some(request_id), jsonrpc.invalid_params())
@@ -1337,6 +1337,12 @@ fn handle_invocation_finished(
     }
     _ -> #(server, [])
   }
+}
+
+fn application_error_text(error: Value) -> String {
+  // The declared error codec has already produced this JSON value. Keeping its
+  // exact JSON representation in text content lets clients decode it again.
+  json.to_string(v2026.value_to_json(error))
 }
 
 fn handle_invocation_progress(

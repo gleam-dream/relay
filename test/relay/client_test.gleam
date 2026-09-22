@@ -51,8 +51,21 @@ fn local_server() -> server.Server(Nil) {
       relay.empty_metadata(),
       codec.field("name", codec.string()),
       codec.string(),
+      fail_error_codec(),
+      fn(_context, _value) {
+        Error(#("not_found", "The requested record is unavailable."))
+      },
+    )
+  let assert Ok(error_encoding_name) = relay.tool_name("error_encoding")
+  let assert Ok(error_codec) = codec.integer_between(0, 10)
+  let assert Ok(error_encoding_tool) =
+    relay.context_tool(
+      error_encoding_name,
+      relay.empty_metadata(),
+      codec.field("name", codec.string()),
       codec.string(),
-      fn(_context, _value) { Error("private handler detail") },
+      error_codec,
+      fn(_context, _value) { Error(11) },
     )
   let assert Ok(say_name) = relay.tool_name("say")
   let assert Ok(say_tool) =
@@ -124,6 +137,7 @@ fn local_server() -> server.Server(Nil) {
     relay.registry([
       echo_tool,
       fail_tool,
+      error_encoding_tool,
       say_tool,
       rich_tool,
       exact_tool,
@@ -204,6 +218,15 @@ fn many_named_tools(count: Int) -> List(relay.ContextTool(Nil)) {
       [listed_tool, ..many_named_tools(count - 1)]
     }
   }
+}
+
+fn fail_error_codec() -> codec.Codec(#(String, String)) {
+  let assert Ok(fields) =
+    codec.combine(
+      codec.required("code", codec.string()),
+      codec.required("message", codec.string()),
+    )
+  codec.object(fields)
 }
 
 pub fn http_client_uses_explicit_ca_for_tls_test() {
@@ -540,7 +563,7 @@ pub fn gun_http_client_discovery_and_typed_call_test() {
   should.be_true(string.contains(invalid_cursor, "\"error\""))
 
   let assert Ok(tools) = client.list_tools(peer)
-  should.equal(list.length(tools), 107)
+  should.equal(list.length(tools), 108)
   should.be_true(
     list.any(tools, fn(declaration) { declaration.name == "list-1" }),
   )
@@ -578,18 +601,43 @@ pub fn gun_http_client_discovery_and_typed_call_test() {
   )
 
   let assert Ok(fail_name) = relay.tool_name("fail")
-  should.equal(
+  let failure =
     client.call_tool(
       peer,
       fail_name,
       "MCP",
       codec.field("name", codec.string()),
       codec.string(),
-    ),
-    client.ToolFailure([
-      content.TextContent("The tool reported an error.", None),
-    ]),
+    )
+  case failure {
+    client.ToolFailure([content.TextContent(error_json, None)]) ->
+      codec.decode_json(fail_error_codec(), error_json)
+      |> should.equal(
+        Ok(#("not_found", "The requested record is unavailable.")),
+      )
+    _ -> should.fail()
+  }
+
+  let assert Ok(error_response) =
+    client.raw_json_call(peer, "tools/call", Some("error_encoding"), [
+      #("name", json.string("error_encoding")),
+      #("arguments", json.object([#("name", json.string("MCP"))])),
+    ])
+  let assert Ok(error_response_text) = bit_array.to_string(error_response)
+  let assert Ok(error_response) =
+    json.parse(error_response_text, dyn_decode.dynamic)
+  dyn_decode.run(
+    error_response,
+    dyn_decode.at(["error", "code"], dyn_decode.int),
   )
+  |> should.equal(Ok(-32_603))
+  dyn_decode.run(
+    error_response,
+    dyn_decode.at(["error", "message"], dyn_decode.string),
+  )
+  |> should.equal(Ok("Internal error."))
+  dyn_decode.run(error_response, dyn_decode.at(["result"], dyn_decode.dynamic))
+  |> should.be_error()
 
   let assert Ok(say_name) = relay.tool_name("say")
   should.equal(
