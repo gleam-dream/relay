@@ -30,6 +30,7 @@ import relay/resources.{
   resource_to_json,
 }
 import relay/schema
+import relay/subscriptions.{type SubscriptionFilter}
 import relay/tool.{
   type InputRequest, type ToolDeclaration, type ToolName, InputRequest,
 }
@@ -62,6 +63,11 @@ pub type Request {
     cursor: Option(String),
   )
   ResourcesRead(id: RequestId, metadata: RequestMetadata, uri: String)
+  SubscriptionsListen(
+    id: RequestId,
+    metadata: RequestMetadata,
+    filter: SubscriptionFilter,
+  )
   PromptsList(id: RequestId, metadata: RequestMetadata, cursor: Option(String))
   PromptsGet(
     id: RequestId,
@@ -263,6 +269,7 @@ fn request_id(request: Request) -> RequestId {
     ResourcesList(id, _, _) -> id
     ResourceTemplatesList(id, _, _) -> id
     ResourcesRead(id, _, _) -> id
+    SubscriptionsListen(id, _, _) -> id
     PromptsList(id, _, _) -> id
     PromptsGet(id, _, _, _, _, _) -> id
     CompletionComplete(id, _, _, _, _) -> id
@@ -453,6 +460,8 @@ fn route_request(
               parse_resource_templates_list_params(id, meta, params_dyn)
             "resources/read" ->
               parse_resources_read_params(id, meta, params_dyn)
+            "subscriptions/listen" ->
+              parse_subscriptions_listen_params(id, meta, params_dyn)
             "prompts/list" -> parse_prompts_list_params(id, meta, params_dyn)
             "prompts/get" ->
               parse_prompts_get_params(id, meta, params_dyn, bytes)
@@ -462,6 +471,67 @@ fn route_request(
             _ -> AdmittedRejected(Some(id), jsonrpc.method_not_found())
           }
       }
+  }
+}
+
+fn parse_subscriptions_listen_params(
+  id: RequestId,
+  meta: RequestMetadata,
+  params_dyn: Dynamic,
+) -> Admission {
+  case decode.run(params_dyn, decode.dict(decode.string, decode.dynamic)) {
+    Error(_) -> AdmittedRejected(Some(id), jsonrpc.invalid_params())
+    Ok(params) ->
+      case dict.get(params, "notifications") {
+        Error(_) -> AdmittedRejected(Some(id), jsonrpc.invalid_params())
+        Ok(notif_dyn) ->
+          case parse_subscription_filter(notif_dyn) {
+            Ok(filter) -> AdmittedRequest(SubscriptionsListen(id, meta, filter))
+            Error(_) -> AdmittedRejected(Some(id), jsonrpc.invalid_params())
+          }
+      }
+  }
+}
+
+fn parse_subscription_filter(
+  dyn: Dynamic,
+) -> Result(subscriptions.SubscriptionFilter, Nil) {
+  case decode.run(dyn, decode.dict(decode.string, decode.dynamic)) {
+    Error(_) -> Error(Nil)
+    Ok(filter_dict) -> {
+      use tools_list_changed <- result.try(
+        case dict.get(filter_dict, "toolsListChanged") {
+          Error(_) -> Ok(False)
+          Ok(v) -> decode.run(v, decode.bool) |> result.map_error(fn(_) { Nil })
+        },
+      )
+      use resources_list_changed <- result.try(
+        case dict.get(filter_dict, "resourcesListChanged") {
+          Error(_) -> Ok(False)
+          Ok(v) -> decode.run(v, decode.bool) |> result.map_error(fn(_) { Nil })
+        },
+      )
+      use prompts_list_changed <- result.try(
+        case dict.get(filter_dict, "promptsListChanged") {
+          Error(_) -> Ok(False)
+          Ok(v) -> decode.run(v, decode.bool) |> result.map_error(fn(_) { Nil })
+        },
+      )
+      use resource_subscriptions <- result.try(
+        case dict.get(filter_dict, "resourceSubscriptions") {
+          Error(_) -> Ok([])
+          Ok(v) ->
+            decode.run(v, decode.list(decode.string))
+            |> result.map_error(fn(_) { Nil })
+        },
+      )
+      Ok(subscriptions.SubscriptionFilter(
+        tools_list_changed: tools_list_changed,
+        resources_list_changed: resources_list_changed,
+        prompts_list_changed: prompts_list_changed,
+        resource_subscriptions: resource_subscriptions,
+      ))
+    }
   }
 }
 
@@ -964,15 +1034,30 @@ pub fn encode_discovery_response_with_capabilities(
 ) -> json.Json {
   let capabilities = []
   let capabilities = case has_tools {
-    True -> [#("tools", json.object([])), ..capabilities]
+    True -> [
+      #("tools", json.object([#("listChanged", json.bool(True))])),
+      ..capabilities
+    ]
     False -> capabilities
   }
   let capabilities = case has_resources {
-    True -> [#("resources", json.object([])), ..capabilities]
+    True -> [
+      #(
+        "resources",
+        json.object([
+          #("listChanged", json.bool(True)),
+          #("subscribe", json.bool(True)),
+        ]),
+      ),
+      ..capabilities
+    ]
     False -> capabilities
   }
   let capabilities = case has_prompts {
-    True -> [#("prompts", json.object([])), ..capabilities]
+    True -> [
+      #("prompts", json.object([#("listChanged", json.bool(True))])),
+      ..capabilities
+    ]
     False -> capabilities
   }
   let capabilities = case has_completions {
@@ -1136,14 +1221,25 @@ pub fn encode_tools_list_response_with_cursor(
         #("name", json.string(tool.tool_name_to_string(decl.name))),
         #("inputSchema", value_to_json(input_schema)),
       ]
-      let with_desc = case decl.metadata.description {
+      let with_title = case decl.metadata.title {
         None -> fields
-        Some(d) -> list.append(fields, [#("description", json.string(d))])
+        Some(t) -> list.append(fields, [#("title", json.string(t))])
+      }
+      let with_desc = case decl.metadata.description {
+        None -> with_title
+        Some(d) -> list.append(with_title, [#("description", json.string(d))])
+      }
+      let with_annotations = case decl.metadata.annotations {
+        None -> with_desc
+        Some(a) ->
+          list.append(with_desc, [
+            #("annotations", tool.tool_annotations_to_json(a)),
+          ])
       }
       let with_out_schema = case decl.output_schema {
-        None -> with_desc
+        None -> with_annotations
         Some(s) ->
-          list.append(with_desc, [
+          list.append(with_annotations, [
             #("outputSchema", value_to_json(schema.materialize_schema(s))),
           ])
       }
@@ -1296,6 +1392,206 @@ pub fn encode_progress_notification(
       json.object([
         #("progressToken", jsonrpc.progress_token_to_json(token)),
         #("progress", json.int(progress)),
+      ]),
+    ),
+  ])
+}
+
+/// Encodes a subscriptions acknowledged notification sent when a listen request is established.
+pub fn encode_subscriptions_acknowledged_notification(
+  subscription_id: RequestId,
+  filter: subscriptions.SubscriptionFilter,
+) -> json.Json {
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("method", json.string("notifications/subscriptions/acknowledged")),
+    #(
+      "params",
+      json.object([
+        #(
+          "_meta",
+          json.object([
+            #(
+              "io.modelcontextprotocol/subscriptionId",
+              jsonrpc.request_id_to_json(subscription_id),
+            ),
+          ]),
+        ),
+        #("notifications", subscription_filter_to_json(filter)),
+      ]),
+    ),
+  ])
+}
+
+/// Encodes a modern client request to open a subscriptions/listen stream.
+pub fn encode_subscriptions_listen_request(
+  id: RequestId,
+  filter: SubscriptionFilter,
+) -> json.Json {
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("id", jsonrpc.request_id_to_json(id)),
+    #("method", json.string("subscriptions/listen")),
+    #(
+      "params",
+      json.object([
+        #(
+          "_meta",
+          json.object([
+            #(
+              "io.modelcontextprotocol/protocolVersion",
+              json.string("2026-07-28"),
+            ),
+            #("io.modelcontextprotocol/clientCapabilities", json.object([])),
+          ]),
+        ),
+        #("notifications", subscription_filter_to_json(filter)),
+      ]),
+    ),
+  ])
+}
+
+fn subscription_filter_to_json(filter: SubscriptionFilter) -> json.Json {
+  let fields = []
+  let fields = case filter.tools_list_changed {
+    True -> [#("toolsListChanged", json.bool(True)), ..fields]
+    False -> fields
+  }
+  let fields = case filter.resources_list_changed {
+    True -> [#("resourcesListChanged", json.bool(True)), ..fields]
+    False -> fields
+  }
+  let fields = case filter.prompts_list_changed {
+    True -> [#("promptsListChanged", json.bool(True)), ..fields]
+    False -> fields
+  }
+  let fields = case filter.resource_subscriptions {
+    [] -> fields
+    uris -> [
+      #("resourceSubscriptions", json.array(uris, json.string)),
+      ..fields
+    ]
+  }
+  json.object(fields)
+}
+
+/// Encodes a resource updated notification delivered on a subscriptions/listen stream.
+pub fn encode_resource_updated_notification(
+  subscription_id: RequestId,
+  uri: String,
+) -> json.Json {
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("method", json.string("notifications/resources/updated")),
+    #(
+      "params",
+      json.object([
+        #(
+          "_meta",
+          json.object([
+            #(
+              "io.modelcontextprotocol/subscriptionId",
+              jsonrpc.request_id_to_json(subscription_id),
+            ),
+          ]),
+        ),
+        #("uri", json.string(uri)),
+      ]),
+    ),
+  ])
+}
+
+/// Encodes a tools list changed notification delivered on a subscriptions/listen stream.
+pub fn encode_tools_list_changed_notification(
+  subscription_id: RequestId,
+) -> json.Json {
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("method", json.string("notifications/tools/list_changed")),
+    #(
+      "params",
+      json.object([
+        #(
+          "_meta",
+          json.object([
+            #(
+              "io.modelcontextprotocol/subscriptionId",
+              jsonrpc.request_id_to_json(subscription_id),
+            ),
+          ]),
+        ),
+      ]),
+    ),
+  ])
+}
+
+/// Encodes a resources list changed notification delivered on a subscriptions/listen stream.
+pub fn encode_resources_list_changed_notification(
+  subscription_id: RequestId,
+) -> json.Json {
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("method", json.string("notifications/resources/list_changed")),
+    #(
+      "params",
+      json.object([
+        #(
+          "_meta",
+          json.object([
+            #(
+              "io.modelcontextprotocol/subscriptionId",
+              jsonrpc.request_id_to_json(subscription_id),
+            ),
+          ]),
+        ),
+      ]),
+    ),
+  ])
+}
+
+/// Encodes a prompts list changed notification delivered on a subscriptions/listen stream.
+pub fn encode_prompts_list_changed_notification(
+  subscription_id: RequestId,
+) -> json.Json {
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("method", json.string("notifications/prompts/list_changed")),
+    #(
+      "params",
+      json.object([
+        #(
+          "_meta",
+          json.object([
+            #(
+              "io.modelcontextprotocol/subscriptionId",
+              jsonrpc.request_id_to_json(subscription_id),
+            ),
+          ]),
+        ),
+      ]),
+    ),
+  ])
+}
+
+/// Encodes a subscriptions/listen result response sent when the server terminates a subscription stream gracefully.
+pub fn encode_subscriptions_listen_result_response(id: RequestId) -> json.Json {
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("id", jsonrpc.request_id_to_json(id)),
+    #(
+      "result",
+      json.object([
+        #("resultType", json.string("complete")),
+        #(
+          "_meta",
+          json.object([
+            #("io.modelcontextprotocol/serverInfo", server_info()),
+            #(
+              "io.modelcontextprotocol/subscriptionId",
+              jsonrpc.request_id_to_json(id),
+            ),
+          ]),
+        ),
       ]),
     ),
   ])

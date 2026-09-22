@@ -21,8 +21,11 @@ import relay/content.{
   ResourceLinkBlock, TextContent, TextResourceContents, UserRole,
 }
 import relay/prompts
+import relay/protocol/jsonrpc.{RequestString}
 import relay/protocol/v2026_07_28 as v2026
+import relay/subscriptions.{type SubscriptionFilter, SubscriptionFilter}
 import relay/tool.{type ToolName}
+import relay/transport/stdio_client
 
 const protocol_version = "2026-07-28"
 
@@ -38,14 +41,29 @@ pub type ClientConfig {
   )
 }
 
-/// Opaque owner-bound Gun connection. Its Erlang process is private to Relay.
+/// Configuration for a local stdio client process.
+pub type StdioConfig {
+  StdioConfig(
+    executable: String,
+    args: List(String),
+    timeout_ms: Int,
+    max_response_bytes: Int,
+  )
+}
+
+/// Opaque owner-bound HTTP or local stdio client.
 pub opaque type Client {
   Client(
-    pid: process.Pid,
+    transport: ClientTransport,
     path: String,
     timeout_ms: Int,
     max_response_bytes: Int,
   )
+}
+
+type ClientTransport {
+  HttpTransport(process.Pid)
+  StdioTransport(stdio_client.Client)
 }
 
 pub type ClientError {
@@ -77,11 +95,37 @@ pub type ToolCallOutcome(output) {
   InputEncodingFailure
 }
 
+/// A correlated notification received on one live subscriptions/listen stream.
+pub type SubscriptionNotification {
+  ResourceUpdated(uri: String)
+  ToolsListChanged
+  ResourcesListChanged
+  PromptsListChanged
+}
+
+/// An HTTP subscription stream owned by one Gun connection.
+pub opaque type Subscription {
+  Subscription(
+    reader: process.Pid,
+    request_id: String,
+    notifications: SubscriptionFilter,
+  )
+}
+
 @external(erlang, "relay_gun_ffi", "open")
 fn ffi_open(
   host: String,
   port: Int,
   secure: Bool,
+  timeout_ms: Int,
+) -> Result(process.Pid, String)
+
+@external(erlang, "relay_gun_ffi", "open_with_ca")
+fn ffi_open_with_ca(
+  host: String,
+  port: Int,
+  secure: Bool,
+  ca_cert_file: String,
   timeout_ms: Int,
 ) -> Result(process.Pid, String)
 
@@ -97,6 +141,25 @@ fn ffi_request(
   max_response_bytes: Int,
 ) -> Result(#(Int, BitArray), String)
 
+@external(erlang, "relay_gun_ffi", "open_sse")
+fn ffi_open_sse(
+  pid: process.Pid,
+  path: String,
+  body: BitArray,
+  version: String,
+  timeout_ms: Int,
+  max_buffered_bytes: Int,
+) -> Result(process.Pid, String)
+
+@external(erlang, "relay_gun_ffi", "next_sse")
+fn ffi_next_sse(
+  reader: process.Pid,
+  timeout_ms: Int,
+) -> Result(BitArray, String)
+
+@external(erlang, "relay_gun_ffi", "close_sse")
+fn ffi_close_sse(reader: process.Pid) -> Nil
+
 @external(erlang, "relay_gun_ffi", "close")
 fn ffi_close(pid: process.Pid) -> Nil
 
@@ -105,6 +168,21 @@ fn ffi_unique_integer() -> Int
 
 /// Opens a reusable, owner-bound Gun HTTP/1.1 connection.
 pub fn connect(config: ClientConfig) -> Result(Client, ClientError) {
+  connect_with_ca_option(config, None)
+}
+
+/// Opens a reusable HTTPS connection trusted by the supplied CA certificate file.
+pub fn connect_with_ca(
+  config: ClientConfig,
+  ca_cert_file: String,
+) -> Result(Client, ClientError) {
+  connect_with_ca_option(config, Some(ca_cert_file))
+}
+
+fn connect_with_ca_option(
+  config: ClientConfig,
+  ca_cert_file: Option(String),
+) -> Result(Client, ClientError) {
   case
     string.trim(config.host) != ""
     && config.port > 0
@@ -112,18 +190,68 @@ pub fn connect(config: ClientConfig) -> Result(Client, ClientError) {
     && string.starts_with(config.path, "/")
     && config.timeout_ms > 0
     && config.max_response_bytes > 0
+    && valid_ca_configuration(config.secure, ca_cert_file)
   {
     False -> Error(InvalidClientConfiguration)
     True ->
-      case
-        ffi_open(config.host, config.port, config.secure, config.timeout_ms)
-      {
+      case open_connection(config, ca_cert_file) {
         Ok(pid) ->
           Ok(Client(
-            pid,
-            config.path,
-            config.timeout_ms,
-            config.max_response_bytes,
+            transport: HttpTransport(pid),
+            path: config.path,
+            timeout_ms: config.timeout_ms,
+            max_response_bytes: config.max_response_bytes,
+          ))
+        Error(reason) -> Error(ConnectionFailed(reason))
+      }
+  }
+}
+
+fn valid_ca_configuration(secure: Bool, ca_cert_file: Option(String)) -> Bool {
+  case secure, ca_cert_file {
+    True, None -> True
+    True, Some(path) -> path != ""
+    False, None -> True
+    False, Some(_) -> False
+  }
+}
+
+fn open_connection(
+  config: ClientConfig,
+  ca_cert_file: Option(String),
+) -> Result(process.Pid, String) {
+  case ca_cert_file {
+    Some(path) ->
+      ffi_open_with_ca(
+        config.host,
+        config.port,
+        config.secure,
+        path,
+        config.timeout_ms,
+      )
+    None -> ffi_open(config.host, config.port, config.secure, config.timeout_ms)
+  }
+}
+
+/// Starts a typed client for a local stdio-speaking child process.
+pub fn connect_stdio(config: StdioConfig) -> Result(Client, ClientError) {
+  case config.timeout_ms > 0 && config.max_response_bytes > 0 {
+    False -> Error(InvalidClientConfiguration)
+    True ->
+      case
+        stdio_client.connect(stdio_client.Config(
+          executable: config.executable,
+          args: config.args,
+          timeout_ms: config.timeout_ms,
+          max_frame_bytes: config.max_response_bytes,
+        ))
+      {
+        Ok(child) ->
+          Ok(Client(
+            transport: StdioTransport(child),
+            path: "",
+            timeout_ms: config.timeout_ms,
+            max_response_bytes: config.max_response_bytes,
           ))
         Error(reason) -> Error(ConnectionFailed(reason))
       }
@@ -132,19 +260,22 @@ pub fn connect(config: ClientConfig) -> Result(Client, ClientError) {
 
 /// Closes the underlying Gun connection and its in-flight streams.
 pub fn close(client: Client) -> Nil {
-  ffi_close(client.pid)
+  case client.transport {
+    HttpTransport(pid) -> ffi_close(pid)
+    StdioTransport(child) -> stdio_client.close(child)
+  }
 }
 
 /// Cancels in-flight requests by closing the connection.
 pub fn cancel(client: Client) -> Nil {
-  ffi_close(client.pid)
+  close(client)
 }
 
 /// Discovers server capabilities and pins use to the retained 2026 revision.
 pub fn discover(client: Client) -> Result(Discovery, String) {
   let id = request_id()
   let body = request_envelope(id, "server/discover", [])
-  case request(client, body, "server/discover", "") {
+  case request(client, body, id, "server/discover", "") {
     Error(reason) -> Error(reason)
     Ok(#(status, bytes)) ->
       case status {
@@ -177,7 +308,7 @@ pub fn raw_json_call(
         None -> ""
         Some(value) -> value
       }
-      case request(client, body, method, name) {
+      case request(client, body, id, method, name) {
         Error(reason) -> Error(reason)
         Ok(#(status, _)) if status != 200 ->
           Error("raw method call returned HTTP " <> int.to_string(status))
@@ -191,7 +322,22 @@ pub fn raw_json_call(
 
 /// Traverses all tools/list pages and returns each declaration as checked JSON.
 pub fn list_tools(client: Client) -> Result(List(String), String) {
-  list_tools_page(client, None, [], [], 10_000)
+  list_json_pages(client, "tools/list", "tools")
+}
+
+/// Traverses all resources/list pages and returns each declaration as checked JSON.
+pub fn list_resources(client: Client) -> Result(List(String), String) {
+  list_json_pages(client, "resources/list", "resources")
+}
+
+/// Traverses all resources/templates/list pages as checked JSON declarations.
+pub fn list_resource_templates(client: Client) -> Result(List(String), String) {
+  list_json_pages(client, "resources/templates/list", "resourceTemplates")
+}
+
+/// Traverses all prompts/list pages and returns each declaration as checked JSON.
+pub fn list_prompts(client: Client) -> Result(List(String), String) {
+  list_json_pages(client, "prompts/list", "prompts")
 }
 
 /// Calls a tool using the supplied input and output codecs.
@@ -212,7 +358,7 @@ pub fn call_tool(
         #("arguments", v2026.value_to_json(arguments)),
       ]
       let body = request_envelope(id, "tools/call", params)
-      case request(client, body, "tools/call", tool_name) {
+      case request(client, body, id, "tools/call", tool_name) {
         Error("cancelled") -> Cancelled
         Error(reason) -> TransportFailure(reason)
         Ok(#(status, _)) if status != 200 ->
@@ -323,22 +469,241 @@ pub fn complete(
   decode_completion_values(result_value)
 }
 
+/// Opens a typed server-notification stream and verifies its acknowledgement.
+pub fn listen(
+  client: Client,
+  requested: SubscriptionFilter,
+) -> Result(Subscription, String) {
+  case client.transport {
+    StdioTransport(_) ->
+      Error("subscriptions/listen over the stdio client is not implemented")
+    HttpTransport(pid) -> {
+      let id = request_id()
+      let body =
+        v2026.encode_subscriptions_listen_request(RequestString(id), requested)
+        |> json.to_string
+        |> bit_array.from_string
+      case
+        ffi_open_sse(
+          pid,
+          client.path,
+          body,
+          protocol_version,
+          client.timeout_ms,
+          client.max_response_bytes,
+        )
+      {
+        Error(reason) -> Error(reason)
+        Ok(reader) ->
+          case ffi_next_sse(reader, client.timeout_ms) {
+            Error(reason) -> {
+              ffi_close_sse(reader)
+              Error("subscription acknowledgement failed: " <> reason)
+            }
+            Ok(bytes) ->
+              case decode_subscription_acknowledgement(bytes, id) {
+                Error(reason) -> {
+                  ffi_close_sse(reader)
+                  Error(reason)
+                }
+                Ok(notifications) -> Ok(Subscription(reader, id, notifications))
+              }
+          }
+      }
+    }
+  }
+}
+
+/// Returns the notification filter the server confirmed for this stream.
+pub fn acknowledged_notifications(
+  subscription: Subscription,
+) -> SubscriptionFilter {
+  subscription.notifications
+}
+
+/// Waits for and decodes the next notification from a subscription stream.
+pub fn next_notification(
+  subscription: Subscription,
+  timeout_ms: Int,
+) -> Result(SubscriptionNotification, String) {
+  case timeout_ms > 0 {
+    False -> Error("subscription wait timeout must be positive")
+    True ->
+      case ffi_next_sse(subscription.reader, timeout_ms) {
+        Error("timeout") -> Error("subscription notification timed out")
+        Error(reason) -> Error(reason)
+        Ok(bytes) ->
+          decode_subscription_notification(bytes, subscription.request_id)
+      }
+  }
+}
+
+/// Cancels this stream without closing other requests on the shared connection.
+pub fn close_subscription(subscription: Subscription) -> Nil {
+  ffi_close_sse(subscription.reader)
+}
+
+fn decode_subscription_acknowledgement(
+  bytes: BitArray,
+  expected_id: String,
+) -> Result(SubscriptionFilter, String) {
+  use raw <- result.try(subscription_json(bytes))
+  use version <- result.try(string_field(raw, ["jsonrpc"]))
+  use method <- result.try(string_field(raw, ["method"]))
+  case version, method {
+    "2.0", "notifications/subscriptions/acknowledged" -> {
+      use params <- result.try(dynamic_field(raw, ["params"]))
+      use _ <- result.try(validate_subscription_id(params, expected_id))
+      use notifications <- result.try(dynamic_field(params, ["notifications"]))
+      decode_subscription_filter(notifications)
+    }
+    _, _ -> Error("subscription stream did not begin with its acknowledgement")
+  }
+}
+
+fn decode_subscription_notification(
+  bytes: BitArray,
+  expected_id: String,
+) -> Result(SubscriptionNotification, String) {
+  use raw <- result.try(subscription_json(bytes))
+  use version <- result.try(string_field(raw, ["jsonrpc"]))
+  use method <- result.try(string_field(raw, ["method"]))
+  case version {
+    "2.0" -> {
+      use params <- result.try(dynamic_field(raw, ["params"]))
+      use _ <- result.try(validate_subscription_id(params, expected_id))
+      case method {
+        "notifications/resources/updated" ->
+          string_field(params, ["uri"])
+          |> result.map(ResourceUpdated)
+        "notifications/tools/list_changed" -> Ok(ToolsListChanged)
+        "notifications/resources/list_changed" -> Ok(ResourcesListChanged)
+        "notifications/prompts/list_changed" -> Ok(PromptsListChanged)
+        _ -> Error("subscription stream contained an unsupported notification")
+      }
+    }
+    _ -> Error("subscription notification used an unsupported JSON-RPC version")
+  }
+}
+
+fn subscription_json(bytes: BitArray) -> Result(Dynamic, String) {
+  case bit_array.to_string(bytes) {
+    Error(_) -> Error("subscription event was not UTF-8")
+    Ok(raw) ->
+      json.parse(raw, dyn_decode.dynamic)
+      |> result.map_error(fn(_) { "subscription event was not valid JSON" })
+  }
+}
+
+fn dynamic_field(
+  value: Dynamic,
+  path: List(String),
+) -> Result(Dynamic, String) {
+  dyn_decode.run(value, dyn_decode.at(path, dyn_decode.dynamic))
+  |> result.map_error(fn(_) {
+    "subscription event is missing a required object"
+  })
+}
+
+fn validate_subscription_id(
+  params: Dynamic,
+  expected_id: String,
+) -> Result(Nil, String) {
+  use actual_id <- result.try(
+    string_field(params, ["_meta", "io.modelcontextprotocol/subscriptionId"]),
+  )
+  case actual_id == expected_id {
+    True -> Ok(Nil)
+    False ->
+      Error("subscription notification had an uncorrelated subscription ID")
+  }
+}
+
+fn decode_subscription_filter(
+  value: Dynamic,
+) -> Result(SubscriptionFilter, String) {
+  use fields <- result.try(
+    dyn_decode.run(
+      value,
+      dyn_decode.dict(dyn_decode.string, dyn_decode.dynamic),
+    )
+    |> result.map_error(fn(_) { "subscription filter was not an object" }),
+  )
+  use tools_list_changed <- result.try(optional_filter_bool(
+    fields,
+    "toolsListChanged",
+  ))
+  use resources_list_changed <- result.try(optional_filter_bool(
+    fields,
+    "resourcesListChanged",
+  ))
+  use prompts_list_changed <- result.try(optional_filter_bool(
+    fields,
+    "promptsListChanged",
+  ))
+  use resource_subscriptions <- result.try(optional_filter_uris(fields))
+  Ok(SubscriptionFilter(
+    tools_list_changed,
+    resources_list_changed,
+    prompts_list_changed,
+    resource_subscriptions,
+  ))
+}
+
+fn optional_filter_bool(
+  fields: Dict(String, Dynamic),
+  key: String,
+) -> Result(Bool, String) {
+  case dict.get(fields, key) {
+    Error(_) -> Ok(False)
+    Ok(value) ->
+      dyn_decode.run(value, dyn_decode.bool)
+      |> result.map_error(fn(_) { "subscription filter flag was not a boolean" })
+  }
+}
+
+fn optional_filter_uris(
+  fields: Dict(String, Dynamic),
+) -> Result(List(String), String) {
+  case dict.get(fields, "resourceSubscriptions") {
+    Error(_) -> Ok([])
+    Ok(value) ->
+      dyn_decode.run(value, dyn_decode.list(dyn_decode.string))
+      |> result.map_error(fn(_) {
+        "resourceSubscriptions was not a string array"
+      })
+  }
+}
+
 fn request(
   client: Client,
   body: BitArray,
+  id: String,
   method: String,
   name: String,
 ) -> Result(#(Int, BitArray), String) {
-  ffi_request(
-    client.pid,
-    client.path,
-    body,
-    method,
-    name,
-    protocol_version,
-    client.timeout_ms,
-    client.max_response_bytes,
-  )
+  case client.transport {
+    HttpTransport(pid) ->
+      ffi_request(
+        pid,
+        client.path,
+        body,
+        method,
+        name,
+        protocol_version,
+        client.timeout_ms,
+        client.max_response_bytes,
+      )
+    StdioTransport(child) ->
+      stdio_client.request(
+        child,
+        body,
+        id,
+        client.timeout_ms,
+        client.max_response_bytes,
+      )
+      |> result.map(fn(bytes) { #(200, bytes) })
+  }
 }
 
 fn jsonrpc_call_result(
@@ -349,7 +714,7 @@ fn jsonrpc_call_result(
 ) -> Result(Dynamic, String) {
   let id = request_id()
   let body = request_envelope(id, method, params)
-  case request(client, body, method, name) {
+  case request(client, body, id, method, name) {
     Error(reason) -> Error(reason)
     Ok(#(status, _)) if status != 200 ->
       Error(method <> " returned HTTP " <> int.to_string(status))
@@ -822,15 +1187,16 @@ fn decode_structured_content(
   }
 }
 
-fn decode_tool_list_page(
+fn decode_json_list_page(
   bytes: BitArray,
   expected_id: String,
+  collection_key: String,
 ) -> Result(#(List(String), Option(String)), String) {
   case bit_array.to_string(bytes) {
-    Error(_) -> Error("tools/list response was not UTF-8")
+    Error(_) -> Error("list response was not UTF-8")
     Ok(raw) ->
       case json.parse(raw, dyn_decode.dynamic) {
-        Error(_) -> Error("tools/list response was not valid JSON")
+        Error(_) -> Error("list response was not valid JSON")
         Ok(response) ->
           case validate_jsonrpc_result(response, expected_id) {
             Error(reason) -> Error(reason)
@@ -842,9 +1208,9 @@ fn decode_tool_list_page(
                 )
               {
                 Error(_) ->
-                  Error("tools/list response contains an invalid JSON value")
+                  Error("list response contains an invalid JSON value")
                 Ok(root) ->
-                  case blueprint_at(root, ["result", "tools"]) {
+                  case blueprint_at(root, ["result", collection_key]) {
                     Some(blueprint_value.Array(items)) -> {
                       let tools =
                         list.map(
@@ -855,11 +1221,10 @@ fn decode_tool_list_page(
                         None -> Ok(#(tools, None))
                         Some(blueprint_value.String(cursor)) ->
                           Ok(#(tools, Some(cursor)))
-                        Some(_) ->
-                          Error("tools/list nextCursor must be a string")
+                        Some(_) -> Error("list nextCursor must be a string")
                       }
                     }
-                    _ -> Error("tools/list response is missing its tools array")
+                    _ -> Error("list response is missing its collection array")
                   }
               }
           }
@@ -889,28 +1254,38 @@ fn request_id() -> String {
   "relay-" <> int.to_string(ffi_unique_integer())
 }
 
-fn list_tools_page(
+fn list_json_pages(
   client: Client,
+  method: String,
+  collection_key: String,
+) -> Result(List(String), String) {
+  list_json_page(client, method, collection_key, None, [], [], 10_000)
+}
+
+fn list_json_page(
+  client: Client,
+  method: String,
+  collection_key: String,
   cursor: Option(String),
   seen_cursors: List(String),
   accumulated: List(String),
   remaining_pages: Int,
 ) -> Result(List(String), String) {
   case remaining_pages <= 0 {
-    True -> Error("tools/list exceeded the client page limit")
+    True -> Error(method <> " exceeded the client page limit")
     False -> {
       let params = case cursor {
         None -> []
         Some(value) -> [#("cursor", json.string(value))]
       }
       let id = request_id()
-      let body = request_envelope(id, "tools/list", params)
-      case request(client, body, "tools/list", "") {
+      let body = request_envelope(id, method, params)
+      case request(client, body, id, method, "") {
         Error(reason) -> Error(reason)
         Ok(#(status, _)) if status != 200 ->
-          Error("tools/list returned HTTP " <> int.to_string(status))
+          Error(method <> " returned HTTP " <> int.to_string(status))
         Ok(#(_, bytes)) ->
-          case decode_tool_list_page(bytes, id) {
+          case decode_json_list_page(bytes, id, collection_key) {
             Error(reason) -> Error(reason)
             Ok(#(items, next_cursor)) -> {
               let accumulated = list.append(accumulated, items)
@@ -918,10 +1293,12 @@ fn list_tools_page(
                 None -> Ok(accumulated)
                 Some(next) ->
                   case list.contains(seen_cursors, next) {
-                    True -> Error("tools/list cursor repeated")
+                    True -> Error(method <> " cursor repeated")
                     False ->
-                      list_tools_page(
+                      list_json_page(
                         client,
+                        method,
+                        collection_key,
                         Some(next),
                         [next, ..seen_cursors],
                         accumulated,

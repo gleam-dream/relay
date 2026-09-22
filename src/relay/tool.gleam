@@ -124,11 +124,74 @@ fn is_valid_name_grapheme(grapheme: String) -> Bool {
   }
 }
 
+/// Annotations providing hints to clients about a tool's behavior and environment.
+pub type ToolAnnotations {
+  ToolAnnotations(
+    title: Option(String),
+    read_only_hint: Option(Bool),
+    destructive_hint: Option(Bool),
+    idempotent_hint: Option(Bool),
+    open_world_hint: Option(Bool),
+  )
+}
+
+pub fn empty_annotations() -> ToolAnnotations {
+  ToolAnnotations(
+    title: None,
+    read_only_hint: None,
+    destructive_hint: None,
+    idempotent_hint: None,
+    open_world_hint: None,
+  )
+}
+
+pub fn tool_annotations(
+  title: Option(String),
+  read_only_hint: Option(Bool),
+  destructive_hint: Option(Bool),
+  idempotent_hint: Option(Bool),
+  open_world_hint: Option(Bool),
+) -> ToolAnnotations {
+  ToolAnnotations(
+    title: title,
+    read_only_hint: read_only_hint,
+    destructive_hint: destructive_hint,
+    idempotent_hint: idempotent_hint,
+    open_world_hint: open_world_hint,
+  )
+}
+
+pub fn tool_annotations_to_json(annotations: ToolAnnotations) -> json.Json {
+  let fields = []
+  let fields = case annotations.title {
+    Some(t) -> [#("title", json.string(t)), ..fields]
+    None -> fields
+  }
+  let fields = case annotations.read_only_hint {
+    Some(b) -> [#("readOnlyHint", json.bool(b)), ..fields]
+    None -> fields
+  }
+  let fields = case annotations.destructive_hint {
+    Some(b) -> [#("destructiveHint", json.bool(b)), ..fields]
+    None -> fields
+  }
+  let fields = case annotations.idempotent_hint {
+    Some(b) -> [#("idempotentHint", json.bool(b)), ..fields]
+    None -> fields
+  }
+  let fields = case annotations.open_world_hint {
+    Some(b) -> [#("openWorldHint", json.bool(b)), ..fields]
+    None -> fields
+  }
+  json.object(fields)
+}
+
 /// Metadata associated with a tool definition.
 pub type ToolMetadata {
   ToolMetadata(
     description: Option(String),
     title: Option(String),
+    annotations: Option(ToolAnnotations),
     required_client_capabilities: List(String),
   )
 }
@@ -137,8 +200,28 @@ pub fn tool_metadata(description: String) -> ToolMetadata {
   ToolMetadata(
     description: Some(description),
     title: None,
+    annotations: None,
     required_client_capabilities: [],
   )
+}
+
+pub fn tool_metadata_with_title(
+  description: String,
+  title: String,
+) -> ToolMetadata {
+  ToolMetadata(
+    description: Some(description),
+    title: Some(title),
+    annotations: None,
+    required_client_capabilities: [],
+  )
+}
+
+pub fn tool_metadata_with_annotations(
+  metadata: ToolMetadata,
+  annotations: ToolAnnotations,
+) -> ToolMetadata {
+  ToolMetadata(..metadata, annotations: Some(annotations))
 }
 
 pub fn tool_metadata_requiring_client_capabilities(
@@ -148,12 +231,18 @@ pub fn tool_metadata_requiring_client_capabilities(
   ToolMetadata(
     description: Some(description),
     title: None,
+    annotations: None,
     required_client_capabilities: capabilities,
   )
 }
 
 pub fn empty_metadata() -> ToolMetadata {
-  ToolMetadata(description: None, title: None, required_client_capabilities: [])
+  ToolMetadata(
+    description: None,
+    title: None,
+    annotations: None,
+    required_client_capabilities: [],
+  )
 }
 
 pub type ToolAdmissionError {
@@ -507,6 +596,45 @@ pub fn registry(
   tools: List(ContextTool(context)),
 ) -> Result(Registry(context), RegistryError) {
   check_duplicate_names(tools, [])
+}
+
+/// Adds a tool to an existing registry, failing if the tool name is already registered.
+pub fn register(
+  registry: Registry(context),
+  tool: ContextTool(context),
+) -> Result(Registry(context), RegistryError) {
+  let Registry(tools) = registry
+  case list.any(tools, fn(t) { t.name == tool.name }) {
+    True -> Error(DuplicateToolName(tool.name))
+    False -> Ok(Registry([tool, ..tools]))
+  }
+}
+
+/// Removes a tool from an existing registry by name.
+pub fn unregister(
+  registry: Registry(context),
+  name: ToolName,
+) -> Registry(context) {
+  let Registry(tools) = registry
+  Registry(list.filter(tools, fn(t) { t.name != name }))
+}
+
+/// Reports whether a tool with this name is present in the registry.
+pub fn contains(registry: Registry(context), name: ToolName) -> Bool {
+  let Registry(tools) = registry
+  list.any(tools, fn(candidate) { candidate.name == name })
+}
+
+/// Returns the current tool values in the registry.
+///
+/// The values are used by the HTTP hub to reconcile a subscription against
+/// the current registry at admission time. The registry itself remains
+/// immutable and opaque to callers.
+pub fn registered_tools(
+  registry: Registry(context),
+) -> List(ContextTool(context)) {
+  let Registry(tools) = registry
+  tools
 }
 
 fn check_duplicate_names(

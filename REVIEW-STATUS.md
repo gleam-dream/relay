@@ -1,37 +1,45 @@
-# Relay Wave 2 final focused review
+# Relay Wave 3 final focused review
 
 ## Verdict
 
-- **PASS — the final residual finding is accepted for the delivered local HTTP subset.** Handler progress is now backpressured through the runtime owner and transport writer, the runtime mailbox remains bounded under a held writer, and an SSE delivery failure closes the runtime and kills its active workers. The broker records the first failure, so a dead SSE actor cannot impose one timeout per queued progress frame.
-- This is not full Wave 2 or full-package acceptance. The deferred rows in `WAVE-2-REPORT.md` remain unfinished, including subscription routing and notifications, dynamic registry changes, logging emission, full typed client and stdio client coverage, local TLS evidence, broader process-cleanup evidence, authorization, legacy compatibility, interoperability fixtures, and the public test kit.
-- The target is the dirty Relay working tree against checkpoint `ce718db`. This review is intentionally limited to the single HIGH finding retained by `relay-wave2-rereview.md` and direct cancellation/timeout regressions from its repair.
+- **PASS — the HTTP subscription-establishment and dynamic-registry subset is accepted.** The generation-based repair closes the last same-name replacement race while preserving the prior empty-registry, net-change, acknowledgement, cleanup, and bounded-retention guarantees.
+- This review targets the repaired subset in the complete dirty Relay tree against checkpoint `20ad8af`. It does not accept full Wave 3 or package completion.
+- The previously accepted Wave 3 subset remains accepted. The deferred package work listed in `WAVE-3-REPORT.md` remains outside this verdict.
 
-## Residual finding verification
+## Final finding closure
 
-No blocking finding remains in the reviewed path.
+### Same-name replacement during establishment
 
-The handler's progress callback now uses a synchronous call to the runtime owner. The owner does not acknowledge the callback until it has reduced the progress event and completed the status writer. A producer therefore cannot enqueue its full burst independently of the socket. The regression holds the writer during a 128-value burst, measures the runtime owner's actual mailbox, and requires at most one queued message before releasing the writer.
+- The prior HIGH finding is closed. `HubState` now owns a monotonic registry generation, and `HubGetServer` returns that generation with the immutable server and tool snapshot.
+- Accepted registration increments the generation at `src/relay/transport/http.gleam:161-177`. Accepted removal increments it at `src/relay/transport/http.gleam:180-193`; duplicate registration and absent-name removal leave it unchanged.
+- `RegisterSubscription` compares the snapshot generation with the current generation inside the serialized hub actor. A changed generation causes the runtime to unregister every snapshot tool, register every current tool, and enqueue one tools-list notification before the hub reports successful registration.
+- This complete current-state reconciliation preserves a removal followed by registration under the same name. It also covers net additions and removals without comparing handler closures or retaining mutation history.
 
-The live HTTP runtime now uses a status-returning writer. A rejected or timed-out broker delivery returns `Error`, and the runtime immediately closes its state and kills every active worker. The broker marks itself failed on an absent actor, response-limit failure, actor write failure, or actor acknowledgement timeout; later deliveries reject without another actor wait. The loopback regression resets the real TCP peer after receiving the first SSE data event during a 100,000-value producer burst, observes the worker PID terminate within one second, and proves the producer never finishes the burst.
+## Direct regression evidence
 
-One in-flight writer call may still occupy the configured request timeout. That is the deliberate delivery bound, not an unbounded progress backlog: only one producer call is admitted through that boundary, the outer runtime delivery returns failure at the same bound, and close/stop or invocation-timeout messages then run without a queue of progress frames ahead of them. The source contains no cyclic wait among the worker, runtime, broker, and SSE actor. The worker waits only for the runtime; the runtime and broker each use bounded transport receives; the actor returns the write result; and any failure closes the runtime. I found no cancellation/timeout deadlock introduced by the synchronous progress repair within the claimed local HTTP subset.
+- `http_subscription_reconciles_same_name_replacement_during_establishment_test` pauses the request context after the snapshot, removes `replace-me`, registers a replacement with changed metadata and handler output, and then releases admission.
+- The regression proves the acknowledged filter retains `toolsListChanged`, the stream receives `ToolsListChanged`, a subsequent listing contains `replacement metadata` and excludes `old metadata`, and a call returns `replacement handler`.
+- The empty-registry and populated-registry gate regressions still prove a net addition between snapshot and activation produces a notification and becomes visible to later requests.
+- The 128-cycle churn regression still proves subscription admission depends on the current registry and generation rather than server-lifetime mutation history.
+- The hub-death regression still proves `client.listen` returns an error when the hub stops during admission, so a failed registration cannot expose an acknowledged stream.
 
-## Regression quality
+## Bound and cleanup guarantees
 
-- `runtime_progress_backpressure_bounds_mailbox_test` directly measures the runtime owner rather than inferring backpressure from successful writes. Its held writer makes the producer attempt the remaining burst while only one progress call can be outstanding.
-- `live_sse_progress_burst_disconnect_cancels_worker_test` uses a real loopback socket and reset, captures the real worker PID, and checks both prompt exit and incomplete production. It exercises live SSE delivery failure during sustained producer pressure.
-- The full test suite passed twice independently, so both timing-sensitive regressions held on repeated runs.
+- `HubState` contains only the current server, active subscriptions, and one generation integer. No change journal, historical `ContextTool`, or removed handler closure remains retained.
+- Reconciliation work is bounded by the snapshot and current registry sizes. A changed generation performs one pass over each list; prior churn count does not affect the work.
+- The SSE broker continues to hold all initial subscription frames. The handler releases them only after successful hub registration.
+- Registration timeout, hub death, and acknowledgement-release failure each queue `UnregisterSubscription` and stop the runtime, SSE actor, and broker. Same-sender mailbox ordering ensures a delayed successful registration is followed by its queued unregister cleanup.
+- The suite retains post-write disconnect and response-bound regressions. It does not contain a deterministic subscription-specific initial-flush failure injection, so that branch remains established by direct code inspection rather than a dedicated regression.
 
 ## Independent evidence
 
-- `nix develop --command gleam test --target erlang` passed twice: **88 passed, 0 failed** on each run.
-- `scripts/conformance/run-server-suite.sh` passed: **40 scenarios, 106 checks passed, 0 failed**. `input-required-result-missing-input-response` emitted **0 checks**, so this is 106 emitted checks rather than 40 independently asserted scenario passes.
-- `nix develop --command gleam format --check src test` passed.
-- `nix develop --command gleam check --target erlang` passed with the already-recorded unused-constructor and deferred authorization/test-kit TODO warnings.
-- `git diff --check ce718db` passed.
+- `nix develop --command gleam test --target erlang` passed: **99 tests, 0 failures**. Expected untrusted-CA and broken-child diagnostics appeared.
+- `./scripts/conformance/run-server-suite.sh` passed: **109 emitted checks across 40 scenarios, 0 failed**. `input-required-result-missing-input-response` emitted zero checks and is not an independently asserted scenario pass.
+- The preceding focused review ran `nix develop --command python3 scripts/relay_schema_check.py`: **17** Relay messages matched the frozen schema and **40** malformed single-field mutations were rejected. The final repair does not change protocol encoding or the schema corpus.
+- `git diff --check 20ad8af` passed.
 
 ## Acceptance boundary
 
-Accepted: the previously rejected claim for worker-driven progress, response backpressure, live SSE delivery failure, and disconnect cancellation in the delivered local HTTP subset. The producer boundary is synchronous, the observed owner mailbox is bounded, transport failure reaches the runtime, active workers are killed, and the failed broker does not repeat dead-actor waits.
-
-Not accepted: complete Wave 2, complete MCP coverage, or release readiness. The partial status and deferred ownership recorded in `WAVE-2-REPORT.md` remain authoritative. The passing conformance result covers every emitted check in the pinned server HTTP suite; it does not fill the zero-check scenario or establish the deferred client, stdio, TLS, authorization, compatibility, interoperability, soak, fuzz, matrix, or test-kit scope.
+- Accepted: HTTP `subscriptions/listen` capability negotiation for empty and populated registries; atomic snapshot-to-activation reconciliation for net additions, net removals, and same-name replacement; dynamic tool list-change delivery; current-registry-bounded reconciliation without retained history; acknowledgement withholding until hub registration; and terminal cleanup for registration failure, timeout, hub death, release failure, and later disconnect.
+- Previously accepted and unchanged: typed stdio request/response methods; explicit-CA HTTPS; the expanded modern wire corpus; retained HTTP backpressure and disconnect cancellation; and strict `2026-07-28` codec behavior.
+- Still incomplete: typed stdio subscriptions, owner-death and comprehensive process-count cleanup, official-peer client fixtures, remaining modern families and admission, authorization, `2025-11-25` compatibility, the public test kit, target matrices, soak/fuzz, and release hardening. These are package-completion gaps rather than blockers for the accepted subset.

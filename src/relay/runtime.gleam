@@ -4,8 +4,10 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
+import relay/protocol/jsonrpc.{type RequestId}
 import relay/server.{type ExchangeId, type InvocationId, type Server}
 import relay/telemetry
+import relay/tool.{type ContextTool, type ToolName}
 
 pub type RuntimeConfig {
   RuntimeConfig(
@@ -57,6 +59,13 @@ pub type RuntimeMessage(context) {
   WorkerTimeout(invocation_id: InvocationId, exchange_id: ExchangeId)
   ProcessDownMessage(down: process.Down)
   ExpireTombstone(invocation_id: InvocationId)
+  NotifyResource(uri: String)
+  NotifyToolsChanged
+  NotifyResourcesChanged
+  NotifyPromptsChanged
+  RegisterDynamicTool(tool: ContextTool(context))
+  UnregisterDynamicTool(name: ToolName)
+  TerminateSubscriptionStream(id: RequestId)
   Close
   Stop(reply: Subject(Nil))
 }
@@ -172,6 +181,51 @@ pub fn stop(runtime: Runtime(context), timeout_ms: Int) -> Nil {
   process.call(subject, waiting: timeout_ms, sending: Stop)
 }
 
+/// Notifies that a resource has changed, sending notifications to all active subscribers.
+pub fn notify_resource_updated(runtime: Runtime(context), uri: String) -> Nil {
+  let Runtime(subject) = runtime
+  process.send(subject, NotifyResource(uri))
+}
+
+/// Notifies that the list of available tools has changed.
+pub fn notify_tools_list_changed(runtime: Runtime(context)) -> Nil {
+  let Runtime(subject) = runtime
+  process.send(subject, NotifyToolsChanged)
+}
+
+/// Notifies that the list of available resources has changed.
+pub fn notify_resources_list_changed(runtime: Runtime(context)) -> Nil {
+  let Runtime(subject) = runtime
+  process.send(subject, NotifyResourcesChanged)
+}
+
+/// Notifies that the list of available prompts has changed.
+pub fn notify_prompts_list_changed(runtime: Runtime(context)) -> Nil {
+  let Runtime(subject) = runtime
+  process.send(subject, NotifyPromptsChanged)
+}
+
+/// Dynamically registers a new tool and notifies subscribers if tools list changed.
+pub fn register_tool(
+  runtime: Runtime(context),
+  tool: ContextTool(context),
+) -> Nil {
+  let Runtime(subject) = runtime
+  process.send(subject, RegisterDynamicTool(tool))
+}
+
+/// Dynamically unregisters a tool by name and notifies subscribers if tools list changed.
+pub fn unregister_tool(runtime: Runtime(context), name: ToolName) -> Nil {
+  let Runtime(subject) = runtime
+  process.send(subject, UnregisterDynamicTool(name))
+}
+
+/// Gracefully terminates a subscription stream by JSON-RPC request ID.
+pub fn terminate_subscription(runtime: Runtime(context), id: RequestId) -> Nil {
+  let Runtime(subject) = runtime
+  process.send(subject, TerminateSubscriptionStream(id))
+}
+
 fn handle_message(
   state: RuntimeState(context),
   msg: RuntimeMessage(context),
@@ -275,6 +329,62 @@ fn handle_message(
 
     ExpireTombstone(inv_id) -> {
       let next_st = handle_expire_tombstone(state, inv_id)
+      actor.continue(next_st)
+    }
+
+    NotifyResource(uri) -> {
+      let #(next_server, effects) =
+        server.step(state.server, server.NotifyResourceUpdated(uri))
+      let next_st =
+        interpret_effects(RuntimeState(..state, server: next_server), effects)
+      actor.continue(next_st)
+    }
+
+    NotifyToolsChanged -> {
+      let #(next_server, effects) =
+        server.step(state.server, server.NotifyToolsListChanged)
+      let next_st =
+        interpret_effects(RuntimeState(..state, server: next_server), effects)
+      actor.continue(next_st)
+    }
+
+    NotifyResourcesChanged -> {
+      let #(next_server, effects) =
+        server.step(state.server, server.NotifyResourcesListChanged)
+      let next_st =
+        interpret_effects(RuntimeState(..state, server: next_server), effects)
+      actor.continue(next_st)
+    }
+
+    NotifyPromptsChanged -> {
+      let #(next_server, effects) =
+        server.step(state.server, server.NotifyPromptsListChanged)
+      let next_st =
+        interpret_effects(RuntimeState(..state, server: next_server), effects)
+      actor.continue(next_st)
+    }
+
+    RegisterDynamicTool(tool) -> {
+      let #(next_server, effects) =
+        server.step(state.server, server.RegisterTool(tool))
+      let next_st =
+        interpret_effects(RuntimeState(..state, server: next_server), effects)
+      actor.continue(next_st)
+    }
+
+    UnregisterDynamicTool(name) -> {
+      let #(next_server, effects) =
+        server.step(state.server, server.UnregisterTool(name))
+      let next_st =
+        interpret_effects(RuntimeState(..state, server: next_server), effects)
+      actor.continue(next_st)
+    }
+
+    TerminateSubscriptionStream(id) -> {
+      let #(next_server, effects) =
+        server.step(state.server, server.TerminateSubscription(id))
+      let next_st =
+        interpret_effects(RuntimeState(..state, server: next_server), effects)
       actor.continue(next_st)
     }
 

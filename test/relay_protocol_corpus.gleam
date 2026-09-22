@@ -12,6 +12,7 @@ import relay/protocol/jsonrpc.{RequestString}
 import relay/protocol/v2026_07_28 as v2026
 import relay/resources
 import relay/server
+import relay/subscriptions
 
 pub fn main() -> Nil {
   // 1. Tool setup
@@ -73,6 +74,57 @@ pub fn main() -> Nil {
     )
     |> json.to_string()
   emit("tool_call_error", "CallToolResultResponse", call_err_wire)
+
+  let subscription_id = RequestString("sub-1")
+  let filter =
+    subscriptions.SubscriptionFilter(
+      tools_list_changed: True,
+      resources_list_changed: True,
+      prompts_list_changed: True,
+      resource_subscriptions: ["memory://corpus/one"],
+    )
+  let listen_wire =
+    v2026.encode_subscriptions_listen_request(subscription_id, filter)
+    |> json.to_string
+  emit("subscriptions_listen", "SubscriptionsListenRequest", listen_wire)
+  let acknowledgement_wire =
+    v2026.encode_subscriptions_acknowledged_notification(
+      subscription_id,
+      filter,
+    )
+    |> json.to_string
+  emit(
+    "subscriptions_acknowledged",
+    "SubscriptionsAcknowledgedNotification",
+    acknowledgement_wire,
+  )
+  let resource_updated_wire =
+    v2026.encode_resource_updated_notification(
+      subscription_id,
+      "memory://corpus/one",
+    )
+    |> json.to_string
+  emit("resource_updated", "ResourceUpdatedNotification", resource_updated_wire)
+  let tools_changed_wire =
+    v2026.encode_tools_list_changed_notification(subscription_id)
+    |> json.to_string
+  emit("tools_list_changed", "ToolListChangedNotification", tools_changed_wire)
+  let resources_changed_wire =
+    v2026.encode_resources_list_changed_notification(subscription_id)
+    |> json.to_string
+  emit(
+    "resources_list_changed",
+    "ResourceListChangedNotification",
+    resources_changed_wire,
+  )
+  let prompts_changed_wire =
+    v2026.encode_prompts_list_changed_notification(subscription_id)
+    |> json.to_string
+  emit(
+    "prompts_list_changed",
+    "PromptListChangedNotification",
+    prompts_changed_wire,
+  )
 
   // 5. Unsupported protocol version error
   let unsupp_err =

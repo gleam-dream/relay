@@ -15,7 +15,8 @@ import gleam/uri
 import mist
 import relay/protocol/v2026_07_28 as v2026
 import relay/runtime
-import relay/server.{type Server}
+import relay/server as server_mod
+import relay/tool as relay_tool
 
 /// Streamable HTTP listener options. Bind `host` to a loopback interface for
 /// local development; remote listeners should use an explicit policy.
@@ -34,8 +35,195 @@ pub type HttpPolicy {
   )
 }
 
-pub opaque type HttpServer {
-  HttpServer(pid: process.Pid, port: Int)
+pub opaque type HttpServer(context) {
+  HttpServer(pid: process.Pid, port: Int, hub: HubHandle(context))
+}
+
+pub opaque type HubHandle(context) {
+  HubHandle(process.Subject(HubMessage(context)))
+}
+
+type ActiveSubscription(context) {
+  ActiveSubscription(
+    broker: SseBroker,
+    notify_resource: fn(String) -> Nil,
+    notify_tools: fn() -> Nil,
+    notify_resources: fn() -> Nil,
+    notify_prompts: fn() -> Nil,
+    register_tool: fn(relay_tool.ContextTool(context)) -> Nil,
+    unregister_tool: fn(relay_tool.ToolName) -> Nil,
+    stop: fn() -> Nil,
+  )
+}
+
+type HubMessage(context) {
+  RegisterSubscription(
+    ActiveSubscription(context),
+    List(relay_tool.ContextTool(context)),
+    Int,
+    process.Subject(Result(Nil, Nil)),
+  )
+  UnregisterSubscription(SseBroker)
+  HubNotifyResource(String)
+  HubNotifyTools
+  HubNotifyResources
+  HubNotifyPrompts
+  HubGetServer(
+    process.Subject(
+      Result(
+        #(
+          server_mod.Server(context),
+          List(relay_tool.ContextTool(context)),
+          Int,
+        ),
+        Nil,
+      ),
+    ),
+  )
+  HubRegisterTool(
+    relay_tool.ContextTool(context),
+    process.Subject(Result(Nil, relay_tool.RegistryError)),
+  )
+  HubUnregisterTool(relay_tool.ToolName, process.Subject(Bool))
+  StopHub(process.Subject(Nil))
+}
+
+type HubState(context) {
+  HubState(
+    server: server_mod.Server(context),
+    subscriptions: List(ActiveSubscription(context)),
+    generation: Int,
+  )
+}
+
+fn start_hub(
+  server: server_mod.Server(context),
+) -> Result(process.Subject(HubMessage(context)), actor.StartError) {
+  let builder =
+    actor.new(HubState(server: server, subscriptions: [], generation: 0))
+    |> actor.on_message(handle_hub_message)
+  case actor.start(builder) {
+    Ok(started) -> Ok(started.data)
+    Error(err) -> Error(err)
+  }
+}
+
+fn handle_hub_message(
+  state: HubState(context),
+  msg: HubMessage(context),
+) -> actor.Next(HubState(context), HubMessage(context)) {
+  case msg {
+    RegisterSubscription(sub, snapshot_tools, snapshot_generation, reply) -> {
+      reconcile_subscription(
+        sub,
+        snapshot_tools,
+        server_mod.registered_tools(state.server),
+        snapshot_generation,
+        state.generation,
+      )
+      process.send(reply, Ok(Nil))
+      actor.continue(
+        HubState(..state, subscriptions: [sub, ..state.subscriptions]),
+      )
+    }
+    UnregisterSubscription(broker) -> {
+      let remaining =
+        list.filter(state.subscriptions, fn(s) { s.broker != broker })
+      actor.continue(HubState(..state, subscriptions: remaining))
+    }
+    HubNotifyResource(uri) -> {
+      list.each(state.subscriptions, fn(s) { s.notify_resource(uri) })
+      actor.continue(state)
+    }
+    HubNotifyTools -> {
+      list.each(state.subscriptions, fn(s) { s.notify_tools() })
+      actor.continue(state)
+    }
+    HubNotifyResources -> {
+      list.each(state.subscriptions, fn(s) { s.notify_resources() })
+      actor.continue(state)
+    }
+    HubNotifyPrompts -> {
+      list.each(state.subscriptions, fn(s) { s.notify_prompts() })
+      actor.continue(state)
+    }
+    HubGetServer(reply) -> {
+      process.send(
+        reply,
+        Ok(#(
+          state.server,
+          server_mod.registered_tools(state.server),
+          state.generation,
+        )),
+      )
+      actor.continue(state)
+    }
+    HubRegisterTool(new_tool, reply) -> {
+      case server_mod.register_tool(state.server, new_tool) {
+        Error(error) -> {
+          process.send(reply, Error(error))
+          actor.continue(state)
+        }
+        Ok(next_server) -> {
+          list.each(state.subscriptions, fn(s) { s.register_tool(new_tool) })
+          process.send(reply, Ok(Nil))
+          actor.continue(
+            HubState(
+              ..state,
+              server: next_server,
+              generation: state.generation + 1,
+            ),
+          )
+        }
+      }
+    }
+    HubUnregisterTool(name, reply) -> {
+      let #(next_server, changed) =
+        server_mod.unregister_tool(state.server, name)
+      case changed {
+        True -> {
+          list.each(state.subscriptions, fn(s) { s.unregister_tool(name) })
+          process.send(reply, changed)
+          actor.continue(
+            HubState(
+              ..state,
+              server: next_server,
+              generation: state.generation + 1,
+            ),
+          )
+        }
+        False -> {
+          process.send(reply, changed)
+          actor.continue(HubState(..state, server: next_server))
+        }
+      }
+    }
+    StopHub(reply) -> {
+      list.each(state.subscriptions, fn(s) { s.stop() })
+      process.send(reply, Nil)
+      actor.stop()
+    }
+  }
+}
+
+fn reconcile_subscription(
+  sub: ActiveSubscription(context),
+  snapshot_tools: List(relay_tool.ContextTool(context)),
+  current_tools: List(relay_tool.ContextTool(context)),
+  snapshot_generation: Int,
+  current_generation: Int,
+) -> Nil {
+  case snapshot_generation == current_generation {
+    True -> Nil
+    False -> {
+      list.each(snapshot_tools, fn(snapshot_tool) {
+        sub.unregister_tool(relay_tool.tool_name_of(snapshot_tool))
+      })
+      list.each(current_tools, sub.register_tool)
+      sub.notify_tools()
+    }
+  }
+  Nil
 }
 
 type SseControlMessage {
@@ -62,6 +250,7 @@ type SseActorLoopState {
 type SseBrokerMessage {
   AttachSseActor(process.Subject(SseActorMessage), process.Subject(Nil))
   DeliverSseFrame(BitArray, process.Subject(SseDeliveryResult))
+  ReleaseSseBroker(process.Subject(Result(Nil, Nil)))
   StopSseBroker(process.Subject(Nil))
 }
 
@@ -77,6 +266,8 @@ type SseBrokerState {
     timeout_ms: Int,
     response_limit: Int,
     response_bytes: Int,
+    holding: Bool,
+    pending: List(BitArray),
     failed: Bool,
   )
 }
@@ -85,12 +276,65 @@ type SseBroker {
   SseBroker(subject: process.Subject(SseBrokerMessage))
 }
 
-pub fn http_server_port(server: HttpServer) -> Int {
+pub fn http_server_port(server: HttpServer(context)) -> Int {
   server.port
 }
 
-pub fn stop_http_server(server: HttpServer) -> Nil {
+pub fn stop_http_server(server: HttpServer(context)) -> Nil {
+  let HubHandle(hub) = server.hub
+  let reply = process.new_subject()
+  process.send(hub, StopHub(reply))
+  let _ = process.receive(reply, 2000)
   ffi_stop_supervisor(server.pid)
+}
+
+/// Notifies all active HTTP SSE subscription streams that a resource has updated.
+pub fn notify_resource_updated(
+  server: HttpServer(context),
+  uri: String,
+) -> Nil {
+  let HubHandle(hub) = server.hub
+  process.send(hub, HubNotifyResource(uri))
+}
+
+/// Notifies all active HTTP SSE subscription streams that the tools list has changed.
+pub fn notify_tools_list_changed(server: HttpServer(context)) -> Nil {
+  let HubHandle(hub) = server.hub
+  process.send(hub, HubNotifyTools)
+}
+
+/// Notifies all active HTTP SSE subscription streams that the resources list has changed.
+pub fn notify_resources_list_changed(server: HttpServer(context)) -> Nil {
+  let HubHandle(hub) = server.hub
+  process.send(hub, HubNotifyResources)
+}
+
+/// Notifies all active HTTP SSE subscription streams that the prompts list has changed.
+pub fn notify_prompts_list_changed(server: HttpServer(context)) -> Nil {
+  let HubHandle(hub) = server.hub
+  process.send(hub, HubNotifyPrompts)
+}
+
+/// Dynamically registers a tool for future HTTP requests and active subscriptions.
+pub fn register_tool(
+  server: HttpServer(context),
+  new_tool: relay_tool.ContextTool(context),
+) -> Result(Nil, relay_tool.RegistryError) {
+  let HubHandle(hub) = server.hub
+  process.call(hub, waiting: 5000, sending: fn(reply) {
+    HubRegisterTool(new_tool, reply)
+  })
+}
+
+/// Dynamically removes a tool and notifies active subscribers when it existed.
+pub fn unregister_tool(
+  server: HttpServer(context),
+  name: relay_tool.ToolName,
+) -> Bool {
+  let HubHandle(hub) = server.hub
+  process.call(hub, waiting: 5000, sending: fn(reply) {
+    HubUnregisterTool(name, reply)
+  })
 }
 
 @external(erlang, "relay_ffi", "stop_supervisor")
@@ -124,9 +368,9 @@ pub fn local_http_policy(host: String) -> HttpPolicy {
 
 /// Starts the local, unprotected modern Streamable HTTP endpoint.
 pub fn start_http_server(
-  server: Server(Nil),
+  server: server_mod.Server(Nil),
   options: HttpOptions,
-) -> Result(HttpServer, String) {
+) -> Result(HttpServer(Nil), String) {
   start_http_server_with_policy(
     server,
     options,
@@ -135,51 +379,106 @@ pub fn start_http_server(
 }
 
 pub fn start_http_server_with_policy(
-  server: Server(Nil),
+  server: server_mod.Server(Nil),
   options: HttpOptions,
   policy: HttpPolicy,
-) -> Result(HttpServer, String) {
-  case valid_policy(policy) {
-    False ->
-      Error("Relay HTTP limits and allow-lists must be non-empty and positive")
-    True -> {
-      let port_subject = process.new_subject()
-      let handler = fn(req) {
-        handle_request(req, server, fn() { Nil }, policy)
-      }
-      let builder =
-        mist.new(handler)
-        |> mist.port(options.port)
-        |> mist.bind(options.host)
-        |> mist.after_start(fn(port, _scheme, _interface) {
-          process.send(port_subject, port)
-        })
-      start_listener(builder, port_subject)
-    }
-  }
+) -> Result(HttpServer(Nil), String) {
+  start_http_server_with_context(server, options, fn() { Nil }, policy)
 }
 
 /// Starts the modern endpoint with an application-owned request context.
 pub fn start_http_server_with_context(
-  server: Server(context),
+  server: server_mod.Server(context),
   options: HttpOptions,
   context: fn() -> context,
   policy: HttpPolicy,
-) -> Result(HttpServer, String) {
+) -> Result(HttpServer(context), String) {
   case valid_policy(policy) {
     False ->
       Error("Relay HTTP limits and allow-lists must be non-empty and positive")
     True -> {
-      let port_subject = process.new_subject()
-      let handler = fn(req) { handle_request(req, server, context, policy) }
-      let builder =
-        mist.new(handler)
-        |> mist.port(options.port)
-        |> mist.bind(options.host)
-        |> mist.after_start(fn(port, _scheme, _interface) {
-          process.send(port_subject, port)
-        })
-      start_listener(builder, port_subject)
+      case start_hub(server) {
+        Error(_) -> Error("Relay subscription hub failed to start")
+        Ok(hub) -> {
+          let port_subject = process.new_subject()
+          let handler = fn(req) { handle_request(req, context, policy, hub) }
+          let builder =
+            mist.new(handler)
+            |> mist.port(options.port)
+            |> mist.bind(options.host)
+            |> mist.after_start(fn(port, _scheme, _interface) {
+              process.send(port_subject, port)
+            })
+          start_listener(builder, port_subject, hub)
+        }
+      }
+    }
+  }
+}
+
+/// Starts the secure modern endpoint with TLS certificates and default local policy.
+pub fn start_https_server(
+  server: server_mod.Server(Nil),
+  options: HttpOptions,
+  certfile: String,
+  keyfile: String,
+) -> Result(HttpServer(Nil), String) {
+  start_https_server_with_policy(
+    server,
+    options,
+    local_http_policy(options.host),
+    certfile,
+    keyfile,
+  )
+}
+
+/// Starts the secure modern endpoint with TLS certificates and explicit policy.
+pub fn start_https_server_with_policy(
+  server: server_mod.Server(Nil),
+  options: HttpOptions,
+  policy: HttpPolicy,
+  certfile: String,
+  keyfile: String,
+) -> Result(HttpServer(Nil), String) {
+  start_https_server_with_context(
+    server,
+    options,
+    fn() { Nil },
+    policy,
+    certfile,
+    keyfile,
+  )
+}
+
+/// Starts the secure modern endpoint with TLS certificates, context, and policy.
+pub fn start_https_server_with_context(
+  server: server_mod.Server(context),
+  options: HttpOptions,
+  context: fn() -> context,
+  policy: HttpPolicy,
+  certfile: String,
+  keyfile: String,
+) -> Result(HttpServer(context), String) {
+  case valid_policy(policy) {
+    False ->
+      Error("Relay HTTP limits and allow-lists must be non-empty and positive")
+    True -> {
+      case start_hub(server) {
+        Error(_) -> Error("Relay subscription hub failed to start")
+        Ok(hub) -> {
+          let port_subject = process.new_subject()
+          let handler = fn(req) { handle_request(req, context, policy, hub) }
+          let builder =
+            mist.new(handler)
+            |> mist.port(options.port)
+            |> mist.bind(options.host)
+            |> mist.with_tls(certfile, keyfile)
+            |> mist.after_start(fn(port, _scheme, _interface) {
+              process.send(port_subject, port)
+            })
+          start_listener(builder, port_subject, hub)
+        }
+      }
     }
   }
 }
@@ -187,14 +486,24 @@ pub fn start_http_server_with_context(
 fn start_listener(
   builder: mist.Builder(mist.Connection, mist.ResponseData),
   port_subject: process.Subject(Int),
-) -> Result(HttpServer, String) {
+  hub: process.Subject(HubMessage(context)),
+) -> Result(HttpServer(context), String) {
   case mist.start(builder) {
-    Error(_) -> Error("Mist failed to start the Relay HTTP listener")
+    Error(_) -> {
+      let reply = process.new_subject()
+      process.send(hub, StopHub(reply))
+      let _ = process.receive(reply, 1000)
+      Error("Mist failed to start the Relay HTTP listener")
+    }
     Ok(started) -> {
       process.unlink(started.pid)
       case process.receive(port_subject, 5000) {
-        Ok(port) -> Ok(HttpServer(pid: started.pid, port: port))
+        Ok(port) ->
+          Ok(HttpServer(pid: started.pid, port: port, hub: HubHandle(hub)))
         Error(_) -> {
+          let reply = process.new_subject()
+          process.send(hub, StopHub(reply))
+          let _ = process.receive(reply, 1000)
           ffi_stop_supervisor(started.pid)
           Error("Mist started without reporting its bound port")
         }
@@ -217,9 +526,9 @@ type BodyError {
 
 fn handle_request(
   req: Request(mist.Connection),
-  server: Server(context),
   context: fn() -> context,
   policy: HttpPolicy,
+  hub: process.Subject(HubMessage(context)),
 ) -> Response(mist.ResponseData) {
   case req.method {
     Post ->
@@ -233,11 +542,36 @@ fn handle_request(
             Error(BodyMalformed) ->
               plain_response(400, "Malformed request body")
             Ok(body) ->
-              handle_body(req, server, context, policy, accept_sse, body)
+              case current_hub_server(hub, policy.request_timeout_ms) {
+                Error(_) ->
+                  plain_response(503, "Relay HTTP registry is unavailable")
+                Ok(#(current_server, snapshot_tools, snapshot_generation)) ->
+                  handle_body(
+                    req,
+                    current_server,
+                    snapshot_tools,
+                    snapshot_generation,
+                    context,
+                    policy,
+                    accept_sse,
+                    body,
+                    hub,
+                  )
+              }
           }
       }
     _ -> plain_response(405, "Only POST is supported by modern Streamable HTTP")
   }
+}
+
+fn current_hub_server(
+  hub: process.Subject(HubMessage(context)),
+  timeout_ms: Int,
+) -> Result(
+  #(server_mod.Server(context), List(relay_tool.ContextTool(context)), Int),
+  Nil,
+) {
+  process.call(hub, waiting: timeout_ms, sending: HubGetServer)
 }
 
 fn validate_request_headers(
@@ -402,11 +736,14 @@ fn read_bounded_chunk(
 
 fn handle_body(
   req: Request(mist.Connection),
-  server: Server(context),
+  server: server_mod.Server(context),
+  snapshot_tools: List(relay_tool.ContextTool(context)),
+  snapshot_generation: Int,
   context: fn() -> context,
   policy: HttpPolicy,
   accept_sse: Bool,
   body: BitArray,
+  hub: process.Subject(HubMessage(context)),
 ) -> Response(mist.ResponseData) {
   case v2026.http_route(body) {
     Error(_) -> plain_response(400, "Invalid MCP JSON-RPC envelope")
@@ -417,7 +754,7 @@ fn handle_body(
       {
         False -> json_rpc_response(400, v2026.encode_http_routing_error(body))
         True ->
-          case server.http_admission_failure(server, body) {
+          case server_mod.http_admission_failure(server, body) {
             Some(#(status_code, response_body)) ->
               json_rpc_response(status_code, response_body)
             None ->
@@ -430,9 +767,13 @@ fn handle_body(
                       handle_live_sse_request(
                         req,
                         server,
+                        snapshot_tools,
+                        snapshot_generation,
                         context,
                         policy,
+                        route,
                         body,
+                        hub,
                       )
                     False ->
                       handle_buffered_request(
@@ -451,7 +792,7 @@ fn handle_body(
 }
 
 fn handle_buffered_request(
-  server: Server(context),
+  server: server_mod.Server(context),
   context: fn() -> context,
   policy: HttpPolicy,
   route: v2026.HttpRoute,
@@ -472,7 +813,7 @@ fn handle_buffered_request(
   {
     Error(_) -> plain_response(500, "Relay runtime failed to start")
     Ok(runtime_instance) -> {
-      let exchange = server.fresh_exchange()
+      let exchange = server_mod.fresh_exchange()
       case
         runtime.send_frame(
           runtime_instance,
@@ -519,13 +860,18 @@ fn handle_buffered_request(
 
 fn handle_live_sse_request(
   req: Request(mist.Connection),
-  server: Server(context),
+  server: server_mod.Server(context),
+  snapshot_tools: List(relay_tool.ContextTool(context)),
+  snapshot_generation: Int,
   context: fn() -> context,
   policy: HttpPolicy,
+  route: v2026.HttpRoute,
   body: BitArray,
+  hub: process.Subject(HubMessage(context)),
 ) -> Response(mist.ResponseData) {
+  let is_subscription = route.method == "subscriptions/listen"
   let control = process.new_subject()
-  case start_sse_broker(control, policy) {
+  case start_sse_broker(control, policy, is_subscription) {
     Error(_) -> plain_response(500, "Relay SSE writer failed to start")
     Ok(broker) -> {
       let config =
@@ -573,7 +919,7 @@ fn handle_live_sse_request(
             }
             Ok(sse_actor) -> {
               attach_sse_actor(broker, sse_actor, 1000)
-              let exchange = server.fresh_exchange()
+              let exchange = server_mod.fresh_exchange()
               case
                 runtime.send_frame(
                   runtime_instance,
@@ -588,13 +934,98 @@ fn handle_live_sse_request(
                   response
                 }
                 Ok(_) -> {
-                  wait_for_sse_terminal(
-                    control,
-                    runtime_instance,
-                    broker,
-                    sse_actor,
-                    policy.request_timeout_ms,
-                  )
+                  case is_subscription {
+                    True -> {
+                      let active =
+                        ActiveSubscription(
+                          broker: broker,
+                          notify_resource: fn(uri) {
+                            runtime.notify_resource_updated(
+                              runtime_instance,
+                              uri,
+                            )
+                          },
+                          notify_tools: fn() {
+                            runtime.notify_tools_list_changed(runtime_instance)
+                          },
+                          notify_resources: fn() {
+                            runtime.notify_resources_list_changed(
+                              runtime_instance,
+                            )
+                          },
+                          notify_prompts: fn() {
+                            runtime.notify_prompts_list_changed(
+                              runtime_instance,
+                            )
+                          },
+                          register_tool: fn(new_tool) {
+                            runtime.register_tool(runtime_instance, new_tool)
+                          },
+                          unregister_tool: fn(name) {
+                            runtime.unregister_tool(runtime_instance, name)
+                          },
+                          stop: fn() {
+                            runtime.close(runtime_instance)
+                            runtime.stop(runtime_instance, 1000)
+                          },
+                        )
+                      let reply = process.new_subject()
+                      process.send(
+                        hub,
+                        RegisterSubscription(
+                          active,
+                          snapshot_tools,
+                          snapshot_generation,
+                          reply,
+                        ),
+                      )
+                      case process.receive(reply, policy.request_timeout_ms) {
+                        Ok(Ok(Nil)) ->
+                          case
+                            release_sse_broker(
+                              broker,
+                              policy.request_timeout_ms,
+                            )
+                          {
+                            Ok(Nil) ->
+                              wait_for_sse_subscription(
+                                control,
+                                runtime_instance,
+                                broker,
+                                sse_actor,
+                                hub,
+                              )
+                            Error(Nil) -> {
+                              process.send(hub, UnregisterSubscription(broker))
+                              stop_live_sse(
+                                runtime_instance,
+                                broker,
+                                sse_actor,
+                                policy.request_timeout_ms,
+                              )
+                            }
+                          }
+                        Ok(Error(_)) | Error(_) -> {
+                          process.send(hub, UnregisterSubscription(broker))
+                          stop_live_sse(
+                            runtime_instance,
+                            broker,
+                            sse_actor,
+                            policy.request_timeout_ms,
+                          )
+                        }
+                      }
+                    }
+                    False -> {
+                      wait_for_sse_terminal(
+                        control,
+                        runtime_instance,
+                        broker,
+                        sse_actor,
+                        policy.request_timeout_ms,
+                      )
+                    }
+                  }
                   response
                 }
               }
@@ -602,6 +1033,21 @@ fn handle_live_sse_request(
           }
         }
       }
+    }
+  }
+}
+
+fn wait_for_sse_subscription(
+  control: process.Subject(SseControlMessage),
+  runtime_instance: runtime.Runtime(context),
+  broker: SseBroker,
+  sse_actor: process.Subject(SseActorMessage),
+  hub: process.Subject(HubMessage(context)),
+) -> Nil {
+  case process.receive_forever(control) {
+    SseClientDisconnected | SseResponseTooLarge | SseResponseFinished -> {
+      process.send(hub, UnregisterSubscription(broker))
+      stop_live_sse(runtime_instance, broker, sse_actor, 1000)
     }
   }
 }
@@ -657,6 +1103,7 @@ fn handle_sse_actor_message(
 fn start_sse_broker(
   control: process.Subject(SseControlMessage),
   policy: HttpPolicy,
+  holding: Bool,
 ) -> Result(SseBroker, actor.StartError) {
   let builder =
     actor.new_with_initialiser(5000, fn(self_subject) {
@@ -667,6 +1114,8 @@ fn start_sse_broker(
           timeout_ms: policy.request_timeout_ms,
           response_limit: policy.max_response_bytes,
           response_bytes: 0,
+          holding: holding,
+          pending: [],
           failed: False,
         )
       actor.initialised(state)
@@ -703,40 +1152,116 @@ fn handle_sse_broker_message(
           actor.continue(SseBrokerState(..state, failed: True))
         }
         False ->
-          case state.sse_actor {
-            None -> {
-              process.send(state.control, SseClientDisconnected)
-              process.send(reply, SseDeliveryRejected)
-              actor.continue(SseBrokerState(..state, failed: True))
+          case state.holding {
+            True -> {
+              process.send(reply, SseDelivered)
+              actor.continue(
+                SseBrokerState(
+                  ..state,
+                  response_bytes: state.response_bytes + frame_size,
+                  pending: list.append(state.pending, [bytes]),
+                ),
+              )
             }
-            Some(sse_actor) -> {
-              let event_reply = process.new_subject()
-              process.send(sse_actor, SseFrame(bytes, event_reply))
-              case process.receive(event_reply, state.timeout_ms) {
-                Ok(Ok(Nil)) -> {
-                  process.send(reply, SseDelivered)
-                  let response_bytes = state.response_bytes + frame_size
-                  case v2026.is_response_frame(bytes) {
-                    True -> process.send(state.control, SseResponseFinished)
-                    False -> Nil
-                  }
-                  actor.continue(
-                    SseBrokerState(..state, response_bytes: response_bytes),
-                  )
-                }
-                Ok(Error(Nil)) | Error(_) -> {
-                  process.send(state.control, SseClientDisconnected)
-                  process.send(reply, SseDeliveryRejected)
-                  actor.continue(SseBrokerState(..state, failed: True))
-                }
-              }
-            }
+            False -> deliver_sse_frame(state, bytes, frame_size, reply)
           }
       }
     }
+    ReleaseSseBroker(reply) ->
+      case state.failed {
+        True -> {
+          process.send(reply, Error(Nil))
+          actor.continue(state)
+        }
+        False ->
+          case state.holding, state.sse_actor {
+            False, _ -> {
+              process.send(reply, Ok(Nil))
+              actor.continue(state)
+            }
+            True, None -> {
+              process.send(state.control, SseClientDisconnected)
+              process.send(reply, Error(Nil))
+              actor.continue(SseBrokerState(..state, failed: True))
+            }
+            True, Some(sse_actor) ->
+              case
+                flush_sse_frames(sse_actor, state.pending, state.timeout_ms)
+              {
+                Ok(Nil) -> {
+                  process.send(reply, Ok(Nil))
+                  actor.continue(
+                    SseBrokerState(..state, holding: False, pending: []),
+                  )
+                }
+                Error(Nil) -> {
+                  process.send(state.control, SseClientDisconnected)
+                  process.send(reply, Error(Nil))
+                  actor.continue(SseBrokerState(..state, failed: True))
+                }
+              }
+          }
+      }
     StopSseBroker(reply) -> {
       process.send(reply, Nil)
       actor.stop()
+    }
+  }
+}
+
+fn deliver_sse_frame(
+  state: SseBrokerState,
+  bytes: BitArray,
+  frame_size: Int,
+  reply: process.Subject(SseDeliveryResult),
+) -> actor.Next(SseBrokerState, SseBrokerMessage) {
+  case state.sse_actor {
+    None -> {
+      process.send(state.control, SseClientDisconnected)
+      process.send(reply, SseDeliveryRejected)
+      actor.continue(SseBrokerState(..state, failed: True))
+    }
+    Some(sse_actor) -> {
+      let event_reply = process.new_subject()
+      process.send(sse_actor, SseFrame(bytes, event_reply))
+      case process.receive(event_reply, state.timeout_ms) {
+        Ok(Ok(Nil)) -> {
+          process.send(reply, SseDelivered)
+          case v2026.is_response_frame(bytes) {
+            True -> process.send(state.control, SseResponseFinished)
+            False -> Nil
+          }
+          actor.continue(
+            SseBrokerState(
+              ..state,
+              response_bytes: state.response_bytes + frame_size,
+            ),
+          )
+        }
+        Ok(Error(Nil)) | Error(_) -> {
+          process.send(state.control, SseClientDisconnected)
+          process.send(reply, SseDeliveryRejected)
+          actor.continue(SseBrokerState(..state, failed: True))
+        }
+      }
+    }
+  }
+}
+
+fn flush_sse_frames(
+  sse_actor: process.Subject(SseActorMessage),
+  pending: List(BitArray),
+  timeout_ms: Int,
+) -> Result(Nil, Nil) {
+  case pending {
+    [] -> Ok(Nil)
+    [bytes, ..rest] -> {
+      let reply = process.new_subject()
+      process.send(sse_actor, SseFrame(bytes, reply))
+      case process.receive(reply, timeout_ms) {
+        Ok(Ok(Nil)) -> flush_sse_frames(sse_actor, rest, timeout_ms)
+        Ok(Error(Nil)) | Error(_) -> Error(Nil)
+      }
     }
   }
 }
@@ -764,6 +1289,16 @@ fn sse_broker_deliver(
   case process.receive(reply, timeout_ms) {
     Ok(SseDelivered) -> Ok(Nil)
     Ok(SseDeliveryRejected) | Error(_) -> Error(Nil)
+  }
+}
+
+fn release_sse_broker(broker: SseBroker, timeout_ms: Int) -> Result(Nil, Nil) {
+  let SseBroker(subject) = broker
+  let reply = process.new_subject()
+  process.send(subject, ReleaseSseBroker(reply))
+  case process.receive(reply, timeout_ms) {
+    Ok(result) -> result
+    Error(_) -> Error(Nil)
   }
 }
 
@@ -843,17 +1378,22 @@ fn validate_route_headers(
 
 fn validate_custom_parameter_headers(
   req: Request(mist.Connection),
-  server: Server(context),
+  server: server_mod.Server(context),
   route: v2026.HttpRoute,
 ) -> Bool {
   case route.method, route.name, route.arguments {
     "tools/call", Some(name), Some(arguments) ->
-      server.http_custom_headers_valid(server, name, arguments, fn(header_name) {
-        case request.get_header(req, header_name) {
-          Ok(value) -> Some(value)
-          Error(_) -> None
-        }
-      })
+      server_mod.http_custom_headers_valid(
+        server,
+        name,
+        arguments,
+        fn(header_name) {
+          case request.get_header(req, header_name) {
+            Ok(value) -> Some(value)
+            Error(_) -> None
+          }
+        },
+      )
     _, _, _ -> True
   }
 }

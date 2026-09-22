@@ -24,6 +24,12 @@ REQUIRED_DEFINITIONS = {
     "GetPromptResultResponse",
     "CompleteResultResponse",
     "UnsupportedProtocolVersionError",
+    "SubscriptionsListenRequest",
+    "SubscriptionsAcknowledgedNotification",
+    "ResourceUpdatedNotification",
+    "ToolListChangedNotification",
+    "ResourceListChangedNotification",
+    "PromptListChangedNotification",
 }
 REQUIRED_RESULT_DEFINITIONS = {
     "ListResourcesResult",

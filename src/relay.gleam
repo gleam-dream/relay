@@ -20,6 +20,9 @@ pub type ToolNameError =
 pub type ToolMetadata =
   tool.ToolMetadata
 
+pub type ToolAnnotations =
+  tool.ToolAnnotations
+
 pub type ContextTool(context) =
   tool.ContextTool(context)
 
@@ -77,6 +80,40 @@ pub fn tool_name_to_string(name: ToolName) -> String {
 /// Constructs metadata with an optional description.
 pub fn tool_metadata(description: String) -> ToolMetadata {
   tool.tool_metadata(description)
+}
+
+pub fn tool_metadata_with_title(
+  description: String,
+  title: String,
+) -> ToolMetadata {
+  tool.tool_metadata_with_title(description, title)
+}
+
+pub fn tool_metadata_with_annotations(
+  metadata: ToolMetadata,
+  annotations: ToolAnnotations,
+) -> ToolMetadata {
+  tool.tool_metadata_with_annotations(metadata, annotations)
+}
+
+pub fn tool_annotations(
+  title: Option(String),
+  read_only_hint: Option(Bool),
+  destructive_hint: Option(Bool),
+  idempotent_hint: Option(Bool),
+  open_world_hint: Option(Bool),
+) -> ToolAnnotations {
+  tool.tool_annotations(
+    title,
+    read_only_hint,
+    destructive_hint,
+    idempotent_hint,
+    open_world_hint,
+  )
+}
+
+pub fn empty_annotations() -> ToolAnnotations {
+  tool.empty_annotations()
 }
 
 pub fn tool_metadata_requiring_client_capabilities(
@@ -169,6 +206,22 @@ pub fn registry(
   tools: List(ContextTool(context)),
 ) -> Result(Registry(context), RegistryError) {
   tool.registry(tools)
+}
+
+/// Adds a tool to an existing registry, failing if the tool name is already registered.
+pub fn register(
+  registry: Registry(context),
+  tool: ContextTool(context),
+) -> Result(Registry(context), RegistryError) {
+  tool.register(registry, tool)
+}
+
+/// Removes a tool from an existing registry by name.
+pub fn unregister(
+  registry: Registry(context),
+  name: ToolName,
+) -> Registry(context) {
+  tool.unregister(registry, name)
 }
 
 /// Returns tool declarations for the given context.

@@ -30,7 +30,10 @@
     git_head/1,
     send_sse_comment/2,
     set_sse_send_timeout/2,
-    decode_base64_strict/1
+    decode_base64_strict/1,
+    start_stdio_client_port/3,
+    send_stdio_client_command/2,
+    close_stdio_client_port/1
 ]).
 
 send_sse_comment(Connection, Timeout) ->
@@ -393,3 +396,92 @@ git_head(RepoPath) ->
 stop_supervisor(Pid) when is_pid(Pid) ->
     _ = catch sys:terminate(Pid, shutdown, 5000),
     nil.
+
+start_stdio_client_port(CmdBin, ArgsList, GleamSubject) ->
+    Parent = self(),
+    OpenRef = make_ref(),
+    Cmd = binary_to_list(CmdBin),
+    Args = [binary_to_list(A) || A <- ArgsList],
+    case resolve_stdio_executable(Cmd) of
+        {error, Reason} -> {error, Reason};
+        {ok, Executable} ->
+            {Pid, Monitor} = spawn_monitor(fun() ->
+                try erlang:open_port(
+                    {spawn_executable, Executable},
+                    [stream, binary, use_stdio, exit_status, {args, Args}]
+                ) of
+                    Port ->
+                        Parent ! {port_ready, OpenRef, {ok, self()}},
+                        ParentMon = erlang:monitor(process, Parent),
+                        client_port_loop(Port, GleamSubject, ParentMon)
+                catch
+                    Class:OpenReason ->
+                        Parent ! {port_ready, OpenRef,
+                                  {error, printable({Class, OpenReason})}}
+                end
+            end),
+            receive
+                {port_ready, OpenRef, {ok, Pid}} ->
+                    erlang:demonitor(Monitor, [flush]),
+                    {ok, Pid};
+                {port_ready, OpenRef, {error, Reason}} ->
+                    erlang:demonitor(Monitor, [flush]),
+                    {error, Reason};
+                {'DOWN', Monitor, process, Pid, Reason} ->
+                    {error, printable(Reason)}
+            after 5000 ->
+                exit(Pid, kill),
+                {error, <<"stdio child startup timed out">>}
+            end
+    end.
+
+resolve_stdio_executable(Cmd) ->
+    case filename:pathtype(Cmd) of
+        absolute ->
+            case filelib:is_regular(Cmd) of
+                true -> {ok, Cmd};
+                false -> {error, <<"stdio executable does not exist">>}
+            end;
+        relative ->
+            case filename:dirname(Cmd) =:= "." of
+                false ->
+                    case filelib:is_regular(Cmd) of
+                        true -> {ok, filename:absname(Cmd)};
+                        false -> {error, <<"stdio executable does not exist">>}
+                    end;
+                true ->
+                    case os:find_executable(Cmd) of
+                        false -> {error, <<"stdio executable was not found on PATH">>};
+                        Executable -> {ok, Executable}
+                    end
+            end
+    end.
+
+client_port_loop(Port, GleamSubject, ParentMon) ->
+    receive
+        {Port, {data, Data}} ->
+            gleam@erlang@process:send(GleamSubject, {client_port_message, {port_data, Data}}),
+            client_port_loop(Port, GleamSubject, ParentMon);
+        {Port, {exit_status, Status}} ->
+            gleam@erlang@process:send(GleamSubject, {client_port_message, {port_exit, Status}});
+        {command, Bytes} ->
+            Port ! {self(), {command, Bytes}},
+            client_port_loop(Port, GleamSubject, ParentMon);
+        {'DOWN', ParentMon, process, _, _} ->
+            catch erlang:port_close(Port),
+            ok;
+        close ->
+            catch erlang:port_close(Port),
+            ok
+    end.
+
+send_stdio_client_command(Pid, Bytes) ->
+    Pid ! {command, Bytes},
+    ok.
+
+close_stdio_client_port(Pid) ->
+    Pid ! close,
+    ok.
+
+printable(Bin) when is_binary(Bin) -> Bin;
+printable(Term) -> unicode:characters_to_binary(io_lib:format("~p", [Term])).

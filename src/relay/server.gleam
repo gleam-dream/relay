@@ -1,5 +1,6 @@
 import gleam/bit_array
 import gleam/dict.{type Dict}
+import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -21,7 +22,11 @@ import relay/resources.{
   type ResourceError, type ResourceTemplate, ContextResource,
   ContextResourceTemplate,
 }
-import relay/tool.{type DispatchError, type Registry, type ToolName}
+import relay/subscriptions.{type SubscriptionFilter, type Subscriptions}
+import relay/tool.{
+  type ContextTool, type DispatchError, type Registry, type RegistryError,
+  type ToolName,
+}
 
 pub opaque type ExchangeId {
   ExchangeId(Int)
@@ -38,6 +43,10 @@ pub fn exchange_id(n: Int) -> ExchangeId {
 pub fn exchange_id_to_int(id: ExchangeId) -> Int {
   let ExchangeId(n) = id
   n
+}
+
+pub fn exchange_id_to_string(id: ExchangeId) -> String {
+  int.to_string(exchange_id_to_int(id))
 }
 
 /// Returns an HTTP admission error that must be decided before opening an SSE stream.
@@ -226,6 +235,13 @@ pub type ServerInput(context) {
   InvocationFinished(invocation: InvocationId, outcome: InvocationOutcome)
   InvocationProgress(invocation: InvocationId, value: Int)
   ExchangeClosed(exchange: ExchangeId)
+  NotifyResourceUpdated(uri: String)
+  NotifyToolsListChanged
+  NotifyResourcesListChanged
+  NotifyPromptsListChanged
+  RegisterTool(tool: ContextTool(context))
+  UnregisterTool(name: ToolName)
+  TerminateSubscription(id: RequestId)
 }
 
 pub type ServerEffect(context) {
@@ -435,6 +451,11 @@ type ExchangeRecord {
     status: ExchangeStatus,
     latest_progress: Option(Int),
   )
+  StreamExchange(
+    exchange: ExchangeId,
+    request_id: RequestId,
+    filter: SubscriptionFilter,
+  )
   ImmediateExchange(ExchangeId)
   Preclosed(ExchangeId)
 }
@@ -450,6 +471,7 @@ pub opaque type Server(context) {
     completion: Option(ContextCompletion(context)),
     cursor_key: BitArray,
     exchanges: List(ExchangeRecord),
+    subscriptions: Subscriptions,
   )
 }
 
@@ -482,6 +504,7 @@ pub fn server_with_services(
     completion: completion,
     cursor_key: ffi_new_cursor_key(),
     exchanges: [],
+    subscriptions: subscriptions.new(),
   )
 }
 
@@ -510,6 +533,57 @@ pub fn server_with_dispatch(
     completion: None,
     cursor_key: ffi_new_cursor_key(),
     exchanges: [],
+    subscriptions: subscriptions.new(),
+  )
+}
+
+/// Returns a server with a new tool registered, or the registry validation error.
+pub fn register_tool(
+  server: Server(context),
+  new_tool: ContextTool(context),
+) -> Result(Server(context), RegistryError) {
+  case tool.register(server.registry, new_tool) {
+    Error(error) -> Error(error)
+    Ok(next_registry) -> Ok(server_with_registry(server, next_registry))
+  }
+}
+
+/// Returns a server with a tool removed and whether the registry changed.
+pub fn unregister_tool(
+  server: Server(context),
+  name: ToolName,
+) -> #(Server(context), Bool) {
+  case tool.contains(server.registry, name) {
+    False -> #(server, False)
+    True -> #(
+      server_with_registry(server, tool.unregister(server.registry, name)),
+      True,
+    )
+  }
+}
+
+/// Returns the current tools registered on the server.
+pub fn registered_tools(server: Server(context)) -> List(ContextTool(context)) {
+  tool.registered_tools(server.registry)
+}
+
+fn server_with_registry(
+  server: Server(context),
+  registry: Registry(context),
+) -> Server(context) {
+  Server(
+    ..server,
+    registry: registry,
+    dispatch: fn(ctx, name, arguments, input_responses, report_progress) {
+      tool.dispatch_with_inputs(
+        registry,
+        ctx,
+        name,
+        arguments,
+        input_responses,
+        report_progress,
+      )
+    },
   )
 }
 
@@ -526,6 +600,13 @@ pub fn step(
     InvocationProgress(invocation, value) ->
       handle_invocation_progress(server, invocation, value)
     ExchangeClosed(exchange) -> handle_exchange_closed(server, exchange)
+    NotifyResourceUpdated(uri) -> handle_notify_resource_updated(server, uri)
+    NotifyToolsListChanged -> handle_notify_tools_list_changed(server)
+    NotifyResourcesListChanged -> handle_notify_resources_list_changed(server)
+    NotifyPromptsListChanged -> handle_notify_prompts_list_changed(server)
+    RegisterTool(tool) -> handle_register_tool(server, tool)
+    UnregisterTool(name) -> handle_unregister_tool(server, name)
+    TerminateSubscription(id) -> handle_terminate_subscription(server, id)
   }
 }
 
@@ -535,7 +616,9 @@ fn handle_message_received(
   context: context,
   bytes: BitArray,
 ) -> #(Server(context), List(ServerEffect(context))) {
-  let Server(reg, dispatch, _, _, _, _, _, exchanges) = server
+  let reg = server.registry
+  let dispatch = server.dispatch
+  let exchanges = server.exchanges
   case find_exchange(exchanges, exchange) {
     Some(_) -> #(server, [])
     None -> {
@@ -900,6 +983,43 @@ fn handle_message_received(
               }
           }
         }
+        v2026.AdmittedRequest(v2026.SubscriptionsListen(id, _meta, filter)) -> {
+          let has_tools = True
+          let has_resources = server.resources != []
+          let has_prompts = server.prompts != []
+          let honored_filter =
+            subscriptions.filter_supported(
+              filter,
+              has_tools,
+              has_resources,
+              has_prompts,
+            )
+          let owner = exchange_id_to_string(exchange)
+          let next_subs =
+            subscriptions.listen(
+              server.subscriptions,
+              owner,
+              id,
+              honored_filter,
+            )
+          let ack =
+            v2026.encode_subscriptions_acknowledged_notification(
+              id,
+              honored_filter,
+            )
+          let ack_bytes = string_to_bytes(json.to_string(ack) <> "\n")
+          let record = StreamExchange(exchange, id, honored_filter)
+          #(
+            Server(..server, subscriptions: next_subs, exchanges: [
+              record,
+              ..exchanges
+            ]),
+            [
+              EmitRequestAdmitted(exchange, "subscriptions/listen"),
+              Write(exchange, ack_bytes),
+            ],
+          )
+        }
       }
     }
   }
@@ -910,7 +1030,7 @@ fn immediate_disposition(
   exchange: ExchangeId,
   disposition: UnhandledMessage,
 ) -> #(Server(context), List(ServerEffect(context))) {
-  let Server(_, _, _, _, _, _, _, exchanges) = server
+  let exchanges = server.exchanges
   #(Server(..server, exchanges: [ImmediateExchange(exchange), ..exchanges]), [
     Ignore(disposition),
     CloseExchange(exchange),
@@ -923,7 +1043,7 @@ fn immediate_error(
   id: Option(RequestId),
   error: jsonrpc.RpcError,
 ) -> #(Server(context), List(ServerEffect(context))) {
-  let Server(_, _, _, _, _, _, _, exchanges) = server
+  let exchanges = server.exchanges
   let out_bytes =
     string_to_bytes(json.to_string(jsonrpc.error_to_json(id, error)) <> "\n")
   #(Server(..server, exchanges: [ImmediateExchange(exchange), ..exchanges]), [
@@ -939,7 +1059,7 @@ fn immediate_response(
   method: String,
   response: json.Json,
 ) -> #(Server(context), List(ServerEffect(context))) {
-  let Server(_, _, _, _, _, _, _, exchanges) = server
+  let exchanges = server.exchanges
   let out_bytes = string_to_bytes(json.to_string(response) <> "\n")
   #(Server(..server, exchanges: [ImmediateExchange(exchange), ..exchanges]), [
     EmitRequestAdmitted(exchange, method),
@@ -957,7 +1077,7 @@ fn start_invocation(
   method: String,
   work: InvocationWork(context),
 ) -> #(Server(context), List(ServerEffect(context))) {
-  let Server(_, _, _, _, _, _, _, exchanges) = server
+  let exchanges = server.exchanges
   let invocation_id = fresh_invocation()
   let record =
     ActiveExchange(
@@ -1017,7 +1137,7 @@ fn paginate(
   cursor: Option(String),
   items: List(a),
 ) -> Result(#(Server(context), List(a), Option(String)), Nil) {
-  let Server(_, _, _, _, _, _, cursor_key, _) = server
+  let cursor_key = server.cursor_key
   let offset = case cursor {
     None -> Ok(0)
     Some(token) -> ffi_read_cursor(cursor_key, family, token)
@@ -1132,7 +1252,7 @@ fn handle_client_cancellation(
   notify_exchange: ExchangeId,
   target_req_id: RequestId,
 ) -> #(Server(context), List(ServerEffect(context))) {
-  let Server(_, _, _, _, _, _, _, exchanges) = server
+  let exchanges = server.exchanges
   let updated_notify = [ImmediateExchange(notify_exchange), ..exchanges]
   case find_active_by_request_id(exchanges, target_req_id) {
     None -> #(Server(..server, exchanges: updated_notify), [
@@ -1154,6 +1274,22 @@ fn handle_client_cancellation(
         CloseExchange(notify_exchange),
       ])
     }
+    Some(StreamExchange(ex_id, req_id, _)) -> {
+      let owner = exchange_id_to_string(ex_id)
+      let next_subs =
+        subscriptions.close_stream(server.subscriptions, owner, req_id)
+      let next_exchanges =
+        list.filter(updated_notify, fn(rec) {
+          case rec {
+            StreamExchange(target, _, _) -> target != ex_id
+            _ -> True
+          }
+        })
+      #(Server(..server, subscriptions: next_subs, exchanges: next_exchanges), [
+        CloseExchange(ex_id),
+        CloseExchange(notify_exchange),
+      ])
+    }
     Some(_) -> #(Server(..server, exchanges: updated_notify), [
       CloseExchange(notify_exchange),
     ])
@@ -1165,7 +1301,7 @@ fn handle_invocation_finished(
   invocation: InvocationId,
   outcome: InvocationOutcome,
 ) -> #(Server(context), List(ServerEffect(context))) {
-  let Server(_, _, _, _, _, _, _, exchanges) = server
+  let exchanges = server.exchanges
   case find_invocation(exchanges, invocation) {
     Some(ActiveExchange(exchange, request_id, _, Some(_), StatusOpen, _)) -> {
       let updated =
@@ -1208,7 +1344,7 @@ fn handle_invocation_progress(
   invocation: InvocationId,
   value: Int,
 ) -> #(Server(context), List(ServerEffect(context))) {
-  let Server(_, _, _, _, _, _, _, exchanges) = server
+  let exchanges = server.exchanges
   case find_invocation(exchanges, invocation) {
     Some(ActiveExchange(exchange, _, Some(token), _, StatusOpen, latest)) -> {
       case valid_progress(value, latest) {
@@ -1235,7 +1371,7 @@ fn handle_exchange_closed(
   server: Server(context),
   exchange: ExchangeId,
 ) -> #(Server(context), List(ServerEffect(context))) {
-  let Server(_, _, _, _, _, _, _, exchanges) = server
+  let exchanges = server.exchanges
   case find_exchange(exchanges, exchange) {
     None -> #(
       Server(..server, exchanges: [Preclosed(exchange), ..exchanges]),
@@ -1249,7 +1385,185 @@ fn handle_exchange_closed(
         CloseExchange(exchange),
       ])
     }
+    Some(StreamExchange(ex, req_id, _)) -> {
+      let owner = exchange_id_to_string(ex)
+      let next_subs =
+        subscriptions.close_stream(server.subscriptions, owner, req_id)
+      let next =
+        list.filter(exchanges, fn(rec) {
+          case rec {
+            StreamExchange(target, _, _) -> target != exchange
+            _ -> True
+          }
+        })
+      #(Server(..server, subscriptions: next_subs, exchanges: next), [
+        CloseExchange(exchange),
+      ])
+    }
     Some(_) -> #(server, [])
+  }
+}
+
+fn handle_notify_resource_updated(
+  server: Server(context),
+  uri: String,
+) -> #(Server(context), List(ServerEffect(context))) {
+  let subscribers =
+    subscriptions.stream_subscribers_for_resource(server.subscriptions, uri)
+  let effects =
+    list.filter_map(subscribers, fn(pair) {
+      let #(owner, sub_id) = pair
+      case find_stream_exchange(server.exchanges, owner, sub_id) {
+        Some(ex) -> {
+          let notif = v2026.encode_resource_updated_notification(sub_id, uri)
+          let bytes = string_to_bytes(json.to_string(notif) <> "\n")
+          Ok(Write(ex, bytes))
+        }
+        None -> Error(Nil)
+      }
+    })
+  #(server, effects)
+}
+
+fn handle_notify_tools_list_changed(
+  server: Server(context),
+) -> #(Server(context), List(ServerEffect(context))) {
+  let subscribers =
+    subscriptions.stream_subscribers_for_tools(server.subscriptions)
+  let effects =
+    list.filter_map(subscribers, fn(pair) {
+      let #(owner, sub_id) = pair
+      case find_stream_exchange(server.exchanges, owner, sub_id) {
+        Some(ex) -> {
+          let notif = v2026.encode_tools_list_changed_notification(sub_id)
+          let bytes = string_to_bytes(json.to_string(notif) <> "\n")
+          Ok(Write(ex, bytes))
+        }
+        None -> Error(Nil)
+      }
+    })
+  #(server, effects)
+}
+
+fn handle_notify_resources_list_changed(
+  server: Server(context),
+) -> #(Server(context), List(ServerEffect(context))) {
+  let subscribers =
+    subscriptions.stream_subscribers_for_resources(server.subscriptions)
+  let effects =
+    list.filter_map(subscribers, fn(pair) {
+      let #(owner, sub_id) = pair
+      case find_stream_exchange(server.exchanges, owner, sub_id) {
+        Some(ex) -> {
+          let notif = v2026.encode_resources_list_changed_notification(sub_id)
+          let bytes = string_to_bytes(json.to_string(notif) <> "\n")
+          Ok(Write(ex, bytes))
+        }
+        None -> Error(Nil)
+      }
+    })
+  #(server, effects)
+}
+
+fn handle_notify_prompts_list_changed(
+  server: Server(context),
+) -> #(Server(context), List(ServerEffect(context))) {
+  let subscribers =
+    subscriptions.stream_subscribers_for_prompts(server.subscriptions)
+  let effects =
+    list.filter_map(subscribers, fn(pair) {
+      let #(owner, sub_id) = pair
+      case find_stream_exchange(server.exchanges, owner, sub_id) {
+        Some(ex) -> {
+          let notif = v2026.encode_prompts_list_changed_notification(sub_id)
+          let bytes = string_to_bytes(json.to_string(notif) <> "\n")
+          Ok(Write(ex, bytes))
+        }
+        None -> Error(Nil)
+      }
+    })
+  #(server, effects)
+}
+
+fn handle_register_tool(
+  server: Server(context),
+  new_tool: ContextTool(context),
+) -> #(Server(context), List(ServerEffect(context))) {
+  case register_tool(server, new_tool) {
+    Ok(next_server) -> {
+      let #(updated, effects) = handle_notify_tools_list_changed(next_server)
+      #(updated, effects)
+    }
+    Error(_) -> #(server, [])
+  }
+}
+
+fn handle_unregister_tool(
+  server: Server(context),
+  name: ToolName,
+) -> #(Server(context), List(ServerEffect(context))) {
+  let #(next_server, changed) = unregister_tool(server, name)
+  case changed {
+    True -> handle_notify_tools_list_changed(next_server)
+    False -> #(server, [])
+  }
+}
+
+fn handle_terminate_subscription(
+  server: Server(context),
+  id: RequestId,
+) -> #(Server(context), List(ServerEffect(context))) {
+  case find_stream_by_request_id(server.exchanges, id) {
+    Some(StreamExchange(ex, req_id, _)) -> {
+      let owner = exchange_id_to_string(ex)
+      let next_subs =
+        subscriptions.close_stream(server.subscriptions, owner, req_id)
+      let next_exchanges =
+        list.filter(server.exchanges, fn(rec) {
+          case rec {
+            StreamExchange(target, _, _) -> target != ex
+            _ -> True
+          }
+        })
+      let resp = v2026.encode_subscriptions_listen_result_response(req_id)
+      let bytes = string_to_bytes(json.to_string(resp) <> "\n")
+      #(Server(..server, subscriptions: next_subs, exchanges: next_exchanges), [
+        Write(ex, bytes),
+        CloseExchange(ex),
+      ])
+    }
+    _ -> #(server, [])
+  }
+}
+
+fn find_stream_exchange(
+  exchanges: List(ExchangeRecord),
+  target_owner: String,
+  target_id: RequestId,
+) -> Option(ExchangeId) {
+  case exchanges {
+    [] -> None
+    [StreamExchange(ex, id, _), ..rest] ->
+      case exchange_id_to_string(ex) == target_owner && id == target_id {
+        True -> Some(ex)
+        False -> find_stream_exchange(rest, target_owner, target_id)
+      }
+    [_, ..rest] -> find_stream_exchange(rest, target_owner, target_id)
+  }
+}
+
+fn find_stream_by_request_id(
+  exchanges: List(ExchangeRecord),
+  target_id: RequestId,
+) -> Option(ExchangeRecord) {
+  case exchanges {
+    [] -> None
+    [StreamExchange(_, id, _) as rec, ..rest] ->
+      case id == target_id {
+        True -> Some(rec)
+        False -> find_stream_by_request_id(rest, target_id)
+      }
+    [_, ..rest] -> find_stream_by_request_id(rest, target_id)
   }
 }
 
@@ -1267,6 +1581,11 @@ fn find_exchange(
   case exchanges {
     [] -> None
     [ActiveExchange(id, _, _, _, _, _) as r, ..rest] ->
+      case id == target {
+        True -> Some(r)
+        False -> find_exchange(rest, target)
+      }
+    [StreamExchange(id, _, _) as r, ..rest] ->
       case id == target {
         True -> Some(r)
         False -> find_exchange(rest, target)
@@ -1306,6 +1625,11 @@ fn find_active_by_request_id(
   case exchanges {
     [] -> None
     [ActiveExchange(_, req_id, _, _, StatusOpen, _) as r, ..rest] ->
+      case req_id == target_id {
+        True -> Some(r)
+        False -> find_active_by_request_id(rest, target_id)
+      }
+    [StreamExchange(_, req_id, _) as r, ..rest] ->
       case req_id == target_id {
         True -> Some(r)
         False -> find_active_by_request_id(rest, target_id)
