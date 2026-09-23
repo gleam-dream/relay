@@ -1,0 +1,2 @@
+json_blueprint=ecf5c60bc77a0d30cded619519d07ba7ef8a4f1d
+sinal=13105bb017a20a50505a9695464fc07fd288f80d

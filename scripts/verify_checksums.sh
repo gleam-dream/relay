@@ -22,8 +22,19 @@ fi
 echo "PASS: MCP 2026-07-28 schema checksum matches ($ACTUAL_SCHEMA_SHA256)"
 
 echo "==> Verifying sibling dependency pins..."
+PINS_FILE="$ROOT/sibling-revisions.txt"
+if [ ! -f "$PINS_FILE" ] || [ "$(wc -l < "$PINS_FILE")" -ne 2 ]; then
+    echo "FAIL: sibling-revisions.txt must contain exactly two pinned revisions" >&2
+    exit 1
+fi
+EXPECTED_BLUEPRINT_HEAD="$(sed -n 's/^json_blueprint=//p' "$PINS_FILE")"
+EXPECTED_SINAL_HEAD="$(sed -n 's/^sinal=//p' "$PINS_FILE")"
+if [[ ! "$EXPECTED_BLUEPRINT_HEAD" =~ ^[0-9a-f]{40}$ ]] || [[ ! "$EXPECTED_SINAL_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "FAIL: sibling-revisions.txt must contain full lowercase Git commit IDs" >&2
+    exit 1
+fi
+
 # json_blueprint pin
-EXPECTED_BLUEPRINT_HEAD="ca50b5a915aaa5e38ef68ff70b102f2dd3f2fe67"
 ACTUAL_BLUEPRINT_HEAD="$(git -C "$ROOT/../json_blueprint" rev-parse HEAD)"
 if [ "$ACTUAL_BLUEPRINT_HEAD" != "$EXPECTED_BLUEPRINT_HEAD" ]; then
     echo "FAIL: json_blueprint git head mismatch: got $ACTUAL_BLUEPRINT_HEAD, expected $EXPECTED_BLUEPRINT_HEAD" >&2
@@ -36,7 +47,6 @@ fi
 echo "PASS: json_blueprint pin matches (commit $ACTUAL_BLUEPRINT_HEAD, version 1.7.1, MIT)"
 
 # sinal pin
-EXPECTED_SINAL_HEAD="1c50c93a3a93569eb60a246475261e20430018b7"
 ACTUAL_SINAL_HEAD="$(git -C "$ROOT/../sinal" rev-parse HEAD)"
 if [ "$ACTUAL_SINAL_HEAD" != "$EXPECTED_SINAL_HEAD" ]; then
     echo "FAIL: sinal git head mismatch: got $ACTUAL_SINAL_HEAD, expected $EXPECTED_SINAL_HEAD" >&2

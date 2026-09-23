@@ -26,10 +26,21 @@ pub fn mcp_frozen_schema_checksum_test() {
   )
 }
 
+fn expected_sibling_heads() -> #(String, String) {
+  let assert Ok(bytes) = ffi_read_file("sibling-revisions.txt")
+  let assert Ok(source) = bit_array.to_string(bytes)
+  let assert [blueprint_line, sinal_line, ""] = string.split(source, on: "\n")
+  let assert ["json_blueprint", blueprint_head] =
+    string.split(blueprint_line, on: "=")
+  let assert ["sinal", sinal_head] = string.split(sinal_line, on: "=")
+  #(blueprint_head, sinal_head)
+}
+
 pub fn sibling_blueprint_pin_test() {
   // Sibling git head
   let head = ffi_git_head("../json_blueprint")
-  head |> should.equal("ca50b5a915aaa5e38ef68ff70b102f2dd3f2fe67")
+  let #(expected, _) = expected_sibling_heads()
+  head |> should.equal(expected)
 
   // Sibling package version and license
   let assert Ok(manifest_bytes) = ffi_read_file("../json_blueprint/gleam.toml")
@@ -43,7 +54,8 @@ pub fn sibling_blueprint_pin_test() {
 pub fn sibling_sinal_pin_test() {
   // Sibling git head
   let head = ffi_git_head("../sinal")
-  head |> should.equal("1c50c93a3a93569eb60a246475261e20430018b7")
+  let #(_, expected) = expected_sibling_heads()
+  head |> should.equal(expected)
 
   // Sibling package version
   let assert Ok(manifest_bytes) = ffi_read_file("../sinal/gleam.toml")
