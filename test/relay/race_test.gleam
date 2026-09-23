@@ -17,6 +17,17 @@ pub fn main() -> Nil {
   gleeunit.main()
 }
 
+fn send_output_to(
+  subject: Subject(BitArray),
+  output: runtime.RuntimeOutput,
+) -> Result(Nil, Nil) {
+  case output {
+    runtime.OutputWrite(_, bytes) -> process.send(subject, bytes)
+    runtime.OutputClose(_) -> Nil
+  }
+  Ok(Nil)
+}
+
 @external(erlang, "erlang", "self")
 fn ffi_self() -> dynamic.Dynamic
 
@@ -149,7 +160,7 @@ pub fn equal_wire_ids_race_test() {
     let reg = sample_registry()
     let s = server.server(reg)
     let box: Subject(BitArray) = process.new_subject()
-    let sink = fn(bytes: BitArray) { process.send(box, bytes) }
+    let sink = fn(output) { send_output_to(box, output) }
     let cfg = runtime.default_config()
 
     let assert Ok(rt) = runtime.start(s, cfg, sink)
@@ -206,7 +217,7 @@ pub fn cancel_before_start_race_test() {
   let reg = sample_registry()
   let s = server.server(reg)
   let box: Subject(BitArray) = process.new_subject()
-  let sink = fn(bytes: BitArray) { process.send(box, bytes) }
+  let sink = fn(output) { send_output_to(box, output) }
   let cfg = runtime.default_config()
 
   let assert Ok(rt) = runtime.start(s, cfg, sink)
@@ -231,7 +242,7 @@ pub fn cancel_racing_completion_test() {
     let reg = slow_registry(30)
     let s = server.server(reg)
     let box: Subject(BitArray) = process.new_subject()
-    let sink = fn(bytes: BitArray) { process.send(box, bytes) }
+    let sink = fn(output) { send_output_to(box, output) }
     let cfg = runtime.default_config()
 
     let assert Ok(rt) = runtime.start(s, cfg, sink)
@@ -270,7 +281,7 @@ pub fn late_completion_after_cancel_test() {
   let reg = slow_registry(100)
   let s = server.server(reg)
   let box: Subject(BitArray) = process.new_subject()
-  let sink = fn(bytes: BitArray) { process.send(box, bytes) }
+  let sink = fn(output) { send_output_to(box, output) }
   let cfg = runtime.default_config()
 
   let assert Ok(rt) = runtime.start(s, cfg, sink)
@@ -303,7 +314,7 @@ pub fn stale_callback_after_owner_replacement_test() {
   let reg = slow_registry(150)
   let s = server.server(reg)
   let box: Subject(BitArray) = process.new_subject()
-  let sink = fn(bytes: BitArray) { process.send(box, bytes) }
+  let sink = fn(output) { send_output_to(box, output) }
   let cfg = runtime.default_config()
 
   let assert Ok(rt1) = runtime.start(s, cfg, sink)
@@ -337,7 +348,7 @@ pub fn simultaneous_handler_completion_test() {
     let reg = sample_registry()
     let s = server.server(reg)
     let box: Subject(BitArray) = process.new_subject()
-    let sink = fn(bytes: BitArray) { process.send(box, bytes) }
+    let sink = fn(output) { send_output_to(box, output) }
     let cfg =
       RuntimeConfig(
         max_frame_bytes: 65_536,
@@ -378,7 +389,7 @@ pub fn repeated_close_idempotency_test() {
   let reg = sample_registry()
   let s = server.server(reg)
   let box: Subject(BitArray) = process.new_subject()
-  let sink = fn(bytes: BitArray) { process.send(box, bytes) }
+  let sink = fn(output) { send_output_to(box, output) }
   let cfg = runtime.default_config()
 
   let assert Ok(rt) = runtime.start(s, cfg, sink)

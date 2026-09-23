@@ -36,6 +36,7 @@ pub type HttpPolicy {
     max_body_bytes: Int,
     max_response_bytes: Int,
     request_timeout_ms: Int,
+    sse_keepalive_ms: Int,
     allowed_hosts: List(String),
     allowed_origins: List(String),
   )
@@ -415,6 +416,7 @@ pub fn local_http_policy(host: String) -> HttpPolicy {
     max_body_bytes: 1_048_576,
     max_response_bytes: 1_048_576,
     request_timeout_ms: 30_000,
+    sse_keepalive_ms: 250,
     allowed_hosts: [string.lowercase(host), "localhost", "127.0.0.1", "::1"],
     allowed_origins: [
       "http://localhost",
@@ -504,6 +506,7 @@ fn valid_policy(policy: HttpPolicy) -> Bool {
   policy.max_body_bytes > 0
   && policy.max_response_bytes > 0
   && policy.request_timeout_ms > 0
+  && policy.sse_keepalive_ms > 0
   && policy.allowed_hosts != []
 }
 
@@ -795,8 +798,12 @@ fn handle_buffered_request(
       tombstone_retention_ms: 1000,
     )
   case
-    runtime.start(server, config, fn(bytes) {
-      process.send(reply_subject, bytes)
+    runtime.start(server, config, fn(output) {
+      case output {
+        runtime.OutputWrite(_, bytes) -> process.send(reply_subject, bytes)
+        runtime.OutputClose(_) -> Nil
+      }
+      Ok(Nil)
     })
   {
     Error(_) -> plain_response(500, "Relay runtime failed to start")
@@ -870,8 +877,12 @@ fn handle_live_sse_request(
           tombstone_retention_ms: 1000,
         )
       case
-        runtime.start_with_status_sink(server, config, fn(bytes) {
-          sse_broker_deliver(broker, bytes, policy.request_timeout_ms)
+        runtime.start(server, config, fn(output) {
+          case output {
+            runtime.OutputWrite(_, bytes) ->
+              sse_broker_deliver(broker, bytes, policy.request_timeout_ms)
+            runtime.OutputClose(_) -> Ok(Nil)
+          }
         })
       {
         Error(_) -> {
@@ -882,11 +893,11 @@ fn handle_live_sse_request(
           let ready_subject = process.new_subject()
           let init = fn(actor_subject) {
             process.send(ready_subject, actor_subject)
-            process.send_after(actor_subject, 250, SseProbe)
+            process.send_after(actor_subject, policy.sse_keepalive_ms, SseProbe)
             SseActorLoopState(
               subject: actor_subject,
               control: control,
-              probe_interval_ms: 250,
+              probe_interval_ms: policy.sse_keepalive_ms,
               write_timeout_ms: policy.request_timeout_ms,
             )
           }

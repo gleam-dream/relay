@@ -7,6 +7,7 @@ import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
+import gleam/result
 import gleam/string
 import relay/transport/stdio.{
   type Framer, type FramerResult, Frame, FrameOversized, InvalidTrailingBytes,
@@ -32,12 +33,18 @@ pub opaque type Client {
 
 type ClientMessage {
   OpenPort(String, List(String), Subject(Result(Pid, String)))
-  Request(BitArray, String, Int, Subject(Result(BitArray, String)))
+  Request(BitArray, String, Int, Subject(Result(BitArray, RequestFailure)))
   Subscribe(BitArray, String, Int, Subject(Result(BitArray, String)))
   NextNotification(String, Int, Subject(Result(BitArray, String)))
   CancelSubscription(String, Subject(Nil))
   ClientPortMessage(PortMessage)
   CloseClient(Subject(Nil))
+}
+
+pub type RequestFailure {
+  Closed
+  Cancelled
+  Failed(String)
 }
 
 type PortMessage {
@@ -129,11 +136,29 @@ pub fn request(
   timeout_ms: Int,
   max_response_bytes: Int,
 ) -> Result(BitArray, String) {
+  request_typed(client, request, expected_id, timeout_ms, max_response_bytes)
+  |> result.map_error(fn(failure) {
+    case failure {
+      Closed -> "stdio client is closed"
+      Cancelled -> "stdio client closed"
+      Failed(reason) -> reason
+    }
+  })
+}
+
+/// Reports closure and explicit close during a request without reading messages.
+pub fn request_typed(
+  client: Client,
+  request: BitArray,
+  expected_id: String,
+  timeout_ms: Int,
+  max_response_bytes: Int,
+) -> Result(BitArray, RequestFailure) {
   let Client(subject) = client
   process.call(subject, waiting: timeout_ms + 1000, sending: fn(reply) {
     Request(request, expected_id, timeout_ms, reply)
   })
-  |> result_limit(max_response_bytes)
+  |> result_limit_typed(max_response_bytes)
 }
 
 /// Opens a long-lived subscriptions/listen exchange and returns its
@@ -215,6 +240,23 @@ fn result_limit(
   }
 }
 
+fn result_limit_typed(
+  result: Result(BitArray, RequestFailure),
+  max_response_bytes: Int,
+) -> Result(BitArray, RequestFailure) {
+  case result {
+    Error(reason) -> Error(reason)
+    Ok(frame) ->
+      case bit_array.byte_size(frame) > max_response_bytes {
+        True ->
+          Error(Failed(
+            "stdio client response exceeds its configured byte limit",
+          ))
+        False -> Ok(frame)
+      }
+  }
+}
+
 fn start_actor(max_frame_bytes: Int) -> Result(Client, actor.StartError) {
   let builder =
     actor.new_with_initialiser(5000, fn(subject) {
@@ -256,7 +298,7 @@ fn handle_client_message(
     Request(bytes, expected_id, timeout_ms, reply) ->
       case state.port_owner {
         None -> {
-          process.send(reply, Error("stdio client is closed"))
+          process.send(reply, Error(Closed))
           actor.continue(state)
         }
         Some(port_owner) -> {
@@ -266,9 +308,14 @@ fn handle_client_message(
           )
           let deadline = ffi_monotonic_time_ms() + timeout_ms
           case await_response(state, deadline, expected_id, []) {
-            Error(AwaitError(reason, _failed_state, queued, close_requested, _)) -> {
+            Error(AwaitError(reason, failed_state, queued, close_requested, _)) -> {
               ffi_close_stdio_client_port(port_owner)
-              process.send(reply, Error(reason))
+              let failure = case close_requested, failed_state.port_owner {
+                True, _ -> Cancelled
+                False, None -> Closed
+                False, Some(_) -> Failed(reason)
+              }
+              process.send(reply, Error(failure))
               case close_requested {
                 True -> {
                   reject_queued_calls(queued, reason)
@@ -537,7 +584,7 @@ fn await_response(
             Ok(ClientPortMessage(PortExit(status))) ->
               Error(AwaitError(
                 "stdio child exited with status " <> int.to_string(status),
-                state,
+                ClientState(..state, port_owner: None),
                 queued,
                 False,
                 False,
@@ -797,7 +844,7 @@ fn reject_queued_calls(queued: List(ClientMessage), reason: String) -> Nil {
   list.each(queued, fn(message) {
     case message {
       OpenPort(_, _, reply) -> process.send(reply, Error(reason))
-      Request(_, _, _, reply) -> process.send(reply, Error(reason))
+      Request(_, _, _, reply) -> process.send(reply, Error(Cancelled))
       Subscribe(_, _, _, reply) -> process.send(reply, Error(reason))
       NextNotification(_, _, reply) -> process.send(reply, Error(reason))
       CancelSubscription(_, reply) -> process.send(reply, Nil)

@@ -2,6 +2,7 @@ import gleam/dict.{type Dict}
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 
 pub type CompletionRef {
   PromptRef(name: String)
@@ -41,10 +42,11 @@ pub type ContextCompletion(context) {
 
 pub fn completion(
   complete: fn(context, CompletionRef, CompletionArgument) ->
-    Result(CompletionValues, CompletionError),
+    Result(CompletionValues, application_error),
 ) -> ContextCompletion(context) {
   ContextCompletion(fn(context, reference, argument, _context) {
     complete(context, reference, argument)
+    |> result.map_error(fn(_) { CompletionFailed("Completion handler failed") })
   })
 }
 

@@ -3,6 +3,7 @@
     open/4,
     open_with_ca/5,
     request/8,
+    request_typed/8,
     open_sse/6,
     next_sse/2,
     close_sse/1,
@@ -42,6 +43,13 @@ open_with_ca(HostBin, Port, Secure, CaCertFileBin, Timeout) ->
     end.
 
 request(Pid, PathBin, Body, MethodBin, NameBin, VersionBin, Timeout, Limit) ->
+    case request_typed(Pid, PathBin, Body, MethodBin, NameBin, VersionBin, Timeout, Limit) of
+        {error, Failure} -> {error, failure_text(Failure)};
+        Success -> Success
+    end.
+
+request_typed(Pid, PathBin, Body, MethodBin, NameBin, VersionBin, Timeout, Limit) ->
+    Monitor = erlang:monitor(process, Pid),
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
     BaseHeaders = [
         {<<"content-type">>, <<"application/json">>},
@@ -56,46 +64,50 @@ request(Pid, PathBin, Body, MethodBin, NameBin, VersionBin, Timeout, Limit) ->
     Flow = 1,
     try gun:request(Pid, <<"POST">>, PathBin, Headers, Body,
                     #{reply_to => self(), flow => Flow}) of
-        StreamRef -> await_response(Pid, StreamRef, Deadline, Limit, undefined, <<>>)
+        StreamRef -> await_response(Pid, StreamRef, Monitor, Deadline, Limit, undefined, <<>>)
     catch
-        Class:CatchReason -> {error, printable({Class, CatchReason})}
+        Class:CatchReason -> {error, {transport_fault, printable({Class, CatchReason})}}
+    after
+        erlang:demonitor(Monitor, [flush])
     end.
 
-await_response(Pid, StreamRef, Deadline, Limit, undefined, Acc) ->
+await_response(Pid, StreamRef, Monitor, Deadline, Limit, undefined, Acc) ->
     receive
         {gun_response, Pid, StreamRef, IsFin, Status, _Headers} ->
             case IsFin of
                 fin -> {ok, {Status, Acc}};
-                nofin -> await_response(Pid, StreamRef, Deadline, Limit, Status, Acc)
+                nofin -> await_response(Pid, StreamRef, Monitor, Deadline, Limit, Status, Acc)
             end;
-        {gun_error, Pid, StreamRef, Reason} -> {error, printable(Reason)};
-        {gun_down, Pid, _Protocol, Reason, _KilledStreams} -> connection_failure(Reason)
+        {gun_error, Pid, StreamRef, Reason} -> {error, gun_failure(Reason)};
+        {gun_down, Pid, _Protocol, Reason, _KilledStreams} -> connection_failure(Reason);
+        {'DOWN', Monitor, process, Pid, Reason} -> connection_failure(Reason)
     after remaining_timeout(Deadline) ->
         catch gun:cancel(Pid, StreamRef),
-        {error, <<"request timed out">>}
+        {error, request_timed_out}
     end;
-await_response(Pid, StreamRef, Deadline, Limit, Status, Acc) ->
+await_response(Pid, StreamRef, Monitor, Deadline, Limit, Status, Acc) ->
     receive
         {gun_data, Pid, StreamRef, IsFin, Data} ->
             NewSize = byte_size(Acc) + byte_size(Data),
             case NewSize > Limit of
                 true ->
                     catch gun:cancel(Pid, StreamRef),
-                    {error, <<"response exceeded configured byte limit">>};
+                    {error, response_limit_exceeded};
                 false ->
                     NewAcc = <<Acc/binary, Data/binary>>,
                     case IsFin of
                         fin -> {ok, {Status, NewAcc}};
                         nofin ->
                             ok = gun:update_flow(Pid, StreamRef, 1),
-                            await_response(Pid, StreamRef, Deadline, Limit, Status, NewAcc)
+                            await_response(Pid, StreamRef, Monitor, Deadline, Limit, Status, NewAcc)
                     end
             end;
-        {gun_error, Pid, StreamRef, Reason} -> {error, printable(Reason)};
-        {gun_down, Pid, _Protocol, Reason, _KilledStreams} -> connection_failure(Reason)
+        {gun_error, Pid, StreamRef, Reason} -> {error, gun_failure(Reason)};
+        {gun_down, Pid, _Protocol, Reason, _KilledStreams} -> connection_failure(Reason);
+        {'DOWN', Monitor, process, Pid, Reason} -> connection_failure(Reason)
     after remaining_timeout(Deadline) ->
         catch gun:cancel(Pid, StreamRef),
-        {error, <<"request timed out">>}
+        {error, request_timed_out}
     end.
 
 open_sse(Pid, PathBin, Body, VersionBin, Timeout, Limit) ->
@@ -394,6 +406,14 @@ unique_integer() -> erlang:unique_integer([positive, monotonic]).
 printable(Reason) when is_binary(Reason) -> Reason;
 printable(Reason) -> unicode:characters_to_binary(io_lib:format("~0p", [Reason])).
 
-connection_failure(shutdown) -> {error, <<"cancelled">>};
-connection_failure(normal) -> {error, <<"cancelled">>};
-connection_failure(Reason) -> {error, printable(Reason)}.
+connection_failure(_Reason) -> {error, connection_closed}.
+
+gun_failure(cancelled) -> request_cancelled;
+gun_failure({cancelled, _}) -> request_cancelled;
+gun_failure(Reason) -> {transport_fault, printable(Reason)}.
+
+failure_text(connection_closed) -> <<"connection closed">>;
+failure_text(request_cancelled) -> <<"request cancelled">>;
+failure_text(request_timed_out) -> <<"request timed out">>;
+failure_text(response_limit_exceeded) -> <<"response exceeded configured byte limit">>;
+failure_text({transport_fault, Message}) -> Message.

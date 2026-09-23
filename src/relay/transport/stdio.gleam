@@ -10,6 +10,8 @@ import relay/server.{type Server}
 import relay/telemetry
 
 pub type StdioError {
+  InvalidChunkSize(Int)
+  InvalidRuntimeConfig(runtime.RuntimeConfigError)
   IoError(String)
   StdoutBroken(String)
   StartupFailed(String)
@@ -260,6 +262,14 @@ pub fn run_local_unprotected_stdio_server(
   config: LocalUnprotectedStdioConfig,
   context: context,
 ) -> Result(Nil, StdioError) {
+  use _ <- result.try(case config.chunk_size > 0 {
+    True -> Ok(Nil)
+    False -> Error(InvalidChunkSize(config.chunk_size))
+  })
+  use _ <- result.try(
+    runtime.validate_config(config.runtime_config)
+    |> result.map_error(InvalidRuntimeConfig),
+  )
   use _ <- result.try(case ffi_set_stdio_binary() {
     Ok(Nil) -> Ok(Nil)
     Error(err) -> Error(IoError(err))
@@ -283,13 +293,17 @@ pub fn run_local_unprotected_stdio_server(
   )
 
   let write_error_box = process.new_subject()
-  let write_sink = fn(bytes) {
-    case write_bytes(writer, bytes) {
-      Ok(Nil) -> Nil
-      Error(err) -> {
-        process.send(write_error_box, err)
-        Nil
-      }
+  let write_sink = fn(output) {
+    case output {
+      runtime.OutputClose(_) -> Ok(Nil)
+      runtime.OutputWrite(_, bytes) ->
+        case write_bytes(writer, bytes) {
+          Ok(Nil) -> Ok(Nil)
+          Error(err) -> {
+            process.send(write_error_box, err)
+            Error(Nil)
+          }
+        }
     }
   }
 

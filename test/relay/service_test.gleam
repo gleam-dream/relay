@@ -20,13 +20,43 @@ pub fn main() -> Nil {
   gleeunit.main()
 }
 
+pub type ApplicationFailure {
+  Denied
+}
+
+pub fn simple_service_handlers_accept_private_application_errors_test() {
+  let resources.ContextResource(_, read) =
+    resources.resource("urn:private", "private", fn(_ctx: Nil, _uri) {
+      Error(Denied)
+    })
+  read(Nil, "urn:private")
+  |> should.equal(Error(resources.ResourceFailed("Resource handler failed")))
+
+  let assert prompts.ContextPrompt(_, get) =
+    prompts.prompt("private", [], fn(_ctx: Nil, _arguments) { Error(Denied) })
+  get(Nil, dict.new())
+  |> should.equal(Error(prompts.PromptFailed("Prompt handler failed")))
+
+  let completion.ContextCompletion(complete) =
+    completion.completion(fn(_ctx: Nil, _ref, _argument) { Error(Denied) })
+  complete(
+    Nil,
+    completion.PromptRef("private"),
+    completion.CompletionArgument("input", "a"),
+    None,
+  )
+  |> should.equal(
+    Error(completion.CompletionFailed("Completion handler failed")),
+  )
+}
+
 fn sample_server() -> server.Server(String) {
   let assert Ok(registry) = tool.registry([])
   let resource =
     resources.resource("memory://notes/1", "note", fn(_context, uri) {
       Ok([content.TextResourceContents(uri, "the note", Some("text/plain"))])
     })
-  let template =
+  let assert Ok(template) =
     resources.resource_template(
       "memory://notes/{id}",
       "note by id",

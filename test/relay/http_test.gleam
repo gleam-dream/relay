@@ -105,12 +105,24 @@ fn empty_server() -> server.Server(Nil) {
   server.server(registry)
 }
 
+pub fn invalid_keepalive_rejected_before_listener_start_test() {
+  let policy =
+    http.HttpPolicy(..http.local_http_policy("127.0.0.1"), sse_keepalive_ms: 0)
+  http.listener(empty_server(), fn() { Nil })
+  |> http.with_policy(policy)
+  |> http.start()
+  |> should.equal(Error(
+    "Invalid Relay HTTP listener options, policy, or TLS settings",
+  ))
+}
+
 pub fn streamable_http_loopback_test() {
   let policy =
     http.HttpPolicy(
       max_body_bytes: 512,
       max_response_bytes: 4096,
       request_timeout_ms: 2000,
+      sse_keepalive_ms: 250,
       allowed_hosts: ["127.0.0.1"],
       allowed_origins: ["http://127.0.0.1"],
     )
@@ -293,6 +305,7 @@ pub fn streamable_http_loopback_test() {
       max_body_bytes: 512,
       max_response_bytes: 1,
       request_timeout_ms: 2000,
+      sse_keepalive_ms: 250,
       allowed_hosts: ["127.0.0.1"],
       allowed_origins: ["http://127.0.0.1"],
     )
@@ -347,6 +360,7 @@ pub fn live_sse_progress_burst_disconnect_cancels_worker_test() {
       max_body_bytes: 512,
       max_response_bytes: 4096,
       request_timeout_ms: 1000,
+      sse_keepalive_ms: 250,
       allowed_hosts: ["127.0.0.1"],
       allowed_origins: ["http://127.0.0.1"],
     )

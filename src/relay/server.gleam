@@ -21,7 +21,6 @@ import relay/protocol/jsonrpc.{type ProgressToken, type RequestId}
 import relay/resources.{
   type ContextResource, type ContextResourceTemplate, type Resource,
   type ResourceError, type ResourceTemplate, ContextResource,
-  ContextResourceTemplate,
 }
 import relay/subscriptions.{type SubscriptionFilter}
 import relay/tool.{
@@ -475,8 +474,14 @@ type ExchangeRecord {
 pub opaque type Server(context) {
   Server(
     registry: Registry(context),
-    dispatch: fn(context, ToolName, Value, Option(Value), tool.ProgressReporter) ->
-      Result(tool.ToolOutput, DispatchError),
+    dispatch: fn(
+      Registry(context),
+      context,
+      ToolName,
+      Value,
+      Option(Value),
+      tool.ProgressReporter,
+    ) -> Result(tool.ToolOutput, DispatchError),
     resources: List(ContextResource(context)),
     resource_templates: List(ContextResourceTemplate(context)),
     prompts: List(ContextPrompt(context)),
@@ -490,9 +495,16 @@ pub opaque type Server(context) {
 pub fn server(registry: Registry(context)) -> Server(context) {
   Server(
     registry: registry,
-    dispatch: fn(ctx, name, args, input_responses, report_progress) {
+    dispatch: fn(
+      current_registry,
+      ctx,
+      name,
+      args,
+      input_responses,
+      report_progress,
+    ) {
       tool.dispatch_with_inputs(
-        registry,
+        current_registry,
         ctx,
         name,
         args,
@@ -542,33 +554,20 @@ pub fn with_completion(
   Server(..server, completion: completion)
 }
 
-pub fn server_with_dispatch(
-  registry: Registry(context),
-  dispatch: fn(context, ToolName, Value) -> Result(Value, DispatchError),
-) -> Server(context) {
-  let dispatch_with_content = fn(
+/// Replaces tool dispatch while passing the current registry on every call.
+/// Registry updates preserve this callback and are visible to later invocations.
+pub fn with_dispatch(
+  server: Server(context),
+  dispatch: fn(
+    Registry(context),
     context,
-    name,
-    args,
-    _input_responses,
-    _report_progress,
-  ) {
-    case dispatch(context, name, args) {
-      Ok(value) -> Ok(tool.StructuredWithContent(value, []))
-      Error(error) -> Error(error)
-    }
-  }
-  Server(
-    registry: registry,
-    dispatch: dispatch_with_content,
-    resources: [],
-    resource_templates: [],
-    prompts: [],
-    completion: None,
-    cursor_key: ffi_new_cursor_key(),
-    exchanges: [],
-    subscriptions: subscription_state.new(),
-  )
+    ToolName,
+    Value,
+    Option(Value),
+    tool.ProgressReporter,
+  ) -> Result(tool.ToolOutput, DispatchError),
+) -> Server(context) {
+  Server(..server, dispatch: dispatch)
 }
 
 /// Returns a server with a new tool registered, or the registry validation error.
@@ -605,20 +604,7 @@ fn server_with_registry(
   server: Server(context),
   registry: Registry(context),
 ) -> Server(context) {
-  Server(
-    ..server,
-    registry: registry,
-    dispatch: fn(ctx, name, arguments, input_responses, report_progress) {
-      tool.dispatch_with_inputs(
-        registry,
-        ctx,
-        name,
-        arguments,
-        input_responses,
-        report_progress,
-      )
-    },
-  )
+  Server(..server, registry: registry)
 }
 
 /// Pure server step function.
@@ -651,7 +637,16 @@ fn handle_message_received(
   bytes: BitArray,
 ) -> #(Server(context), List(ServerEffect(context))) {
   let reg = server.registry
-  let dispatch = server.dispatch
+  let dispatch = fn(ctx, name, arguments, input_responses, report_progress) {
+    server.dispatch(
+      server.registry,
+      ctx,
+      name,
+      arguments,
+      input_responses,
+      report_progress,
+    )
+  }
   let exchanges = server.exchanges
   case find_exchange(exchanges, exchange) {
     Some(_) -> #(server, [])
@@ -1148,12 +1143,9 @@ fn resource_descriptors(
 }
 
 fn resource_template_descriptors(
-  resources: List(ContextResourceTemplate(context)),
+  entries: List(ContextResourceTemplate(context)),
 ) -> List(ResourceTemplate) {
-  list.map(resources, fn(resource) {
-    let ContextResourceTemplate(description, _) = resource
-    description
-  })
+  list.map(entries, resources.template_description)
 }
 
 fn prompt_descriptors(prompts: List(ContextPrompt(context))) -> List(Prompt) {
@@ -1209,44 +1201,18 @@ fn find_resource_reader(
 }
 
 fn find_template_reader(
-  resources: List(ContextResourceTemplate(context)),
+  entries: List(ContextResourceTemplate(context)),
   uri: String,
 ) -> Option(
   fn(context, String) -> Result(List(ResourceContents), ResourceError),
 ) {
-  case resources {
+  case entries {
     [] -> None
-    [ContextResourceTemplate(template, read), ..rest] ->
-      case uri_template_matches(template.uri_template, uri) {
-        True -> Some(read)
-        False -> find_template_reader(rest, uri)
+    [entry, ..rest] ->
+      case resources.matching_template_reader(entry, uri) {
+        Some(read) -> Some(read)
+        None -> find_template_reader(rest, uri)
       }
-  }
-}
-
-fn uri_template_matches(template: String, uri: String) -> Bool {
-  match_uri_segments(
-    string.split(template, on: "/"),
-    string.split(uri, on: "/"),
-  )
-}
-
-fn match_uri_segments(template: List(String), uri: List(String)) -> Bool {
-  case template, uri {
-    [], [] -> True
-    [template_segment, ..template_rest], [uri_segment, ..uri_rest] -> {
-      let variable =
-        string.starts_with(template_segment, "{")
-        && string.ends_with(template_segment, "}")
-        && string.length(template_segment) > 2
-      let matches =
-        variable && uri_segment != "" || template_segment == uri_segment
-      case matches {
-        True -> match_uri_segments(template_rest, uri_rest)
-        False -> False
-      }
-    }
-    _, _ -> False
   }
 }
 

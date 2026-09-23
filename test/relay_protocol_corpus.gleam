@@ -198,7 +198,7 @@ pub fn main() -> Nil {
         ])
       },
     )
-  let template =
+  let assert Ok(template) =
     resources.resource_template(
       "memory://corpus/{id}",
       "corpus template",

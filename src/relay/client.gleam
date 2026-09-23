@@ -10,8 +10,9 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import gleam/uri
-import json/blueprint/codec.{type Codec, decode, encode}
+import json/blueprint/codec.{type Codec, encode}
 import json/blueprint/parser as blueprint_parser
+import json/blueprint/parser_limits
 import json/blueprint/value as blueprint_value
 import relay/completion
 import relay/content
@@ -20,7 +21,7 @@ import relay/internal/transport/stdio_client
 import relay/prompts
 import relay/protocol/jsonrpc.{RequestString}
 import relay/subscriptions.{type SubscriptionFilter, SubscriptionFilter}
-import relay/tool.{type ToolName}
+import relay/tool
 
 const protocol_version = "2026-07-28"
 
@@ -38,7 +39,32 @@ type ClientConfig {
 
 /// URL-derived HTTP settings with explicit bounds and optional CA trust.
 pub opaque type HttpClientConfig {
-  HttpClientConfig(connection: ClientConfig, ca_cert_file: Option(String))
+  HttpClientConfig(
+    connection: ClientConfig,
+    ca_cert_file: Option(String),
+    input_methods: List(InputMethod),
+    listing_limits: ListingLimits,
+  )
+}
+
+/// Optional server-initiated methods this client is prepared to answer.
+pub type InputMethod {
+  Elicitation
+  Sampling
+  Roots
+}
+
+/// Aggregate bounds for a paginated listing.
+pub type ListingLimits {
+  ListingLimits(max_pages: Int, max_items: Int)
+}
+
+pub fn default_listing_limits() -> ListingLimits {
+  ListingLimits(max_pages: 256, max_items: 10_000)
+}
+
+fn valid_listing_limits(limits: ListingLimits) -> Bool {
+  limits.max_pages > 0 && limits.max_items > 0
 }
 
 @external(erlang, "relay_url_ffi", "valid_ipv6")
@@ -133,6 +159,8 @@ pub fn http_config(url: String) -> Result(HttpClientConfig, ClientError) {
                   max_response_bytes: 1_048_576,
                 ),
                 ca_cert_file: None,
+                input_methods: [],
+                listing_limits: default_listing_limits(),
               ))
           }
         }
@@ -227,9 +255,33 @@ pub fn with_ca_cert_file(
   HttpClientConfig(..config, ca_cert_file: Some(ca_cert_file))
 }
 
+/// Advertises only methods the application will handle itself.
+pub fn with_input_methods(
+  config: HttpClientConfig,
+  methods: List(InputMethod),
+) -> HttpClientConfig {
+  HttpClientConfig(..config, input_methods: methods)
+}
+
+pub fn with_listing_limits(
+  config: HttpClientConfig,
+  limits: ListingLimits,
+) -> HttpClientConfig {
+  HttpClientConfig(..config, listing_limits: limits)
+}
+
 /// Connects using the URL-derived settings and optional explicit CA.
 pub fn connect_http(config: HttpClientConfig) -> Result(Client, ClientError) {
-  connect_with_ca_option(config.connection, config.ca_cert_file)
+  case valid_listing_limits(config.listing_limits) {
+    False -> Error(InvalidClientConfiguration)
+    True ->
+      connect_with_ca_option(
+        config.connection,
+        config.ca_cert_file,
+        config.input_methods,
+        config.listing_limits,
+      )
+  }
 }
 
 /// Configuration for a local stdio client process.
@@ -239,12 +291,14 @@ pub type StdioConfig {
     args: List(String),
     timeout_ms: Int,
     max_response_bytes: Int,
+    input_methods: List(InputMethod),
+    listing_limits: ListingLimits,
   )
 }
 
 /// Bounded local stdio defaults; callers can update the public record by name.
 pub fn stdio_config(executable: String, args: List(String)) -> StdioConfig {
-  StdioConfig(executable, args, 30_000, 1_048_576)
+  StdioConfig(executable, args, 30_000, 1_048_576, [], default_listing_limits())
 }
 
 /// Opaque owner-bound HTTP or local stdio client.
@@ -254,6 +308,8 @@ pub opaque type Client {
     path: String,
     timeout_ms: Int,
     max_response_bytes: Int,
+    input_methods: List(InputMethod),
+    listing_limits: ListingLimits,
   )
 }
 
@@ -362,21 +418,61 @@ pub type PromptDeclaration {
 pub type ToolCallOutcome(output) {
   StructuredSuccess(output, content: List(content.ContentBlock))
   ContentOnlySuccess(content: List(content.ContentBlock))
+  InputRequired(
+    continuation: ToolContinuation(output),
+    requests: Dict(String, tool.InputRequest),
+  )
   ToolFailure(content: List(content.ContentBlock))
   ProtocolFailure(reason: String)
-  TransportFailure(reason: String)
-  Cancelled
+  TransportFailure(reason: TransportError)
   InputEncodingFailure
+  InvalidInputResponses
 }
 
-/// A content-only definition cannot yield a typed structured value.
-pub type ContentCallError {
+/// Transport failures are classified before diagnostics are rendered.
+pub type TransportError {
+  ConnectionClosed
+  RequestCancelled
+  RequestTimedOut
+  ResponseLimitExceeded
+  TransportFault(String)
+}
+
+/// Content-only calls have no structured output codec.
+pub type ContentCallOutcome {
+  ContentSuccess(List(content.ContentBlock))
   ContentToolFailure(List(content.ContentBlock))
+  ContentInputRequired(
+    continuation: ContentContinuation,
+    requests: Dict(String, tool.InputRequest),
+  )
   ContentProtocolFailure(String)
-  ContentTransportFailure(String)
-  ContentCancelled
+  ContentTransportFailure(TransportError)
   ContentInputEncodingFailure
   UnexpectedStructuredContent
+  ContentInvalidInputResponses
+}
+
+/// A paused call owns its originating connection, arguments, and output decoder.
+pub opaque type ToolContinuation(output) {
+  ToolContinuation(
+    client: Client,
+    name: String,
+    arguments: json.Json,
+    request_state: Option(String),
+    requests: Dict(String, tool.InputRequest),
+    decode_output: fn(blueprint_value.Value) -> Result(output, String),
+  )
+}
+
+pub opaque type ContentContinuation {
+  ContentContinuation(
+    client: Client,
+    name: String,
+    arguments: json.Json,
+    request_state: Option(String),
+    requests: Dict(String, tool.InputRequest),
+  )
 }
 
 /// A correlated notification received on one live subscriptions/listen stream.
@@ -431,6 +527,18 @@ fn ffi_request(
   max_response_bytes: Int,
 ) -> Result(#(Int, BitArray), String)
 
+@external(erlang, "relay_gun_ffi", "request_typed")
+fn ffi_request_typed(
+  pid: process.Pid,
+  path: String,
+  body: BitArray,
+  method: String,
+  name: String,
+  version: String,
+  timeout_ms: Int,
+  max_response_bytes: Int,
+) -> Result(#(Int, BitArray), TransportError)
+
 @external(erlang, "relay_gun_ffi", "open_sse")
 fn ffi_open_sse(
   pid: process.Pid,
@@ -459,6 +567,8 @@ fn ffi_unique_integer() -> Int
 fn connect_with_ca_option(
   config: ClientConfig,
   ca_cert_file: Option(String),
+  input_methods: List(InputMethod),
+  listing_limits: ListingLimits,
 ) -> Result(Client, ClientError) {
   case
     string.trim(config.host) != ""
@@ -478,6 +588,8 @@ fn connect_with_ca_option(
             path: config.path,
             timeout_ms: config.timeout_ms,
             max_response_bytes: config.max_response_bytes,
+            input_methods: input_methods,
+            listing_limits: listing_limits,
           ))
         Error(reason) -> Error(ConnectionFailed(reason))
       }
@@ -512,7 +624,11 @@ fn open_connection(
 
 /// Starts a typed client for a local stdio-speaking child process.
 pub fn connect_stdio(config: StdioConfig) -> Result(Client, ClientError) {
-  case config.timeout_ms > 0 && config.max_response_bytes > 0 {
+  case
+    config.timeout_ms > 0
+    && config.max_response_bytes > 0
+    && valid_listing_limits(config.listing_limits)
+  {
     False -> Error(InvalidClientConfiguration)
     True ->
       case
@@ -529,6 +645,8 @@ pub fn connect_stdio(config: StdioConfig) -> Result(Client, ClientError) {
             path: "",
             timeout_ms: config.timeout_ms,
             max_response_bytes: config.max_response_bytes,
+            input_methods: config.input_methods,
+            listing_limits: config.listing_limits,
           ))
         Error(reason) -> Error(ConnectionFailed(reason))
       }
@@ -546,7 +664,7 @@ pub fn close(client: Client) -> Nil {
 /// Discovers server capabilities and pins use to the retained 2026 revision.
 pub fn discover(client: Client) -> Result(Discovery, String) {
   let id = request_id()
-  let body = request_envelope(id, "server/discover", [])
+  let body = request_envelope(client, id, "server/discover", [])
   case request(client, body, id, "server/discover", "") {
     Error(reason) -> Error(reason)
     Ok(#(status, bytes)) ->
@@ -575,7 +693,7 @@ pub fn raw_json_call(
     False, Some(_) -> Error("Mcp-Name is not valid for " <> method)
     _, _ -> {
       let id = request_id()
-      let body = request_envelope(id, method, params)
+      let body = request_envelope(client, id, method, params)
       let name = case name {
         None -> ""
         Some(value) -> value
@@ -652,47 +770,111 @@ pub fn list_prompts_json(client: Client) -> Result(List(String), String) {
   list_json_pages(client, "prompts/list", "prompts")
 }
 
-fn call_tool(
+type DecodedToolResponse {
+  Completed(Bool, Option(blueprint_value.Value), List(content.ContentBlock))
+  Awaiting(Dict(String, tool.InputRequest), Option(String))
+}
+
+type ToolRequestFailure {
+  ToolTransport(TransportError)
+  ToolProtocol(String)
+}
+
+fn invoke_tool(
   client: Client,
-  name: ToolName,
-  input: input,
-  input_codec: Codec(input),
-  output_codec: Codec(output),
-) -> ToolCallOutcome(output) {
-  case encode(input_codec, input) {
-    Error(_) -> InputEncodingFailure
-    Ok(arguments) -> {
-      let id = request_id()
-      let tool_name = tool.tool_name_to_string(name)
-      let params = [
-        #("name", json.string(tool_name)),
-        #("arguments", v2026.value_to_json(arguments)),
-      ]
-      let body = request_envelope(id, "tools/call", params)
-      case request(client, body, id, "tools/call", tool_name) {
-        Error("cancelled") -> Cancelled
-        Error(reason) -> TransportFailure(reason)
-        Ok(#(status, _)) if status != 200 ->
-          TransportFailure("tool call returned HTTP " <> int.to_string(status))
-        Ok(#(_, bytes)) ->
-          case decode_tool_response(bytes, id) {
-            Error(reason) -> ProtocolFailure(reason)
-            Ok(#(is_error, maybe_structured, texts)) ->
-              case is_error, maybe_structured {
-                True, _ -> ToolFailure(texts)
-                False, None -> ContentOnlySuccess(texts)
-                False, Some(value) ->
-                  case decode(output_codec, value) {
-                    Ok(output) -> StructuredSuccess(output, texts)
-                    Error(_) ->
-                      ProtocolFailure(
-                        "structured content did not match the output codec",
-                      )
-                  }
-              }
-          }
+  name: String,
+  arguments: json.Json,
+  request_state: Option(String),
+  input_responses: Option(Dict(String, json.Json)),
+) -> Result(DecodedToolResponse, ToolRequestFailure) {
+  let params = [
+    #("name", json.string(name)),
+    #("arguments", arguments),
+  ]
+  let params = case request_state {
+    None -> params
+    Some(state) -> [#("requestState", json.string(state)), ..params]
+  }
+  let params = case input_responses {
+    None -> params
+    Some(responses) -> [
+      #("inputResponses", json.object(dict.to_list(responses))),
+      ..params
+    ]
+  }
+  let id = request_id()
+  let body = request_envelope(client, id, "tools/call", params)
+  case request_typed(client, body, id, "tools/call", name) {
+    Error(failure) -> Error(ToolTransport(failure))
+    Ok(#(status, bytes)) if status != 200 ->
+      case validate_jsonrpc_response(bytes, id) {
+        Ok(_) ->
+          Error(ToolProtocol(
+            "tool call was rejected by the peer (HTTP "
+            <> int.to_string(status)
+            <> ")",
+          ))
+        Error(_) ->
+          Error(
+            ToolTransport(TransportFault(
+              "tool call returned HTTP " <> int.to_string(status),
+            )),
+          )
       }
-    }
+    Ok(#(_, bytes)) ->
+      case decode_tool_response(bytes, id, client.max_response_bytes) {
+        Error(reason) -> Error(ToolProtocol(reason))
+        Ok(Awaiting(requests, state)) ->
+          case input_requests_supported(requests, client.input_methods) {
+            True -> Ok(Awaiting(requests, state))
+            False ->
+              Error(ToolProtocol("tool requested an undeclared input method"))
+          }
+        Ok(completed) -> Ok(completed)
+      }
+  }
+}
+
+fn decode_typed_output(
+  output_codec: Codec(output),
+  value: blueprint_value.Value,
+) -> Result(output, String) {
+  codec.decode(output_codec, value)
+  |> result.map_error(fn(_) {
+    "structured content did not match the output codec"
+  })
+}
+
+fn call_encoded_tool(
+  client: Client,
+  name: String,
+  arguments: json.Json,
+  request_state: Option(String),
+  input_responses: Option(Dict(String, json.Json)),
+  decode_output: fn(blueprint_value.Value) -> Result(output, String),
+) -> ToolCallOutcome(output) {
+  case invoke_tool(client, name, arguments, request_state, input_responses) {
+    Error(ToolTransport(failure)) -> TransportFailure(failure)
+    Error(ToolProtocol(reason)) -> ProtocolFailure(reason)
+    Ok(Awaiting(requests, state)) ->
+      InputRequired(
+        ToolContinuation(
+          client,
+          name,
+          arguments,
+          state,
+          requests,
+          decode_output,
+        ),
+        requests,
+      )
+    Ok(Completed(True, _, blocks)) -> ToolFailure(blocks)
+    Ok(Completed(False, None, blocks)) -> ContentOnlySuccess(blocks)
+    Ok(Completed(False, Some(value), blocks)) ->
+      case decode_output(value) {
+        Ok(output) -> StructuredSuccess(output, blocks)
+        Error(reason) -> ProtocolFailure(reason)
+      }
   }
 }
 
@@ -702,13 +884,82 @@ pub fn call_definition(
   definition: tool.Definition(input, output),
   input: input,
 ) -> ToolCallOutcome(output) {
-  call_tool(
-    client,
-    tool.definition_name(definition),
-    input,
-    tool.definition_input_codec(definition),
-    tool.definition_output_codec(definition),
-  )
+  case encode(tool.definition_input_codec(definition), input) {
+    Error(_) -> InputEncodingFailure
+    Ok(arguments) ->
+      call_encoded_tool(
+        client,
+        tool.definition_name(definition) |> tool.tool_name_to_string,
+        v2026.value_to_json(arguments),
+        None,
+        None,
+        fn(value) {
+          decode_typed_output(tool.definition_output_codec(definition), value)
+        },
+      )
+  }
+}
+
+/// Calls a discovered declaration with exact Blueprint JSON arguments and
+/// exact structured output. The application can forward a parsed provider tool
+/// call without inventing a native input codec or losing numeric precision.
+pub fn call_discovered(
+  client: Client,
+  declaration: ToolDeclaration,
+  arguments: blueprint_value.Value,
+) -> ToolCallOutcome(blueprint_value.Value) {
+  case arguments {
+    blueprint_value.Object(_) ->
+      call_encoded_tool(
+        client,
+        declaration.name,
+        v2026.value_to_json(arguments),
+        None,
+        None,
+        fn(value) { Ok(value) },
+      )
+    _ -> InputEncodingFailure
+  }
+}
+
+/// Continues only the call that produced this value, with one reply per key.
+pub fn resume_tool(
+  continuation: ToolContinuation(output),
+  responses: Dict(String, json.Json),
+) -> ToolCallOutcome(output) {
+  case valid_input_responses(continuation.requests, responses) {
+    False -> InvalidInputResponses
+    True ->
+      call_encoded_tool(
+        continuation.client,
+        continuation.name,
+        continuation.arguments,
+        continuation.request_state,
+        Some(responses),
+        continuation.decode_output,
+      )
+  }
+}
+
+fn call_encoded_content(
+  client: Client,
+  name: String,
+  arguments: json.Json,
+  request_state: Option(String),
+  input_responses: Option(Dict(String, json.Json)),
+) -> ContentCallOutcome {
+  case invoke_tool(client, name, arguments, request_state, input_responses) {
+    Error(ToolTransport(failure)) -> ContentTransportFailure(failure)
+    Error(ToolProtocol(reason)) -> ContentProtocolFailure(reason)
+    Ok(Awaiting(requests, state)) ->
+      ContentInputRequired(
+        ContentContinuation(client, name, arguments, state, requests),
+        requests,
+      )
+    Ok(Completed(True, _, blocks)) -> ContentToolFailure(blocks)
+    Ok(Completed(False, Some(_), _)) -> UnexpectedStructuredContent
+    Ok(Completed(False, None, blocks)) -> ContentSuccess(blocks)
+  }
 }
 
 /// Calls an admitted content-only tool without requiring an output codec.
@@ -716,35 +967,80 @@ pub fn call_content_definition(
   client: Client,
   definition: tool.ContentDefinition(input),
   input: input,
-) -> Result(List(content.ContentBlock), ContentCallError) {
+) -> ContentCallOutcome {
   case encode(tool.content_definition_input_codec(definition), input) {
-    Error(_) -> Error(ContentInputEncodingFailure)
-    Ok(arguments) -> {
-      let id = request_id()
-      let tool_name =
-        tool.content_definition_name(definition) |> tool.tool_name_to_string
-      let body =
-        request_envelope(id, "tools/call", [
-          #("name", json.string(tool_name)),
-          #("arguments", v2026.value_to_json(arguments)),
-        ])
-      case request(client, body, id, "tools/call", tool_name) {
-        Error("cancelled") -> Error(ContentCancelled)
-        Error(reason) -> Error(ContentTransportFailure(reason))
-        Ok(#(status, _)) if status != 200 ->
-          Error(ContentTransportFailure(
-            "tool call returned HTTP " <> int.to_string(status),
-          ))
-        Ok(#(_, bytes)) ->
-          case decode_tool_response(bytes, id) {
-            Error(reason) -> Error(ContentProtocolFailure(reason))
-            Ok(#(True, _, blocks)) -> Error(ContentToolFailure(blocks))
-            Ok(#(False, Some(_), _)) -> Error(UnexpectedStructuredContent)
-            Ok(#(False, None, blocks)) -> Ok(blocks)
-          }
-      }
-    }
+    Error(_) -> ContentInputEncodingFailure
+    Ok(arguments) ->
+      call_encoded_content(
+        client,
+        tool.content_definition_name(definition) |> tool.tool_name_to_string,
+        v2026.value_to_json(arguments),
+        None,
+        None,
+      )
   }
+}
+
+pub fn resume_content(
+  continuation: ContentContinuation,
+  responses: Dict(String, json.Json),
+) -> ContentCallOutcome {
+  case valid_input_responses(continuation.requests, responses) {
+    False -> ContentInvalidInputResponses
+    True ->
+      call_encoded_content(
+        continuation.client,
+        continuation.name,
+        continuation.arguments,
+        continuation.request_state,
+        Some(responses),
+      )
+  }
+}
+
+fn json_is_object(value: json.Json) -> Bool {
+  case
+    json.parse(
+      json.to_string(value),
+      dyn_decode.dict(dyn_decode.string, dyn_decode.dynamic),
+    )
+  {
+    Ok(_) -> True
+    Error(_) -> False
+  }
+}
+
+fn valid_input_responses(
+  requests: Dict(String, tool.InputRequest),
+  responses: Dict(String, json.Json),
+) -> Bool {
+  let request_entries = dict.to_list(requests)
+  let response_entries = dict.to_list(responses)
+  list.length(request_entries) == list.length(response_entries)
+  && list.all(response_entries, fn(entry) {
+    let #(key, value) = entry
+    dict.has_key(requests, key) && json_is_object(value)
+  })
+}
+
+fn input_requests_supported(
+  requests: Dict(String, tool.InputRequest),
+  supported: List(InputMethod),
+) -> Bool {
+  dict.to_list(requests)
+  |> list.all(fn(entry) {
+    let #(_, request) = entry
+    let required = case request.method {
+      "elicitation/create" -> Some(Elicitation)
+      "sampling/createMessage" -> Some(Sampling)
+      "roots/list" -> Some(Roots)
+      _ -> None
+    }
+    case required {
+      Some(method) -> list.contains(supported, method)
+      None -> False
+    }
+  })
 }
 
 /// Reads a resource and decodes its text or base64 content.
@@ -1122,6 +1418,44 @@ fn request(
   }
 }
 
+fn request_typed(
+  client: Client,
+  body: BitArray,
+  id: String,
+  method: String,
+  name: String,
+) -> Result(#(Int, BitArray), TransportError) {
+  case client.transport {
+    HttpTransport(pid) ->
+      ffi_request_typed(
+        pid,
+        client.path,
+        body,
+        method,
+        name,
+        protocol_version,
+        client.timeout_ms,
+        client.max_response_bytes,
+      )
+    StdioTransport(child) ->
+      stdio_client.request_typed(
+        child,
+        body,
+        id,
+        client.timeout_ms,
+        client.max_response_bytes,
+      )
+      |> result.map(fn(bytes) { #(200, bytes) })
+      |> result.map_error(fn(failure) {
+        case failure {
+          stdio_client.Closed -> ConnectionClosed
+          stdio_client.Cancelled -> RequestCancelled
+          stdio_client.Failed(reason) -> TransportFault(reason)
+        }
+      })
+  }
+}
+
 fn jsonrpc_call_result(
   client: Client,
   method: String,
@@ -1129,7 +1463,7 @@ fn jsonrpc_call_result(
   params: List(#(String, json.Json)),
 ) -> Result(Dynamic, String) {
   let id = request_id()
-  let body = request_envelope(id, method, params)
+  let body = request_envelope(client, id, method, params)
   case request(client, body, id, method, name) {
     Error(reason) -> Error(reason)
     Ok(#(status, _)) if status != 200 ->
@@ -1303,10 +1637,8 @@ fn validate_jsonrpc_result(
 fn decode_tool_response(
   bytes: BitArray,
   expected_id: String,
-) -> Result(
-  #(Bool, Option(blueprint_value.Value), List(content.ContentBlock)),
-  String,
-) {
+  max_response_bytes: Int,
+) -> Result(DecodedToolResponse, String) {
   case bit_array.to_string(bytes) {
     Error(_) -> Error("tool response was not UTF-8")
     Ok(raw) ->
@@ -1316,30 +1648,103 @@ fn decode_tool_response(
           case validate_jsonrpc_result(response, expected_id) {
             Error(reason) -> Error(reason)
             Ok(result_value) -> {
-              let content =
-                dyn_decode.run(
-                  result_value,
-                  dyn_decode.at(
-                    ["content"],
-                    dyn_decode.list(dyn_decode.dynamic),
-                  ),
-                )
-              let is_error = optional_bool(result_value, ["isError"], False)
-              case content, is_error {
-                Ok(blocks), Ok(is_error) ->
-                  case decode_content_blocks(blocks) {
-                    Error(reason) -> Error(reason)
-                    Ok(texts) ->
-                      case decode_structured_content(bytes, result_value) {
-                        Error(reason) -> Error(reason)
-                        Ok(structured) -> Ok(#(is_error, structured, texts))
-                      }
-                  }
-                _, _ -> Error("tool result has invalid content or isError")
+              case optional_string_field(result_value, ["resultType"]) {
+                Error(reason) -> Error(reason)
+                Ok(Some("input_required")) ->
+                  decode_input_required(result_value)
+                Ok(None) | Ok(Some("complete")) ->
+                  decode_complete_tool_result(
+                    bytes,
+                    result_value,
+                    max_response_bytes,
+                  )
+                Ok(Some(_)) -> Error("tool result has an unknown resultType")
               }
             }
           }
       }
+  }
+}
+
+fn decode_complete_tool_result(
+  bytes: BitArray,
+  result_value: Dynamic,
+  max_response_bytes: Int,
+) -> Result(DecodedToolResponse, String) {
+  let content =
+    dyn_decode.run(
+      result_value,
+      dyn_decode.at(["content"], dyn_decode.list(dyn_decode.dynamic)),
+    )
+  let is_error = optional_bool(result_value, ["isError"], False)
+  case content, is_error {
+    Ok(blocks), Ok(is_error) ->
+      case decode_content_blocks(blocks) {
+        Error(reason) -> Error(reason)
+        Ok(decoded_blocks) ->
+          case
+            decode_structured_content(bytes, result_value, max_response_bytes)
+          {
+            Error(reason) -> Error(reason)
+            Ok(structured) ->
+              Ok(Completed(is_error, structured, decoded_blocks))
+          }
+      }
+    _, _ -> Error("tool result has invalid content or isError")
+  }
+}
+
+fn decode_input_required(
+  result_value: Dynamic,
+) -> Result(DecodedToolResponse, String) {
+  use fields <- result.try(
+    dyn_decode.run(
+      result_value,
+      dyn_decode.dict(dyn_decode.string, dyn_decode.dynamic),
+    )
+    |> result.map_error(fn(_) { "input-required result must be an object" }),
+  )
+  use requests <- result.try(case dict.get(fields, "inputRequests") {
+    Error(_) -> Ok(dict.new())
+    Ok(raw) -> decode_input_requests(raw)
+  })
+  use state <- result.try(optional_string_field(result_value, ["requestState"]))
+  case !dict.has_key(fields, "inputRequests") && state == None {
+    True -> Error("input-required result has no requests or requestState")
+    False -> Ok(Awaiting(requests, state))
+  }
+}
+
+fn decode_input_requests(
+  raw: Dynamic,
+) -> Result(Dict(String, tool.InputRequest), String) {
+  use requests <- result.try(
+    dyn_decode.run(raw, dyn_decode.dict(dyn_decode.string, dyn_decode.dynamic))
+    |> result.map_error(fn(_) { "inputRequests must be an object" }),
+  )
+  decode_input_request_entries(dict.to_list(requests), [])
+  |> result.map(dict.from_list)
+}
+
+fn decode_input_request_entries(
+  entries: List(#(String, Dynamic)),
+  decoded: List(#(String, tool.InputRequest)),
+) -> Result(List(#(String, tool.InputRequest)), String) {
+  case entries {
+    [] -> Ok(decoded)
+    [#(key, raw), ..rest] -> {
+      use method <- result.try(string_field(raw, ["method"]))
+      use params <- result.try(dynamic_field(raw, ["params"]))
+      use params <- result.try(dynamic_to_json(params))
+      case json_is_object(params) {
+        False -> Error("input request params must be an object")
+        True ->
+          decode_input_request_entries(rest, [
+            #(key, tool.InputRequest(method, params)),
+            ..decoded
+          ])
+      }
+    }
   }
 }
 
@@ -1741,6 +2146,7 @@ fn optional_bool_field(
 fn decode_structured_content(
   bytes: BitArray,
   result_value: Dynamic,
+  max_response_bytes: Int,
 ) -> Result(Option(blueprint_value.Value), String) {
   case
     dyn_decode.run(
@@ -1749,10 +2155,15 @@ fn decode_structured_content(
     )
   {
     Error(_) -> Ok(None)
-    Ok(_) ->
-      case
-        blueprint_parser.parse_value(blueprint_parser.default_limits(), bytes)
-      {
+    Ok(_) -> {
+      use limits <- result.try(
+        parser_limits.with_max_bytes(
+          blueprint_parser.default_limits(),
+          max_response_bytes,
+        )
+        |> result.map_error(fn(_) { "invalid configured response byte limit" }),
+      )
+      case blueprint_parser.parse_value(limits, bytes) {
         Error(_) ->
           Error("structured tool result contains an invalid JSON value")
         Ok(root) ->
@@ -1761,6 +2172,7 @@ fn decode_structured_content(
             Some(value) -> Ok(Some(value))
           }
       }
+    }
   }
 }
 
@@ -2077,7 +2489,16 @@ fn list_json_pages(
   method: String,
   collection_key: String,
 ) -> Result(List(String), String) {
-  list_json_page(client, method, collection_key, None, [], [], 10_000)
+  list_json_page(
+    client,
+    method,
+    collection_key,
+    None,
+    dict.new(),
+    [],
+    0,
+    client.listing_limits.max_pages,
+  )
 }
 
 fn list_json_page(
@@ -2085,8 +2506,9 @@ fn list_json_page(
   method: String,
   collection_key: String,
   cursor: Option(String),
-  seen_cursors: List(String),
-  accumulated: List(String),
+  seen_cursors: Dict(String, Bool),
+  reversed_pages: List(List(String)),
+  item_count: Int,
   remaining_pages: Int,
 ) -> Result(List(String), String) {
   case remaining_pages <= 0 {
@@ -2097,7 +2519,7 @@ fn list_json_page(
         Some(value) -> [#("cursor", json.string(value))]
       }
       let id = request_id()
-      let body = request_envelope(id, method, params)
+      let body = request_envelope(client, id, method, params)
       case request(client, body, id, method, "") {
         Error(reason) -> Error(reason)
         Ok(#(status, _)) if status != 200 ->
@@ -2106,23 +2528,30 @@ fn list_json_page(
           case decode_json_list_page(bytes, id, collection_key) {
             Error(reason) -> Error(reason)
             Ok(#(items, next_cursor)) -> {
-              let accumulated = list.append(accumulated, items)
-              case next_cursor {
-                None -> Ok(accumulated)
-                Some(next) ->
-                  case list.contains(seen_cursors, next) {
-                    True -> Error(method <> " cursor repeated")
-                    False ->
-                      list_json_page(
-                        client,
-                        method,
-                        collection_key,
-                        Some(next),
-                        [next, ..seen_cursors],
-                        accumulated,
-                        remaining_pages - 1,
-                      )
+              let item_count = item_count + list.length(items)
+              case item_count > client.listing_limits.max_items {
+                True -> Error(method <> " exceeded the client item limit")
+                False -> {
+                  let reversed_pages = [items, ..reversed_pages]
+                  case next_cursor {
+                    None -> Ok(list.flatten(list.reverse(reversed_pages)))
+                    Some(next) ->
+                      case dict.has_key(seen_cursors, next) {
+                        True -> Error(method <> " cursor repeated")
+                        False ->
+                          list_json_page(
+                            client,
+                            method,
+                            collection_key,
+                            Some(next),
+                            dict.insert(seen_cursors, next, True),
+                            reversed_pages,
+                            item_count,
+                            remaining_pages - 1,
+                          )
+                      }
                   }
+                }
               }
             }
           }
@@ -2131,7 +2560,25 @@ fn list_json_page(
   }
 }
 
+fn input_capabilities_json(methods: List(InputMethod)) -> json.Json {
+  let fields = []
+  let fields = case list.contains(methods, Elicitation) {
+    True -> [#("elicitation", json.object([])), ..fields]
+    False -> fields
+  }
+  let fields = case list.contains(methods, Sampling) {
+    True -> [#("sampling", json.object([])), ..fields]
+    False -> fields
+  }
+  let fields = case list.contains(methods, Roots) {
+    True -> [#("roots", json.object([])), ..fields]
+    False -> fields
+  }
+  json.object(fields)
+}
+
 fn request_envelope(
+  client: Client,
   id: String,
   method: String,
   params: List(#(String, json.Json)),
@@ -2142,7 +2589,10 @@ fn request_envelope(
         "io.modelcontextprotocol/protocolVersion",
         json.string(protocol_version),
       ),
-      #("io.modelcontextprotocol/clientCapabilities", json.object([])),
+      #(
+        "io.modelcontextprotocol/clientCapabilities",
+        input_capabilities_json(client.input_methods),
+      ),
     ])
   let params = json.object([#("_meta", metadata), ..params])
   json.object([

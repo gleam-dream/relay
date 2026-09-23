@@ -11,6 +11,7 @@ import gleeunit
 import gleeunit/should
 import json/blueprint/codec
 import json/blueprint/number
+import json/blueprint/value
 import relay/client
 import relay/completion
 import relay/content
@@ -277,7 +278,7 @@ fn local_server() -> server.Server(Nil) {
         content.TextResourceContents(uri, "client resource", Some("text/plain")),
       ])
     })
-  let template =
+  let assert Ok(template) =
     resources.resource_template(
       "memory://client/{name}",
       "client resource template",
@@ -440,6 +441,8 @@ pub fn stdio_client_uses_typed_request_surface_test() {
       args: [],
       timeout_ms: 3000,
       max_response_bytes: 65_536,
+      input_methods: [],
+      listing_limits: client.default_listing_limits(),
     ))
   let discovery = client.discover(peer)
   let assert Ok(greet_name) = tool.tool_name("greet")
@@ -477,6 +480,8 @@ pub fn stdio_client_skips_notifications_and_rejects_unrelated_responses_test() {
       ],
       timeout_ms: 3000,
       max_response_bytes: 65_536,
+      input_methods: [],
+      listing_limits: client.default_listing_limits(),
     ))
   let discovery = client.discover(peer)
   client.close(peer)
@@ -490,6 +495,8 @@ pub fn stdio_client_subscriptions_retain_ack_and_notifications_test() {
       args: [],
       timeout_ms: 3000,
       max_response_bytes: 65_536,
+      input_methods: [],
+      listing_limits: client.default_listing_limits(),
     ))
   let requested =
     subscriptions.SubscriptionFilter(
@@ -524,6 +531,8 @@ pub fn stdio_client_preserves_frozen_declaration_fields_test() {
       args: [],
       timeout_ms: 3000,
       max_response_bytes: 65_536,
+      input_methods: [],
+      listing_limits: client.default_listing_limits(),
     ))
   let assert Ok([tool]) = client.list_tools(peer)
   let assert Ok([resource]) = client.list_resources(peer)
@@ -578,6 +587,8 @@ pub fn stdio_subscription_is_ordered_cancellable_and_timeout_safe_test() {
       args: [],
       timeout_ms: 3000,
       max_response_bytes: 65_536,
+      input_methods: [],
+      listing_limits: client.default_listing_limits(),
     ))
   let requested =
     subscriptions.SubscriptionFilter(
@@ -627,6 +638,8 @@ pub fn stdio_frame_overflow_closes_the_owned_child_test() {
       args: [],
       timeout_ms: 3000,
       max_response_bytes: 65_536,
+      input_methods: [],
+      listing_limits: client.default_listing_limits(),
     ))
   let first = client.discover(peer)
   case first {
@@ -643,6 +656,7 @@ pub fn gun_http_client_discovery_and_typed_call_test() {
       max_body_bytes: 4096,
       max_response_bytes: 65_536,
       request_timeout_ms: 3000,
+      sse_keepalive_ms: 250,
       allowed_hosts: ["127.0.0.1"],
       allowed_origins: [],
     )
@@ -800,7 +814,7 @@ pub fn gun_http_client_discovery_and_typed_call_test() {
     tool.content_definition(say_name, codec.field("name", codec.string()))
   should.equal(
     client.call_content_definition(peer, say_definition, "MCP"),
-    Ok([
+    client.ContentSuccess([
       content.TextContent("content-only reply", None),
     ]),
   )
@@ -862,6 +876,20 @@ pub fn gun_http_client_discovery_and_typed_call_test() {
     client.StructuredSuccess(value, _) -> should.equal(value, exact)
     _ -> should.fail()
   }
+  let assert Ok(declarations) = client.list_tools(peer)
+  let assert [exact_declaration] =
+    list.filter(declarations, fn(declaration) { declaration.name == "exact" })
+  case
+    client.call_discovered(
+      peer,
+      exact_declaration,
+      value.Object([#("value", value.Number(exact))]),
+    )
+  {
+    client.StructuredSuccess(value.Number(actual), _) ->
+      should.equal(actual, exact)
+    _ -> should.fail()
+  }
 
   let assert Ok(timeout_peer) =
     open_http_client(
@@ -885,7 +913,7 @@ pub fn gun_http_client_discovery_and_typed_call_test() {
       Ok(definition) -> client.call_definition(timeout_peer, definition, "MCP")
       Error(_) -> client.ProtocolFailure("invalid local tool definition")
     },
-    client.TransportFailure("request timed out"),
+    client.TransportFailure(client.RequestTimedOut),
   )
   process.sleep(600)
   client.close(timeout_peer)
@@ -934,6 +962,7 @@ pub fn admitted_definition_uses_plain_mcp_errors_and_typed_client_call_test() {
       max_body_bytes: 4096,
       max_response_bytes: 65_536,
       request_timeout_ms: 3000,
+      sse_keepalive_ms: 250,
       allowed_hosts: ["127.0.0.1"],
       allowed_origins: [],
     )
@@ -983,6 +1012,7 @@ pub fn http_subscription_receives_requested_list_change_test() {
       max_body_bytes: 4096,
       max_response_bytes: 65_536,
       request_timeout_ms: 3000,
+      sse_keepalive_ms: 250,
       allowed_hosts: ["127.0.0.1"],
       allowed_origins: [],
     )
@@ -1243,6 +1273,7 @@ fn assert_subscription_reconciles_tool_change(
       max_body_bytes: 4096,
       max_response_bytes: 65_536,
       request_timeout_ms: 3000,
+      sse_keepalive_ms: 250,
       allowed_hosts: ["127.0.0.1"],
       allowed_origins: [],
     )
@@ -1413,6 +1444,7 @@ pub fn http_subscription_reconciles_same_name_replacement_during_establishment_t
         max_body_bytes: 4096,
         max_response_bytes: 65_536,
         request_timeout_ms: 3000,
+        sse_keepalive_ms: 250,
         allowed_hosts: ["127.0.0.1"],
         allowed_origins: [],
       ),
@@ -1519,6 +1551,7 @@ pub fn http_subscription_after_registry_churn_reconciles_current_state_test() {
         max_body_bytes: 4096,
         max_response_bytes: 65_536,
         request_timeout_ms: 3000,
+        sse_keepalive_ms: 250,
         allowed_hosts: ["127.0.0.1"],
         allowed_origins: [],
       ),
@@ -1614,6 +1647,7 @@ pub fn http_subscription_registration_fails_when_hub_dies_test() {
         max_body_bytes: 4096,
         max_response_bytes: 65_536,
         request_timeout_ms: 1000,
+        sse_keepalive_ms: 250,
         allowed_hosts: ["127.0.0.1"],
         allowed_origins: [],
       ),
@@ -1670,6 +1704,8 @@ pub fn stdio_client_handles_child_exit_and_repeated_close_test() {
       args: ["-c", "exit 3"],
       timeout_ms: 3000,
       max_response_bytes: 65_536,
+      input_methods: [],
+      listing_limits: client.default_listing_limits(),
     ))
   let discovery = client.discover(peer)
   client.close(peer)
@@ -1687,6 +1723,8 @@ pub fn stdio_client_concurrent_close_is_safe_test() {
       args: [],
       timeout_ms: 3000,
       max_response_bytes: 65_536,
+      input_methods: [],
+      listing_limits: client.default_listing_limits(),
     ))
   let finished = process.new_subject()
   let _ =
@@ -1701,4 +1739,276 @@ pub fn stdio_client_concurrent_close_is_safe_test() {
     })
   let assert Ok(Nil) = process.receive(finished, within: 3000)
   let assert Ok(Nil) = process.receive(finished, within: 3000)
+}
+
+fn continuation_server() -> #(
+  server.Server(Nil),
+  tool.Definition(String, String),
+) {
+  let assert Ok(name) = tool.tool_name("continue-echo")
+  let assert Ok(definition) =
+    tool.definition(name, codec.field("name", codec.string()), codec.string())
+  let bound =
+    tool.handle_advanced(definition, fn(call, name) {
+      case call.input_responses {
+        None ->
+          Ok(
+            tool.NeedsInput(
+              dict.from_list([
+                #(
+                  "choice",
+                  tool.InputRequest(
+                    "elicitation/create",
+                    json.object([
+                      #("message", json.string("Continue?")),
+                      #(
+                        "requestedSchema",
+                        json.object([#("type", json.string("object"))]),
+                      ),
+                    ]),
+                  ),
+                ),
+              ]),
+            ),
+          )
+        Some(_) ->
+          Ok(
+            tool.Complete("continued " <> name, [
+              content.text_content("rich continuation"),
+            ]),
+          )
+      }
+    })
+  let assert Ok(registry) = tool.registry([bound])
+  #(server.server(registry), definition)
+}
+
+pub fn configured_large_structured_response_uses_client_parser_bound_test() {
+  let large_output = string.repeat("x", 10_486_000)
+  let assert Ok(name) = tool.tool_name("large-structured")
+  let assert Ok(definition) =
+    tool.definition(name, codec.field("name", codec.string()), codec.string())
+  let assert Ok(registry) =
+    tool.registry([tool.handle(definition, fn(_name) { Ok(large_output) })])
+  let policy =
+    http.HttpPolicy(
+      ..http.local_http_policy("127.0.0.1"),
+      max_response_bytes: 30_000_000,
+    )
+  let assert Ok(listener) =
+    http.listener(server.server(registry), fn() { Nil })
+    |> http.with_policy(policy)
+    |> http.start()
+  let assert Ok(peer) =
+    open_http_client(
+      "127.0.0.1",
+      http.http_server_port(listener),
+      "/",
+      False,
+      15_000,
+      30_000_000,
+      None,
+    )
+  let outcome = client.call_definition(peer, definition, "large")
+  client.close(peer)
+  http.stop_http_server(listener)
+  case outcome {
+    client.StructuredSuccess(actual, _) ->
+      string.byte_size(actual) |> should.equal(10_486_000)
+    _ -> should.fail()
+  }
+}
+
+pub fn discovered_and_typed_tool_continuations_retain_state_test() {
+  let #(service, definition) = continuation_server()
+  let assert Ok(listener) =
+    http.listener(service, fn() { Nil })
+    |> http.start()
+  let url =
+    "http://127.0.0.1:" <> int.to_string(http.http_server_port(listener))
+  let assert Ok(base) = client.http_config(url)
+  let assert Ok(unconfigured) = client.connect_http(base)
+  let assert client.InputRequired(_, unconfigured_requests) =
+    client.call_definition(unconfigured, definition, "unconfigured")
+  dict.is_empty(unconfigured_requests) |> should.be_true()
+  client.close(unconfigured)
+  let assert Ok(peer) =
+    base
+    |> client.with_input_methods([client.Elicitation])
+    |> client.connect_http()
+  let assert Ok([declaration]) = client.list_tools(peer)
+  let assert client.InputRequired(typed_continuation, requests) =
+    client.call_definition(peer, definition, "typed")
+  dict.has_key(requests, "choice") |> should.be_true()
+  client.resume_tool(typed_continuation, dict.new())
+  |> should.equal(client.InvalidInputResponses)
+  client.resume_tool(
+    typed_continuation,
+    dict.from_list([#("wrong", json.object([]))]),
+  )
+  |> should.equal(client.InvalidInputResponses)
+  let response =
+    json.object([
+      #("action", json.string("accept")),
+      #("content", json.object([])),
+    ])
+  let replies = dict.from_list([#("choice", response)])
+  should.equal(
+    client.resume_tool(typed_continuation, replies),
+    client.StructuredSuccess("continued typed", [
+      content.text_content("rich continuation"),
+    ]),
+  )
+  let arguments = value.Object([#("name", value.String("dynamic"))])
+  let assert client.InputRequired(dynamic_continuation, _) =
+    client.call_discovered(peer, declaration, arguments)
+  should.equal(
+    client.resume_tool(dynamic_continuation, replies),
+    client.StructuredSuccess(value.String("continued dynamic"), [
+      content.text_content("rich continuation"),
+    ]),
+  )
+  client.close(peer)
+  http.stop_http_server(listener)
+}
+
+pub fn discovered_call_and_listing_bounds_are_explicit_test() {
+  let assert Ok(listener) =
+    http.listener(local_server(), fn() { Nil })
+    |> http.start()
+  let url =
+    "http://127.0.0.1:" <> int.to_string(http.http_server_port(listener))
+  let assert Ok(base) = client.http_config(url)
+  let assert Ok(peer) = client.connect_http(base)
+  let assert Ok(declarations) = client.list_tools(peer)
+  let assert [echo_declaration] =
+    list.filter(declarations, fn(declaration) { declaration.name == "echo" })
+  should.equal(
+    client.call_discovered(
+      peer,
+      echo_declaration,
+      value.Object([#("name", value.String("remote"))]),
+    ),
+    client.StructuredSuccess(value.String("hello remote"), [
+      content.text_content("hello remote"),
+    ]),
+  )
+  client.call_discovered(peer, echo_declaration, value.String("not arguments"))
+  |> should.equal(client.InputEncodingFailure)
+  let assert Ok(limited) =
+    base
+    |> client.with_listing_limits(client.ListingLimits(256, 3))
+    |> client.connect_http()
+  let assert Error(reason) = client.list_tools(limited)
+  string.contains(reason, "item limit") |> should.be_true()
+  client.close(limited)
+  client.close(peer)
+  client.call_discovered(
+    peer,
+    echo_declaration,
+    value.Object([#("name", value.String("closed"))]),
+  )
+  |> should.equal(client.TransportFailure(client.ConnectionClosed))
+  http.stop_http_server(listener)
+}
+
+pub fn input_required_accepts_state_only_and_rejects_empty_result_test() {
+  let assert Ok(peer) =
+    client.stdio_config("python3", [
+      "test/fixtures/stdio/input-required-peer.py",
+    ])
+    |> client.connect_stdio()
+  let assert Ok(state_name) = tool.tool_name("state-only")
+  let assert Ok(state_definition) =
+    tool.definition(state_name, codec.object(codec.empty()), codec.string())
+  let assert client.InputRequired(continuation, requests) =
+    client.call_definition(peer, state_definition, Nil)
+  dict.is_empty(requests) |> should.be_true()
+  should.equal(
+    client.resume_tool(continuation, dict.new()),
+    client.StructuredSuccess("resumed", []),
+  )
+  let assert Ok(empty_name) = tool.tool_name("empty-requests")
+  let assert Ok(empty_definition) =
+    tool.definition(empty_name, codec.object(codec.empty()), codec.string())
+  let assert client.InputRequired(empty_continuation, empty_requests) =
+    client.call_definition(peer, empty_definition, Nil)
+  dict.is_empty(empty_requests) |> should.be_true()
+  should.equal(
+    client.resume_tool(empty_continuation, dict.new()),
+    client.StructuredSuccess("resumed empty", []),
+  )
+  let assert Ok(invalid_name) = tool.tool_name("invalid")
+  let assert Ok(invalid_definition) =
+    tool.definition(invalid_name, codec.object(codec.empty()), codec.string())
+  let assert client.ProtocolFailure(reason) =
+    client.call_definition(peer, invalid_definition, Nil)
+  string.contains(reason, "no requests or requestState") |> should.be_true()
+  client.close(peer)
+}
+
+pub fn invalid_listing_bounds_fail_before_transport_start_test() {
+  let assert Ok(http_config) = client.http_config("http://127.0.0.1/")
+  http_config
+  |> client.with_listing_limits(client.ListingLimits(0, 1))
+  |> client.connect_http()
+  |> should.equal(Error(client.InvalidClientConfiguration))
+  let stdio_config =
+    client.StdioConfig(
+      ..client.stdio_config("/bin/echo", []),
+      listing_limits: client.ListingLimits(1, 0),
+    )
+  client.connect_stdio(stdio_config)
+  |> should.equal(Error(client.InvalidClientConfiguration))
+}
+
+pub fn content_only_continuation_has_no_output_codec_test() {
+  let config =
+    client.StdioConfig(
+      ..client.stdio_config("python3", [
+        "test/fixtures/stdio/input-required-peer.py",
+      ]),
+      input_methods: [client.Roots],
+    )
+  let assert Ok(peer) = client.connect_stdio(config)
+  let assert Ok(name) = tool.tool_name("content-only")
+  let assert Ok(definition) =
+    tool.content_definition(name, codec.object(codec.empty()))
+  let assert client.ContentInputRequired(continuation, requests) =
+    client.call_content_definition(peer, definition, Nil)
+  dict.has_key(requests, "root") |> should.be_true()
+  let replies =
+    dict.from_list([
+      #(
+        "root",
+        json.object([
+          #("roots", json.array([], fn(item) { item })),
+        ]),
+      ),
+    ])
+  should.equal(
+    client.resume_content(continuation, replies),
+    client.ContentSuccess([content.text_content("content resumed")]),
+  )
+  client.close(peer)
+}
+
+pub fn stdio_tool_call_close_is_typed_cancellation_test() {
+  let assert Ok(peer) =
+    client.stdio_config("python3", [
+      "test/fixtures/stdio/input-required-peer.py",
+    ])
+    |> client.connect_stdio()
+  let assert Ok(name) = tool.tool_name("slow")
+  let assert Ok(definition) =
+    tool.definition(name, codec.object(codec.empty()), codec.string())
+  let done = process.new_subject()
+  let _ =
+    process.spawn(fn() {
+      process.send(done, client.call_definition(peer, definition, Nil))
+    })
+  process.sleep(100)
+  client.close(peer)
+  let assert Ok(outcome) = process.receive(done, within: 3000)
+  outcome |> should.equal(client.TransportFailure(client.RequestCancelled))
 }

@@ -29,7 +29,7 @@ pub fn mcp_frozen_schema_checksum_test() {
 pub fn sibling_blueprint_pin_test() {
   // Sibling git head
   let head = ffi_git_head("../json_blueprint")
-  head |> should.equal("d3f0708b61eddb4a4789c0476ab5384267814a51")
+  head |> should.equal("ca50b5a915aaa5e38ef68ff70b102f2dd3f2fe67")
 
   // Sibling package version and license
   let assert Ok(manifest_bytes) = ffi_read_file("../json_blueprint/gleam.toml")
@@ -43,7 +43,7 @@ pub fn sibling_blueprint_pin_test() {
 pub fn sibling_sinal_pin_test() {
   // Sibling git head
   let head = ffi_git_head("../sinal")
-  head |> should.equal("dd09933e5466628f7d46fa896c389f31ba7d4cb6")
+  head |> should.equal("1c50c93a3a93569eb60a246475261e20430018b7")
 
   // Sibling package version
   let assert Ok(manifest_bytes) = ffi_read_file("../sinal/gleam.toml")

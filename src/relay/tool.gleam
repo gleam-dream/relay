@@ -286,6 +286,24 @@ pub fn with_input_schema_override(
   }
 }
 
+/// Augments discovery for a content-only definition without an output codec.
+/// The retained input codec still decodes every invocation.
+pub fn content_with_input_schema_override(
+  definition: ContentDefinition(input),
+  input_schema: Value,
+) -> Result(ContentDefinition(input), ToolAdmissionError) {
+  case input_schema {
+    value.Object(_) ->
+      Ok(
+        ContentDefinition(
+          ..definition,
+          input_schema_override: Some(input_schema),
+        ),
+      )
+    _ -> Error(InputSchemaMustBeObject("non-object"))
+  }
+}
+
 /// Validates the schemas once, before a handler is bound or a call is made.
 pub fn definition(
   name: ToolName,
@@ -439,6 +457,12 @@ pub type HandlerResult(output) {
   Complete(output, List(ContentBlock))
   Content(List(ContentBlock))
   NeedsInput(Dict(String, InputRequest))
+}
+
+/// Advanced content-only handlers can complete or request another input round.
+pub type ContentHandlerResult {
+  ContentComplete(List(ContentBlock))
+  ContentNeedsInput(Dict(String, InputRequest))
 }
 
 /// Callback available to handlers that report ordered, non-negative progress.
@@ -618,7 +642,7 @@ pub fn handle_content_with_error_renderer(
 pub fn handle_content_advanced(
   definition: ContentDefinition(input),
   handler: fn(HandlerCallContext(context), input) ->
-    Result(List(ContentBlock), application_error),
+    Result(ContentHandlerResult, application_error),
 ) -> ContextTool(context) {
   handle_content_advanced_with_error_renderer(definition, handler, fn(_error) {
     "Tool execution failed."
@@ -628,7 +652,7 @@ pub fn handle_content_advanced(
 pub fn handle_content_advanced_with_error_renderer(
   definition: ContentDefinition(input),
   handler: fn(HandlerCallContext(context), input) ->
-    Result(List(ContentBlock), application_error),
+    Result(ContentHandlerResult, application_error),
   render_error: fn(application_error) -> String,
 ) -> ContextTool(context) {
   let declaration =
@@ -649,14 +673,19 @@ pub fn handle_content_advanced_with_error_renderer(
       codec.decode(definition.input, raw_input)
       |> result.map_error(InvalidInput),
     )
-    handler(
-      HandlerCallContext(context, input_responses, report_progress),
-      typed_input,
+    use handler_result <- result.try(
+      handler(
+        HandlerCallContext(context, input_responses, report_progress),
+        typed_input,
+      )
+      |> result.map_error(fn(error) {
+        PublicApplicationFailure(render_error(error))
+      }),
     )
-    |> result.map(ContentOnly)
-    |> result.map_error(fn(error) {
-      PublicApplicationFailure(render_error(error))
-    })
+    case handler_result {
+      ContentComplete(blocks) -> Ok(ContentOnly(blocks))
+      ContentNeedsInput(requests) -> Ok(InputRequired(requests))
+    }
   }
   ContextTool(definition.name, declaration, invoke)
 }

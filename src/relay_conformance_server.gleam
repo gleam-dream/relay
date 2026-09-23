@@ -80,17 +80,11 @@ fn conformance_server(registry: tool.Registry(Nil)) -> server.Server(Nil) {
         Ok([content.BlobResourceContents(uri, png_1x1, Some("image/png"))])
       },
     )
-  let template =
-    resources.ContextResourceTemplate(
-      template: resources.ResourceTemplate(
-        uri_template: "test://template/{id}/data",
-        name: "Template Data",
-        title: None,
-        description: Some("Substituted JSON resource for conformance tests"),
-        mime_type: Some("application/json"),
-        annotations: None,
-      ),
-      read: fn(_context, uri) {
+  let assert Ok(template) =
+    resources.resource_template(
+      "test://template/{id}/data",
+      "Template Data",
+      fn(_context, uri) {
         let id = uri |> string.drop_start(string.length("test://template/"))
         let id = case string.split(id, on: "/data") {
           [value, ..] -> value
@@ -106,6 +100,12 @@ fn conformance_server(registry: tool.Registry(Nil)) -> server.Server(Nil) {
         Ok([content.TextResourceContents(uri, text, Some("application/json"))])
       },
     )
+  let template =
+    template
+    |> resources.with_template_description(Some(
+      "Substituted JSON resource for conformance tests",
+    ))
+    |> resources.with_template_mime_type(Some("application/json"))
   let prompts = [
     conformance_prompt("test_simple_prompt", [], fn(_args) {
       [

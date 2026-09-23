@@ -656,7 +656,9 @@ pub fn content_definition_retains_metadata_and_invocation_context_test() {
   let bound =
     tool.handle_content_advanced(definition, fn(call, input) {
       call.report_progress(9)
-      Ok([content.text_content(call.application <> input)])
+      Ok(
+        tool.ContentComplete([content.text_content(call.application <> input)]),
+      )
     })
   let assert Ok(registry) = tool.registry([bound])
   let assert [declaration] = tool.declarations(registry, "prefix:")
@@ -673,6 +675,58 @@ pub fn content_definition_retains_metadata_and_invocation_context_test() {
     )
   blocks |> should.equal([content.text_content("prefix:hello")])
   let assert Ok(9) = process.receive(reported, 100)
+}
+
+pub fn content_definition_override_and_input_round_test() {
+  let assert Ok(name) = tool.tool_name("content_round")
+  let assert Ok(definition) =
+    tool.content_definition(name, codec.field("input", codec.string()))
+  let override = value.Object([#("type", value.String("object"))])
+  let assert Ok(definition) =
+    tool.content_with_input_schema_override(definition, override)
+  let bound =
+    tool.handle_content_advanced(definition, fn(call, _input) {
+      case call.input_responses {
+        None ->
+          Ok(
+            tool.ContentNeedsInput(
+              dict.from_list([
+                #(
+                  "confirm",
+                  tool.InputRequest("elicitation/create", json.object([])),
+                ),
+              ]),
+            ),
+          )
+        Some(_) -> Ok(tool.ContentComplete([content.text_content("done")]))
+      }
+    })
+  let assert Ok(registry) = tool.registry([bound])
+  tool.input_schema_document(registry, name) |> should.equal(Some(override))
+  tool.dispatch_with_inputs(registry, Nil, name, value.Object([]), None, fn(_) {
+    Nil
+  })
+  |> should.be_error
+  let assert Ok(tool.InputRequired(_)) =
+    tool.dispatch_with_inputs(
+      registry,
+      Nil,
+      name,
+      value.Object([#("input", value.String("go"))]),
+      None,
+      fn(_) { Nil },
+    )
+  let assert Ok(tool.ContentOnly(_)) =
+    tool.dispatch_with_inputs(
+      registry,
+      Nil,
+      name,
+      value.Object([#("input", value.String("go"))]),
+      Some(value.Object([])),
+      fn(_) { Nil },
+    )
+  tool.content_with_input_schema_override(definition, value.String("bad"))
+  |> should.equal(Error(tool.InputSchemaMustBeObject("non-object")))
 }
 
 pub fn schema_override_changes_discovery_but_codec_still_validates_test() {

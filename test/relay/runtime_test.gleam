@@ -35,6 +35,101 @@ pub fn main() -> Nil {
   gleeunit.main()
 }
 
+fn send_output_to(
+  subject: process.Subject(BitArray),
+  output: runtime.RuntimeOutput,
+) -> Result(Nil, Nil) {
+  case output {
+    runtime.OutputWrite(_, bytes) -> process.send(subject, bytes)
+    runtime.OutputClose(_) -> Nil
+  }
+  Ok(Nil)
+}
+
+pub fn invalid_runtime_config_reports_field_before_start_test() {
+  let config = RuntimeConfig(..runtime.default_config(), max_frame_bytes: 0)
+  runtime.validate_config(config)
+  |> should.equal(
+    Error(runtime.InvalidRuntimeSetting(runtime.MaxFrameBytes, 0)),
+  )
+  runtime.start(sample_server(), config, fn(_output) { Ok(Nil) })
+  |> should.equal(
+    Error(
+      runtime.InvalidRuntimeConfig(runtime.InvalidRuntimeSetting(
+        runtime.MaxFrameBytes,
+        0,
+      )),
+    ),
+  )
+}
+
+pub fn closing_one_runtime_exchange_preserves_other_exchange_test() {
+  let outputs = process.new_subject()
+  let assert Ok(rt) =
+    runtime.start(sample_server(), runtime.default_config(), fn(output) {
+      process.send(outputs, output)
+      Ok(Nil)
+    })
+  let closing = server.fresh_exchange()
+  let survivor = server.fresh_exchange()
+  let slow =
+    make_call_frame("slow-close", "slow", json.object([#("ms", json.int(500))]))
+  let greet =
+    make_call_frame(
+      "survivor",
+      "greet",
+      json.object([#("name", json.string("Other"))]),
+    )
+  let assert Ok(Nil) = runtime.send_frame(rt, closing, "ctx", slow, 1000)
+  runtime.exchange_closed(rt, closing)
+  let assert Ok(Nil) = runtime.send_frame(rt, survivor, "ctx", greet, 1000)
+
+  let assert Ok(runtime.OutputClose(closed)) = process.receive(outputs, 1000)
+  closed |> should.equal(closing)
+  let assert Ok(runtime.OutputWrite(written, bytes)) =
+    process.receive(outputs, 1000)
+  written |> should.equal(survivor)
+  let assert Ok(text) = bit_array.to_string(bytes)
+  string.contains(text, "Other") |> should.be_true
+  let assert Ok(runtime.OutputClose(completed)) = process.receive(outputs, 1000)
+  completed |> should.equal(survivor)
+  runtime.stop(rt, 1000)
+}
+
+pub fn failed_output_closes_only_its_exchange_test() {
+  let failed = server.fresh_exchange()
+  let survivor = server.fresh_exchange()
+  let outputs = process.new_subject()
+  let assert Ok(rt) =
+    runtime.start(sample_server(), runtime.default_config(), fn(output) {
+      case output {
+        runtime.OutputWrite(exchange, _) if exchange == failed -> Error(Nil)
+        _ -> {
+          process.send(outputs, output)
+          Ok(Nil)
+        }
+      }
+    })
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, failed, "ctx", make_discover_frame("failed"), 1000)
+  let assert Ok(Nil) =
+    runtime.send_frame(
+      rt,
+      survivor,
+      "ctx",
+      make_discover_frame("survivor"),
+      1000,
+    )
+  let assert Ok(runtime.OutputClose(closed)) = process.receive(outputs, 1000)
+  closed |> should.equal(failed)
+  let assert Ok(runtime.OutputWrite(written, _)) =
+    process.receive(outputs, 1000)
+  written |> should.equal(survivor)
+  let assert Ok(runtime.OutputClose(completed)) = process.receive(outputs, 1000)
+  completed |> should.equal(survivor)
+  runtime.stop(rt, 1000)
+}
+
 fn sample_server() -> server.Server(String) {
   let assert Ok(greet_name) = tool.tool_name("greet")
   let assert Ok(greet_tool) = case
@@ -216,7 +311,7 @@ pub fn runtime_lifecycle_test() {
   let config = runtime.default_config()
 
   let assert Ok(rt) =
-    runtime.start(s, config, fn(bytes) { process.send(sink_subj, bytes) })
+    runtime.start(s, config, fn(output) { send_output_to(sink_subj, output) })
 
   // 1. Discover
   let ex1 = server.fresh_exchange()
@@ -259,8 +354,8 @@ pub fn duplicate_exchange_does_not_consume_live_capacity_test() {
   let config = RuntimeConfig(..runtime.default_config(), max_live_exchanges: 1)
   let output = process.new_subject()
   let assert Ok(rt) =
-    runtime.start(sample_server(), config, fn(bytes) {
-      process.send(output, bytes)
+    runtime.start(sample_server(), config, fn(item) {
+      send_output_to(output, item)
     })
   let duplicate = server.fresh_exchange()
   let request = make_discover_frame("duplicate")
@@ -295,7 +390,7 @@ pub fn runtime_crash_isolation_test() {
   let config = runtime.default_config()
 
   let assert Ok(rt) =
-    runtime.start(s, config, fn(bytes) { process.send(sink_subj, bytes) })
+    runtime.start(s, config, fn(output) { send_output_to(sink_subj, output) })
 
   // Call the crashing tool
   let ex = server.fresh_exchange()
@@ -355,7 +450,9 @@ pub fn request_admitted_runtime_observation_test() {
   }
   let assert Ok(att) = sinal.attach(hid, ev, handler, fn(_, _) { Nil })
   let assert Ok(rt) =
-    runtime.start(sample_server(), runtime.default_config(), fn(_bytes) { Nil })
+    runtime.start(sample_server(), runtime.default_config(), fn(_output) {
+      Ok(Nil)
+    })
   let exchange = server.fresh_exchange()
 
   let assert Ok(Nil) =
@@ -387,7 +484,7 @@ pub fn runtime_timeout_test() {
     )
 
   let assert Ok(rt) =
-    runtime.start(s, config, fn(bytes) { process.send(sink_subj, bytes) })
+    runtime.start(s, config, fn(output) { send_output_to(sink_subj, output) })
 
   // Call slow tool for 300ms
   let ex = server.fresh_exchange()
@@ -423,7 +520,7 @@ pub fn runtime_cancellation_test() {
     )
 
   let assert Ok(rt) =
-    runtime.start(s, config, fn(bytes) { process.send(sink_subj, bytes) })
+    runtime.start(s, config, fn(output) { send_output_to(sink_subj, output) })
 
   // Start slow tool
   let ex1 = server.fresh_exchange()
@@ -470,7 +567,7 @@ pub fn runtime_frame_bound_test() {
     )
 
   let assert Ok(rt) =
-    runtime.start(s, config, fn(bytes) { process.send(sink_subj, bytes) })
+    runtime.start(s, config, fn(output) { send_output_to(sink_subj, output) })
 
   let ex = server.fresh_exchange()
   let large_frame = make_discover_frame("large-1")
@@ -489,7 +586,7 @@ pub fn runtime_equal_wire_ids_on_distinct_exchanges_test() {
   let config = runtime.default_config()
 
   let assert Ok(rt) =
-    runtime.start(s, config, fn(bytes) { process.send(sink_subj, bytes) })
+    runtime.start(s, config, fn(output) { send_output_to(sink_subj, output) })
 
   // Two distinct exchanges with same JSON-RPC id: "same-id"
   let ex1 = server.fresh_exchange()
@@ -532,7 +629,7 @@ pub fn runtime_repeated_close_test() {
   let config = runtime.default_config()
 
   let assert Ok(rt) =
-    runtime.start(s, config, fn(bytes) { process.send(sink_subj, bytes) })
+    runtime.start(s, config, fn(output) { send_output_to(sink_subj, output) })
 
   runtime.close(rt)
   runtime.close(rt)
@@ -595,19 +692,26 @@ pub fn runtime_progress_backpressure_bounds_mailbox_test() {
   let config =
     RuntimeConfig(..runtime.default_config(), invocation_timeout_ms: 5000)
   let assert Ok(rt) =
-    runtime.start(server.server(registry), config, fn(_bytes) {
-      let hold = process.call_forever(gate, fn(reply) { DecideToHold(reply) })
-      case hold {
-        False -> Nil
-        True -> {
-          // Keep the writer parked while the producer has a chance to offer
-          // the rest of its burst, then inspect the runtime owner's mailbox.
-          process.sleep(100)
-          let queued = ffi_mailbox_size(ffi_self())
-          let release = process.new_subject()
-          process.send(observations, #(queued, release))
-          let _ = process.receive(release, 5000)
-          Nil
+    runtime.start(server.server(registry), config, fn(output) {
+      case output {
+        runtime.OutputClose(_) -> Ok(Nil)
+        runtime.OutputWrite(_, _) -> {
+          let hold =
+            process.call_forever(gate, fn(reply) { DecideToHold(reply) })
+          case hold {
+            False -> Nil
+            True -> {
+              // Keep the writer parked while the producer has a chance to offer
+              // the rest of its burst, then inspect the runtime owner's mailbox.
+              process.sleep(100)
+              let queued = ffi_mailbox_size(ffi_self())
+              let release = process.new_subject()
+              process.send(observations, #(queued, release))
+              let _ = process.receive(release, 5000)
+              Nil
+            }
+          }
+          Ok(Nil)
         }
       }
     })

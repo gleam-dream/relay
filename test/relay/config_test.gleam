@@ -79,9 +79,24 @@ pub fn service_modifiers_replace_lists_and_preserve_dispatch_test() {
   }
   let assert Ok(registry) = tool.registry([tool])
   let base =
-    server.server_with_dispatch(registry, fn(_context, _name, _args) {
-      Ok(value.String("custom dispatch"))
-    })
+    server.server(registry)
+    |> server.with_dispatch(
+      fn(current_registry, context, name, args, inputs, progress) {
+        case tool.contains(current_registry, name) {
+          True ->
+            tool.dispatch_with_inputs(
+              current_registry,
+              context,
+              name,
+              args,
+              inputs,
+              progress,
+            )
+          False ->
+            Ok(tool.StructuredWithContent(value.String("custom dispatch"), []))
+        }
+      },
+    )
   let first =
     resources.resource("memory://first", "first", fn(_context, uri) {
       Ok([content.TextResourceContents(uri, "first", None)])
@@ -90,7 +105,7 @@ pub fn service_modifiers_replace_lists_and_preserve_dispatch_test() {
     resources.resource("memory://second", "second", fn(_context, uri) {
       Ok([content.TextResourceContents(uri, "second", None)])
     })
-  let template =
+  let assert Ok(template) =
     resources.resource_template(
       "memory://second/{id}",
       "second template",
@@ -199,7 +214,20 @@ pub fn service_modifiers_replace_lists_and_preserve_dispatch_test() {
   let #(_, effects) = server.step(configured, server.perform(invocation))
   let assert [server.Write(_, response), _] = effects
   let assert Ok(response) = bit_array.to_string(response)
-  string.contains(response, "custom dispatch") |> should.be_true
+  string.contains(response, "hello") |> should.be_true
+
+  let #(without_tool, changed) = server.unregister_tool(configured, name)
+  changed |> should.be_true
+  let #(without_tool, effects) =
+    server.step(
+      without_tool,
+      server.MessageReceived(server.fresh_exchange(), Nil, envelope),
+    )
+  let assert [_, server.StartInvocation(invocation)] = effects
+  let #(_, effects) = server.step(without_tool, server.perform(invocation))
+  let assert [server.Write(_, fallback_response), _] = effects
+  let assert Ok(fallback_text) = bit_array.to_string(fallback_response)
+  string.contains(fallback_text, "custom dispatch") |> should.be_true
 }
 
 pub fn url_config_admits_only_supported_components_test() {

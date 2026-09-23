@@ -2,6 +2,7 @@ import gleam/dict.{type Dict}
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import json/blueprint/value.{type Value}
 import relay/content.{
   type ContentBlock, type Role, content_block_to_json, role_to_string,
@@ -64,7 +65,8 @@ pub type ContextPrompt(context) {
 pub fn prompt(
   name: String,
   arguments: List(PromptArgument),
-  get: fn(context, Dict(String, String)) -> Result(PromptResult, PromptError),
+  get: fn(context, Dict(String, String)) ->
+    Result(PromptResult, application_error),
 ) -> ContextPrompt(context) {
   ContextPrompt(
     prompt: Prompt(
@@ -73,7 +75,10 @@ pub fn prompt(
       description: None,
       arguments: arguments,
     ),
-    get: get,
+    get: fn(context, arguments) {
+      get(context, arguments)
+      |> result.map_error(fn(_) { PromptFailed("Prompt handler failed") })
+    },
   )
 }
 

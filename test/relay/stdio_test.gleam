@@ -15,6 +15,35 @@ pub fn main() -> Nil {
   gleeunit.main()
 }
 
+pub fn stdio_rejects_invalid_settings_before_io_test() {
+  let assert Ok(registry) = tool.registry([])
+  let server = server.server(registry)
+  let bad_chunk =
+    stdio.LocalUnprotectedStdioConfig(
+      ..stdio.default_stdio_config(),
+      chunk_size: 0,
+    )
+  stdio.run_local_unprotected_stdio_server(server, bad_chunk, Nil)
+  |> should.equal(Error(stdio.InvalidChunkSize(0)))
+
+  let bad_runtime =
+    runtime.RuntimeConfig(..runtime.default_config(), invocation_timeout_ms: 0)
+  let config =
+    stdio.LocalUnprotectedStdioConfig(
+      ..stdio.default_stdio_config(),
+      runtime_config: bad_runtime,
+    )
+  stdio.run_local_unprotected_stdio_server(server, config, Nil)
+  |> should.equal(
+    Error(
+      stdio.InvalidRuntimeConfig(runtime.InvalidRuntimeSetting(
+        runtime.InvocationTimeoutMs,
+        0,
+      )),
+    ),
+  )
+}
+
 @external(erlang, "relay_ffi", "spawn_stdio_child")
 fn ffi_spawn_stdio_child(cmd: String) -> dynamic.Dynamic
 
@@ -185,9 +214,11 @@ pub fn writer_failure_is_returned_as_a_typed_terminal_error_test() {
 pub fn oversized_frame_refusal_write_failure_stops_the_stream_test() {
   let assert Ok(registry) = tool.registry([])
   let assert Ok(rt) =
-    runtime.start(server.server(registry), runtime.default_config(), fn(_bytes) {
-      Nil
-    })
+    runtime.start(
+      server.server(registry),
+      runtime.default_config(),
+      fn(_output) { Ok(Nil) },
+    )
   let assert Ok(writer) =
     stdio.start_writer(fn(_bytes) { Error(stdio.StdoutBroken("closed pipe")) })
   let reader = fn() { stdio.ReadChunk(bit_array.from_string("too-long\n")) }

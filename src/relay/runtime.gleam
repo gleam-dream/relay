@@ -33,6 +33,58 @@ pub type RuntimeError {
   RuntimeStopped
 }
 
+pub type RuntimeStartError {
+  InvalidRuntimeConfig(RuntimeConfigError)
+  ActorStartFailed(actor.StartError)
+}
+
+pub type RuntimeConfigField {
+  MaxLiveExchanges
+  MaxFrameBytes
+  InvocationTimeoutMs
+  TombstoneRetentionMs
+}
+
+pub type RuntimeConfigError {
+  InvalidRuntimeSetting(field: RuntimeConfigField, value: Int)
+}
+
+pub type RuntimeOutput {
+  OutputWrite(exchange: ExchangeId, bytes: BitArray)
+  OutputClose(exchange: ExchangeId)
+}
+
+pub fn validate_config(
+  config: RuntimeConfig,
+) -> Result(Nil, RuntimeConfigError) {
+  case config.max_live_exchanges > 0 {
+    False ->
+      Error(InvalidRuntimeSetting(MaxLiveExchanges, config.max_live_exchanges))
+    True ->
+      case config.max_frame_bytes > 0 {
+        False ->
+          Error(InvalidRuntimeSetting(MaxFrameBytes, config.max_frame_bytes))
+        True ->
+          case config.invocation_timeout_ms > 0 {
+            False ->
+              Error(InvalidRuntimeSetting(
+                InvocationTimeoutMs,
+                config.invocation_timeout_ms,
+              ))
+            True ->
+              case config.tombstone_retention_ms > 0 {
+                False ->
+                  Error(InvalidRuntimeSetting(
+                    TombstoneRetentionMs,
+                    config.tombstone_retention_ms,
+                  ))
+                True -> Ok(Nil)
+              }
+          }
+      }
+  }
+}
+
 type RuntimeMessage(context) {
   ReceiveFrame(
     exchange: ExchangeId,
@@ -66,6 +118,7 @@ type RuntimeMessage(context) {
   RegisterDynamicTool(tool: ContextTool(context))
   UnregisterDynamicTool(name: ToolName)
   TerminateSubscriptionStream(id: RequestId)
+  ExchangeClosed(exchange: ExchangeId)
   Close
   Stop(reply: Subject(Nil))
 }
@@ -85,7 +138,7 @@ type RuntimeState(context) {
   RuntimeState(
     config: RuntimeConfig,
     server: Server(context),
-    write_sink: fn(BitArray) -> Result(Nil, Nil),
+    write_sink: fn(RuntimeOutput) -> Result(Nil, Nil),
     workers: List(WorkerHandle),
     tombstones: List(InvocationId),
     live_exchanges: Int,
@@ -108,21 +161,19 @@ fn ffi_rescue_run(fun: fn() -> a) -> Result(a, String)
 pub fn start(
   server: Server(context),
   config: RuntimeConfig,
-  write_sink: fn(BitArray) -> Nil,
-) -> Result(Runtime(context), actor.StartError) {
-  start_with_status_sink(server, config, fn(bytes) {
-    write_sink(bytes)
-    Ok(Nil)
-  })
+  write_sink: fn(RuntimeOutput) -> Result(Nil, Nil),
+) -> Result(Runtime(context), RuntimeStartError) {
+  case validate_config(config) {
+    Error(error) -> Error(InvalidRuntimeConfig(error))
+    Ok(Nil) -> start_validated(server, config, write_sink)
+  }
 }
 
-/// Starts the runtime with a writer that can report transport failure.
-/// Returning `Error(Nil)` closes the runtime and cancels active invocations.
-pub fn start_with_status_sink(
+fn start_validated(
   server: Server(context),
   config: RuntimeConfig,
-  write_sink: fn(BitArray) -> Result(Nil, Nil),
-) -> Result(Runtime(context), actor.StartError) {
+  write_sink: fn(RuntimeOutput) -> Result(Nil, Nil),
+) -> Result(Runtime(context), RuntimeStartError) {
   let builder =
     actor.new_with_initialiser(5000, fn(self_subject) {
       let selector =
@@ -151,7 +202,7 @@ pub fn start_with_status_sink(
 
   case actor.start(builder) {
     Ok(started) -> Ok(Runtime(started.data))
-    Error(err) -> Error(err)
+    Error(err) -> Error(ActorStartFailed(err))
   }
 }
 
@@ -173,6 +224,12 @@ pub fn send_frame(
 pub fn close(runtime: Runtime(context)) -> Nil {
   let Runtime(subject) = runtime
   process.send(subject, Close)
+}
+
+/// Reports that one transport exchange closed while other exchanges remain live.
+pub fn exchange_closed(runtime: Runtime(context), exchange: ExchangeId) -> Nil {
+  let Runtime(subject) = runtime
+  process.send(subject, ExchangeClosed(exchange))
 }
 
 /// Stops the runtime actor gracefully.
@@ -388,6 +445,8 @@ fn handle_message(
       actor.continue(next_st)
     }
 
+    ExchangeClosed(exchange) -> actor.continue(close_exchange(state, exchange))
+
     Close -> {
       let next_st = handle_close(state)
       actor.continue(next_st)
@@ -407,10 +466,10 @@ fn interpret_effects(
 ) -> RuntimeState(context) {
   list.fold(effects, state, fn(st, eff) {
     case eff {
-      server.Write(_ex, bytes) -> {
-        case st.write_sink(bytes) {
+      server.Write(ex, bytes) -> {
+        case st.write_sink(OutputWrite(ex, bytes)) {
           Ok(Nil) -> st
-          Error(Nil) -> handle_close(st)
+          Error(Nil) -> close_exchange(st, ex)
         }
       }
       server.StartInvocation(inv) -> {
@@ -421,6 +480,7 @@ fn interpret_effects(
       }
       server.CloseExchange(ex) -> {
         telemetry.emit_exchange_closed(server.exchange_id_to_int(ex))
+        let _ = st.write_sink(OutputClose(ex))
         RuntimeState(..st, live_exchanges: int.max(0, st.live_exchanges - 1))
       }
       server.SendProgress(_ex, _token, _val) -> {
@@ -436,6 +496,15 @@ fn interpret_effects(
       server.Ignore(_) -> st
     }
   })
+}
+
+fn close_exchange(
+  state: RuntimeState(context),
+  exchange: ExchangeId,
+) -> RuntimeState(context) {
+  let #(next_server, effects) =
+    server.step(state.server, server.ExchangeClosed(exchange))
+  interpret_effects(RuntimeState(..state, server: next_server), effects)
 }
 
 fn start_invocation(
