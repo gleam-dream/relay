@@ -15,6 +15,20 @@ pub fn main() -> Nil {
   gleeunit.main()
 }
 
+pub fn described_input_preserves_object_root_admission_test() {
+  let assert Ok(name) = tool.tool_name("described")
+  let input =
+    codec.field("city", codec.describe(codec.string(), "City to look up"))
+    |> codec.describe("Weather request")
+  tool.definition(name, input, codec.string()) |> should.be_ok
+  tool.definition(
+    name,
+    codec.describe(codec.string(), "Plain text"),
+    codec.string(),
+  )
+  |> should.be_error
+}
+
 // Positive test: Two tools with unrelated native input, output, and application-error
 // types coexist in one registry and are listed and invoked through the same public server.
 pub fn heterogeneous_tools_registry_test() {

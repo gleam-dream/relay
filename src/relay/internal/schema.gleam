@@ -37,6 +37,7 @@ pub fn validate_output_schema(
 /// Checks if a schema represents an object-like structure.
 pub fn is_object_schema(schema: Schema) -> Bool {
   case schema {
+    codec.DescribedSchema(_, inner) -> is_object_schema(inner)
     codec.ObjectSchema(_) -> True
     codec.FieldSchema(_, _) -> True
     codec.TaggedSchema(_, _, _, _) -> True
@@ -46,6 +47,7 @@ pub fn is_object_schema(schema: Schema) -> Bool {
 
 pub fn schema_type_name(schema: Schema) -> String {
   case schema {
+    codec.DescribedSchema(_, inner) -> schema_type_name(inner)
     codec.StringSchema -> "string"
     codec.StringEnumSchema(_) -> "string_enum"
     codec.IntSchema -> "integer"
