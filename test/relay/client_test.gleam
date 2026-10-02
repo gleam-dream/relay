@@ -366,14 +366,10 @@ fn many_named_tools(count: Int) -> List(tool.ContextTool(Nil)) {
 }
 
 fn fail_error_codec() -> codec.Codec(#(String, String)) {
-  use code <- codec.field("code", codec.string(), fn(error: #(String, String)) {
-    error.0
+  use code <- codec.field("code", codec.string(), get: fn(error) { error.0 })
+  use message <- codec.field("message", codec.string(), get: fn(error) {
+    error.1
   })
-  use message <- codec.field(
-    "message",
-    codec.string(),
-    fn(error: #(String, String)) { error.1 },
-  )
   codec.success(#(code, message))
 }
 

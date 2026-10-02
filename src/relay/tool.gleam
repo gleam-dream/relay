@@ -16,7 +16,7 @@
 //// pub fn greet() -> tool.ContextTool(Nil) {
 ////   let assert Ok(name) = tool.tool_name("greet")
 ////   let input = {
-////     use name <- codec.field("name", codec.string(), fn(name: String) { name })
+////     use name <- codec.field("name", codec.string(), get: fn(name) { name })
 ////     codec.success(name)
 ////   }
 ////   let assert Ok(definition) = tool.definition(name, input, codec.string())

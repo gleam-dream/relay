@@ -47,49 +47,48 @@ pub type ExchangeClosedMeta {
 // Descriptors
 
 pub fn frame_rejected_event() -> Event(Nil, FrameRejectedMeta) {
-  let meta =
-    fields.record({
-      use exchange_id <- fields.parameter
-      use reason <- fields.parameter
-      FrameRejectedMeta(exchange_id:, reason:)
-    })
-    |> fields.and(fields.int("exchange_id"), fn(m: FrameRejectedMeta) {
+  let meta = {
+    use exchange_id <- fields.include(fields.int("exchange_id"), get: fn(m) {
       m.exchange_id
     })
-    |> fields.and(fields.string("reason"), fn(m) { m.reason })
-    |> fields.build
+    use reason <- fields.include(fields.string("reason"), get: fn(m) {
+      m.reason
+    })
+    fields.success(FrameRejectedMeta(exchange_id:, reason:))
+  }
   sinal.event(["relay", "frame", "rejected"], fields.empty(), meta)
 }
 
 pub fn request_admitted_event() -> Event(Nil, RequestAdmittedMeta) {
-  let meta =
-    fields.record({
-      use exchange_id <- fields.parameter
-      use method <- fields.parameter
-      RequestAdmittedMeta(exchange_id:, method:)
-    })
-    |> fields.and(fields.int("exchange_id"), fn(m: RequestAdmittedMeta) {
+  let meta = {
+    use exchange_id <- fields.include(fields.int("exchange_id"), get: fn(m) {
       m.exchange_id
     })
-    |> fields.and(fields.string("method"), fn(m) { m.method })
-    |> fields.build
+    use method <- fields.include(fields.string("method"), get: fn(m) {
+      m.method
+    })
+    fields.success(RequestAdmittedMeta(exchange_id:, method:))
+  }
   sinal.event(["relay", "request", "admitted"], fields.empty(), meta)
 }
 
 pub fn invocation_started_event() -> Event(Nil, InvocationStartedMeta) {
-  let meta =
-    fields.record({
-      use exchange_id <- fields.parameter
-      use invocation_id <- fields.parameter
-      use tool_name <- fields.parameter
-      InvocationStartedMeta(exchange_id:, invocation_id:, tool_name:)
-    })
-    |> fields.and(fields.int("exchange_id"), fn(m: InvocationStartedMeta) {
+  let meta = {
+    use exchange_id <- fields.include(fields.int("exchange_id"), get: fn(m) {
       m.exchange_id
     })
-    |> fields.and(fields.int("invocation_id"), fn(m) { m.invocation_id })
-    |> fields.and(fields.string("tool_name"), fn(m) { m.tool_name })
-    |> fields.build
+    use invocation_id <- fields.include(fields.int("invocation_id"), get: fn(m) {
+      m.invocation_id
+    })
+    use tool_name <- fields.include(fields.string("tool_name"), get: fn(m) {
+      m.tool_name
+    })
+    fields.success(InvocationStartedMeta(
+      exchange_id:,
+      invocation_id:,
+      tool_name:,
+    ))
+  }
   sinal.event(["relay", "invocation", "started"], fields.empty(), meta)
 }
 
@@ -97,61 +96,61 @@ pub fn invocation_completed_event() -> Event(
   InvocationCompletedMeasurements,
   InvocationCompletedMeta,
 ) {
-  let measurements =
-    fields.record(InvocationCompletedMeasurements)
-    |> fields.and(
-      fields.int("duration_ms"),
-      fn(m: InvocationCompletedMeasurements) { m.duration_ms },
-    )
-    |> fields.build
-  let meta =
-    fields.record({
-      use exchange_id <- fields.parameter
-      use invocation_id <- fields.parameter
-      use status <- fields.parameter
-      InvocationCompletedMeta(exchange_id:, invocation_id:, status:)
+  let measurements = {
+    use duration_ms <- fields.include(fields.int("duration_ms"), get: fn(m) {
+      m.duration_ms
     })
-    |> fields.and(fields.int("exchange_id"), fn(m: InvocationCompletedMeta) {
+    fields.success(InvocationCompletedMeasurements(duration_ms))
+  }
+  let meta = {
+    use exchange_id <- fields.include(fields.int("exchange_id"), get: fn(m) {
       m.exchange_id
     })
-    |> fields.and(fields.int("invocation_id"), fn(m) { m.invocation_id })
-    |> fields.and(fields.string("status"), fn(m) { m.status })
-    |> fields.build
+    use invocation_id <- fields.include(fields.int("invocation_id"), get: fn(m) {
+      m.invocation_id
+    })
+    use status <- fields.include(fields.string("status"), get: fn(m) {
+      m.status
+    })
+    fields.success(InvocationCompletedMeta(
+      exchange_id:,
+      invocation_id:,
+      status:,
+    ))
+  }
   sinal.event(["relay", "invocation", "completed"], measurements, meta)
 }
 
 pub fn invocation_cancelled_event() -> Event(Nil, InvocationCancelledMeta) {
-  let meta =
-    fields.record(InvocationCancelledMeta)
-    |> fields.and(fields.int("invocation_id"), fn(m: InvocationCancelledMeta) {
+  let meta = {
+    use invocation_id <- fields.include(fields.int("invocation_id"), get: fn(m) {
       m.invocation_id
     })
-    |> fields.build
+    fields.success(InvocationCancelledMeta(invocation_id))
+  }
   sinal.event(["relay", "invocation", "cancelled"], fields.empty(), meta)
 }
 
 pub fn invocation_crashed_event() -> Event(Nil, InvocationCrashedMeta) {
-  let meta =
-    fields.record({
-      use invocation_id <- fields.parameter
-      use reason <- fields.parameter
-      InvocationCrashedMeta(invocation_id:, reason:)
-    })
-    |> fields.and(fields.int("invocation_id"), fn(m: InvocationCrashedMeta) {
+  let meta = {
+    use invocation_id <- fields.include(fields.int("invocation_id"), get: fn(m) {
       m.invocation_id
     })
-    |> fields.and(fields.string("reason"), fn(m) { m.reason })
-    |> fields.build
+    use reason <- fields.include(fields.string("reason"), get: fn(m) {
+      m.reason
+    })
+    fields.success(InvocationCrashedMeta(invocation_id:, reason:))
+  }
   sinal.event(["relay", "invocation", "crashed"], fields.empty(), meta)
 }
 
 pub fn exchange_closed_event() -> Event(Nil, ExchangeClosedMeta) {
-  let meta =
-    fields.record(ExchangeClosedMeta)
-    |> fields.and(fields.int("exchange_id"), fn(m: ExchangeClosedMeta) {
+  let meta = {
+    use exchange_id <- fields.include(fields.int("exchange_id"), get: fn(m) {
       m.exchange_id
     })
-    |> fields.build
+    fields.success(ExchangeClosedMeta(exchange_id))
+  }
   sinal.event(["relay", "exchange", "closed"], fields.empty(), meta)
 }
 

@@ -593,11 +593,9 @@ fn custom_header_tool() -> tool.ContextTool(Nil) {
     tool.definition(
       name,
       {
-        use payload <- codec.field(
-          "payload",
-          codec.string(),
-          fn(payload: String) { payload },
-        )
+        use payload <- codec.field("payload", codec.string(), get: fn(payload) {
+          payload
+        })
         codec.success(payload)
       },
       codec.success(Nil),
