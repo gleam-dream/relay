@@ -1,3 +1,20 @@
+//// Bearer-token authorization primitives for an MCP resource server: validated
+//// tokens, resources and scopes, a verifier, request admission, and per-tool
+//// visibility and execution policy.
+////
+//// Use this module when an application authenticates MCP requests itself. A
+//// `Verifier` owns token parsing and any key or introspection work, and returns
+//// a `VerifierAttestation`. `admit` accepts the attestation only when it names
+//// exactly the configured resource and carries every required scope, and then
+//// returns a `GrantedRequest`. `protect_registry` binds a `ToolPolicy` to a
+//// `relay/tool` registry; `visible_declarations` and `dispatch_granted` apply
+//// that policy to a granted request.
+////
+//// The bundled listeners in `relay/transport/http` and `relay/transport/stdio`
+//// do not call this module and enforce no bearer grants. A `BearerToken` keeps
+//// its raw value inside a closure, so `string.inspect` and crash reports print
+//// a function reference instead of the token.
+
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result

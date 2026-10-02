@@ -1,3 +1,28 @@
+//// Typed MCP tool definitions, handlers, and the registry a server dispatches
+//// to.
+////
+//// `tool_name` admits a name. `definition(name, input_codec, output_codec)`
+//// builds a `Definition` from Blueprint codecs, and `content_definition` builds
+//// one for a tool that returns only content. `handle` and its variants bind a
+//// handler and return a `ContextTool`; `registry` collects tools for
+//// `relay/server.server`. The same definition drives
+//// `relay/client.call_definition`. Description, title, annotation, metadata
+//// and input-schema modifiers adjust the published declaration.
+////
+//// ```gleam
+//// import json/blueprint/codec
+//// import relay/tool
+////
+//// pub fn greet() -> tool.ContextTool(Nil) {
+////   let assert Ok(name) = tool.tool_name("greet")
+////   let assert Ok(definition) =
+////     tool.definition(name, codec.field("name", codec.string()), codec.string())
+////   definition
+////   |> tool.with_description("Greets the user by name")
+////   |> tool.handle(fn(name) { Ok("Hello, " <> name <> "!") })
+//// }
+//// ```
+
 import gleam/dict.{type Dict}
 import gleam/json
 import gleam/list

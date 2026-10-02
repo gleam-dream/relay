@@ -1,3 +1,29 @@
+//// Local stdio transport that runs a `relay/server.Server` over standard input
+//// and output.
+////
+//// `run_local_unprotected_stdio_server` reads newline-delimited JSON-RPC frames
+//// from standard input until it closes, writes replies to standard output, and
+//// keeps diagnostics on standard error (`log_stderr`). It enforces no
+//// authorization, so use it only under a trusted parent process. The framer and
+//// writer functions are public for custom stdio loops. To launch a stdio server
+//// as a client, use `relay/client.connect_stdio`.
+////
+//// ```gleam
+//// import relay/server
+//// import relay/tool
+//// import relay/transport/stdio
+////
+//// pub fn main() {
+////   let assert Ok(registry) = tool.registry([])
+////   let assert Ok(Nil) =
+////     stdio.run_local_unprotected_stdio_server(
+////       server.server(registry),
+////       stdio.default_stdio_config(),
+////       Nil,
+////     )
+//// }
+//// ```
+
 import gleam/bit_array
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/list

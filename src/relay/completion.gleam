@@ -1,3 +1,13 @@
+//// Argument completion handlers for prompts and resource templates
+//// (`completion/complete`).
+////
+//// `completion` wraps an application handler and replaces its error with a
+//// generic `CompletionFailed`. `completion_with_context` also receives the
+//// request's context arguments, when present, and returns `CompletionError`
+//// directly. `completion_values` and the JSON encoder keep at most 100 values.
+//// Attach a handler with `relay/server.with_completion`; a client calls it with
+//// `relay/client.complete`.
+
 import gleam/dict.{type Dict}
 import gleam/json
 import gleam/list

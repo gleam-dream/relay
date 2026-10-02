@@ -1,3 +1,10 @@
+//// JSON-RPC 2.0 identifiers and error values used by Relay's MCP messages.
+////
+//// This module defines request ids, progress tokens, the standard and
+//// MCP-specific error codes with their constructors, and the JSON encoders for
+//// them. `relay/server` and `relay/runtime` use these types, for example
+//// `relay/runtime.terminate_subscription` takes a `RequestId`.
+
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}

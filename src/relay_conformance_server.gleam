@@ -1,3 +1,11 @@
+//// Fixture server for the official MCP conformance harness. It is not part of
+//// the library API, and applications should not import it.
+////
+//// `main` starts a Streamable HTTP listener on `127.0.0.1` with the harness's
+//// test tools, resources and prompts, prints `RELAY_CONFORMANCE_URL=...`, and
+//// runs until stopped. `scripts/conformance/run-server-suite.sh` runs it with
+//// `gleam run -m relay_conformance_server`.
+
 import gleam/dict
 import gleam/erlang/process
 import gleam/int

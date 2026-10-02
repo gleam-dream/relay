@@ -1,3 +1,10 @@
+//// MCP logging severity levels and their wire names.
+////
+//// `parse_level` reads a level name, `level_name` renders one, and `permits`
+//// compares a message level with a threshold. The server reads the threshold a
+//// request supplies in its metadata with this module. Relay does not implement
+//// `logging/setLevel`.
+
 /// A protocol logging threshold supplied in request metadata.
 pub type LogLevel {
   Debug

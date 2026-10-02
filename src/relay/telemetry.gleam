@@ -1,3 +1,14 @@
+//// Sinal telemetry events that Relay's runtime emits.
+////
+//// The events are `[relay, frame, rejected]`, `[relay, request, admitted]`,
+//// `[relay, invocation, started]`, `[relay, invocation, completed]`,
+//// `[relay, invocation, cancelled]`, `[relay, invocation, crashed]` and
+//// `[relay, exchange, closed]`. Each `*_event` function returns the
+//// `sinal.Event` descriptor that a handler attaches to. The `emit_*` functions
+//// are what `relay/runtime` calls; they ignore emission failures. Metadata
+//// holds exchange and invocation ids, the request method, and a reason string
+//// for rejections and crashes.
+
 import gleam/erlang/atom
 import sinal.{type Event}
 import sinal/fields

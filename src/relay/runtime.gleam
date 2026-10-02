@@ -1,3 +1,15 @@
+//// The OTP actor that owns a `relay/server.Server` and drives it for a
+//// transport.
+////
+//// Use this module to build a custom transport. `start` validates a
+//// `RuntimeConfig` (live exchanges, frame size, invocation timeout and
+//// tombstone retention; `default_config` sets 100, 1 MiB, 30 s and 60 s) and
+//// then calls the transport's write sink with `OutputWrite` and `OutputClose`.
+//// `send_frame` submits a received frame on an exchange, `exchange_closed`
+//// reports a peer disconnect, and the `notify_*`, `register_tool` and
+//// `unregister_tool` functions change the live server. The stdio and HTTP
+//// transports run on this module.
+
 import gleam/bit_array
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int

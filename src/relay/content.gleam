@@ -1,3 +1,12 @@
+//// MCP content values and their wire JSON encoders: text, image, audio,
+//// resource-link and embedded-resource blocks, resource contents, roles and
+//// annotations.
+////
+//// Tools (`relay/tool`), prompts (`relay/prompts`) and resources
+//// (`relay/resources`) return these values, and `relay/client` decodes results
+//// into them. `text_content`, `image_content` and `audio_content` build blocks
+//// without annotations.
+
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}

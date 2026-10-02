@@ -1,3 +1,34 @@
+//// MCP client for the `2026-07-28` revision over Streamable HTTP or a local
+//// stdio child process.
+////
+//// Use this module to discover a peer, list and call tools, read resources, get
+//// prompts, request completions, listen for subscription notifications, and
+//// send raw checked JSON-RPC calls. `http_config` derives an `HttpClientConfig`
+//// from an absolute URL, and `stdio_config` describes a child process; both
+//// carry explicit timeout, response-size, input-method and listing limits.
+////
+//// `call_definition` and `call_content_definition` reuse the codecs of a
+//// `relay/tool` definition. `call_discovered` sends exact
+//// `json/blueprint/value` arguments to a tool returned by `list_tools`. An
+//// `InputRequired` outcome holds a continuation that `resume_tool` answers, so
+//// the peer must stay open until the call reaches a terminal outcome.
+////
+//// ```gleam
+//// import gleam/result
+//// import relay/client
+//// import relay/tool
+////
+//// pub fn call_greet(
+////   definition: tool.Definition(String, String),
+//// ) -> Result(#(client.Client, client.ToolCallOutcome(String)), client.ClientError) {
+////   use config <- result.try(client.http_config("http://127.0.0.1:3000/"))
+////   use peer <- result.try(
+////     config |> client.with_timeout(30_000) |> client.connect_http(),
+////   )
+////   Ok(#(peer, client.call_definition(peer, definition, "Ada")))
+//// }
+//// ```
+
 import gleam/bit_array
 import gleam/dict.{type Dict}
 import gleam/dynamic.{type Dynamic}

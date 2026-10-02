@@ -1,3 +1,13 @@
+//// Prompt declarations and handlers for `prompts/list` and `prompts/get`.
+////
+//// `prompt(name, arguments, get)` declares a prompt whose handler error is
+//// replaced with a generic `PromptFailed`. `prompt_with_inputs` takes a full
+//// `Prompt` and a handler that may return `RequestPromptInput` to ask the
+//// client for another input round (`relay/tool.InputRequest`). Prompt messages
+//// carry `relay/content` blocks. Attach prompts with
+//// `relay/server.with_prompts`; a client reads them with
+//// `relay/client.list_prompts` and `relay/client.get_prompt`.
+
 import gleam/dict.{type Dict}
 import gleam/json
 import gleam/list

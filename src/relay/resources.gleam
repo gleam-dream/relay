@@ -1,3 +1,14 @@
+//// Static resources and resource templates for `resources/list`,
+//// `resources/templates/list` and `resources/read`.
+////
+//// `resource(uri, name, read)` declares a static resource. `resource_template`
+//// admits a URI template with one simple `{name}` variable per slash segment,
+//// including embedded forms such as `{id}.png`; `resource_template_with_matcher`
+//// accepts other syntax with an application-owned matcher. The simple
+//// constructors replace handler errors with a generic `ResourceFailed`. Read
+//// results are `relay/content.ResourceContents`. Attach resources with
+//// `relay/server.with_resources` and `relay/server.with_resource_templates`.
+
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}

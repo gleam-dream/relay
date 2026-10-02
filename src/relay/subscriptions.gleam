@@ -1,3 +1,10 @@
+//// The notification filter a client sends with `subscriptions/listen`.
+////
+//// `SubscriptionFilter` selects list-changed notifications for tools, resources
+//// and prompts, and update notifications for named resource URIs.
+//// `filter_supported` drops the kinds a server does not offer. `relay/server`
+//// applies the filter, and `relay/client.listen` sends it.
+
 /// The set of notification types a client opts into via subscriptions/listen.
 pub type SubscriptionFilter {
   SubscriptionFilter(

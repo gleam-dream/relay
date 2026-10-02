@@ -1,3 +1,30 @@
+//// Streamable HTTP listener for a `relay/server.Server`, built on mist.
+////
+//// Describe a listener with `listener`, adjust it with `with_options`,
+//// `with_policy`, `with_tls` and `allow_unauthenticated`, then call `start`.
+//// The default binds `127.0.0.1` on an ephemeral port, with a loopback Host and
+//// Origin allow-list, 1 MiB body and response limits, a 30 s request timeout
+//// and a 250 ms SSE keepalive. The listener enforces no authorization, so
+//// `start` refuses a non-loopback host unless the listener carries
+//// `allow_unauthenticated`; `validate` returns that refusal as a typed
+//// `ListenerError`. A running `HttpServer` can register and unregister tools
+//// and send list-changed and resource-updated notifications.
+////
+//// ```gleam
+//// import relay/server
+//// import relay/tool
+//// import relay/transport/http
+////
+//// pub fn serve() -> Int {
+////   let assert Ok(registry) = tool.registry([])
+////   let assert Ok(running) =
+////     http.listener(server.server(registry), fn() { Nil })
+////     |> http.with_options(http.HttpOptions(port: 3000, host: "127.0.0.1"))
+////     |> http.start
+////   http.http_server_port(running)
+//// }
+//// ```
+
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/erlang/atom

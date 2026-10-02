@@ -1,3 +1,30 @@
+//// The immutable MCP server description and its pure reducer.
+////
+//// `server(registry)` builds a `Server` from a `relay/tool` registry, and
+//// `with_resources`, `with_resource_templates`, `with_prompts`, `with_completion`
+//// and `with_dispatch` add services to it. Pass the result to
+//// `relay/transport/stdio`, `relay/transport/http` or `relay/runtime`. `step`
+//// reduces one `ServerInput` to a new server and a list of `ServerEffect`
+//// values and performs no I/O, so a custom transport can drive it directly.
+////
+//// ```gleam
+//// import gleam/option.{None}
+//// import relay/content
+//// import relay/resources
+//// import relay/server
+//// import relay/tool
+////
+//// pub fn service() -> server.Server(Nil) {
+////   let assert Ok(registry) = tool.registry([])
+////   let readme =
+////     resources.resource("memo://readme", "Readme", fn(_context, uri) {
+////       Ok([content.TextResourceContents(uri, "Hello", None)])
+////     })
+////   server.server(registry)
+////   |> server.with_resources([readme])
+//// }
+//// ```
+
 import gleam/bit_array
 import gleam/dict.{type Dict}
 import gleam/int

@@ -1,3 +1,10 @@
+//// MCP protocol revision identifiers.
+////
+//// `ProtocolRevision` names the `2026-07-28` revision that Relay implements and
+//// the legacy `2025-11-25` revision, which Relay recognizes but does not
+//// implement. `to_string` renders the wire string, and `supported_versions`
+//// lists the versions the `2026-07-28` server supports.
+
 /// Protocol revisions supported or recognized by Relay.
 pub type ProtocolRevision {
   /// MCP 2026-07-28: modern, sessionless revision with per-request _meta.
