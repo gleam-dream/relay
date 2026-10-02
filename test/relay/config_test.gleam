@@ -332,3 +332,57 @@ pub fn configured_https_lifecycle_and_invalid_listener_test() {
   client.close(peer)
   http.stop_http_server(running)
 }
+
+pub fn loopback_listener_starts_without_protection_test() {
+  let base = http.listener(empty_server(), fn() { Nil })
+  ["127.0.0.1", "127.0.0.2", "localhost", "::1"]
+  |> list.each(fn(host) {
+    http.with_options(base, http.HttpOptions(port: 0, host: host))
+    |> http.validate
+    |> should.equal(Ok(Nil))
+  })
+  let assert Ok(running) =
+    http.start(http.with_options(
+      base,
+      http.HttpOptions(port: 0, host: "127.0.0.1"),
+    ))
+  http.stop_http_server(running)
+}
+
+pub fn non_loopback_listener_without_protection_is_refused_test() {
+  let base = http.listener(empty_server(), fn() { Nil })
+  ["0.0.0.0", "::", "192.168.1.10", "10.0.0.1"]
+  |> list.each(fn(host) {
+    http.with_options(base, http.HttpOptions(port: 0, host: host))
+    |> http.validate
+    |> should.equal(Error(http.UnauthenticatedNonLoopbackBind(host: host)))
+  })
+  let assert Error(message) =
+    http.start(http.with_options(
+      base,
+      http.HttpOptions(port: 0, host: "0.0.0.0"),
+    ))
+  message
+  |> should.equal(
+    http.describe_listener_error(http.UnauthenticatedNonLoopbackBind(
+      host: "0.0.0.0",
+    )),
+  )
+  string.contains(message, "0.0.0.0") |> should.be_true
+  string.contains(message, "http.allow_unauthenticated") |> should.be_true
+}
+
+pub fn non_loopback_listener_starts_with_explicit_opt_in_test() {
+  let listener =
+    http.listener(empty_server(), fn() { Nil })
+    |> http.with_options(http.HttpOptions(port: 0, host: "0.0.0.0"))
+    |> http.allow_unauthenticated
+  http.validate(listener) |> should.equal(Ok(Nil))
+  let assert Ok(running) = http.start(listener)
+  let url = "http://127.0.0.1:" <> int.to_string(http.http_server_port(running))
+  let assert Ok(config) = client.http_config(url)
+  let assert Ok(peer) = client.connect_http(config)
+  let assert Ok(_discovery) = client.discover(peer)
+  client.close(peer)
+  http.stop_http_server(running)
+}

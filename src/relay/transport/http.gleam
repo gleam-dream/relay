@@ -22,11 +22,17 @@ import relay/tool as relay_tool
 @external(erlang, "relay_url_ffi", "valid_bind_host")
 fn valid_bind_host(host: String) -> Bool
 
+@external(erlang, "relay_url_ffi", "loopback_bind_host")
+fn loopback_bind_host(host: String) -> Bool
+
 @external(erlang, "relay_url_ffi", "readable_file")
 fn readable_file(path: String) -> Bool
 
 /// Streamable HTTP listener options. Bind `host` to a loopback interface for
-/// local development; remote listeners should use an explicit policy.
+/// local development. A non-loopback `host` also needs an explicit Host and
+/// Origin policy, and `start` refuses it unless the listener carries
+/// `allow_unauthenticated`, because the bundled listener does not enforce
+/// bearer grants.
 pub type HttpOptions {
   HttpOptions(port: Int, host: String)
 }
@@ -53,7 +59,19 @@ pub opaque type HttpListener(context) {
     policy: HttpPolicy,
     context: fn() -> context,
     tls: Option(#(String, String)),
+    unauthenticated_allowed: Bool,
   )
+}
+
+/// Why `validate` or `start` refuses a listener description.
+pub type ListenerError {
+  /// The bind options, the policy limits or allow-lists, or the TLS files are
+  /// invalid.
+  InvalidListenerSettings
+  /// `host` is not a loopback address, and the listener has no authorization
+  /// protection. Bind a loopback host, or call `allow_unauthenticated` when a
+  /// trusted network or proxy protects the listener.
+  UnauthenticatedNonLoopbackBind(host: String)
 }
 
 pub fn listener(
@@ -67,6 +85,7 @@ pub fn listener(
     policy: local_http_policy(host),
     context: context,
     tls: None,
+    unauthenticated_allowed: False,
   )
 }
 
@@ -93,6 +112,17 @@ pub fn with_tls(
   keyfile: String,
 ) -> HttpListener(context) {
   HttpListener(..listener, tls: Some(#(certfile, keyfile)))
+}
+
+/// Lets `start` bind a non-loopback host although this listener enforces no
+/// authorization. Every peer that can reach the address can then call every
+/// tool, read every resource and run every prompt. This is unsafe outside a
+/// trusted network, or without a proxy in front that authenticates each
+/// request. Loopback binds do not need it.
+pub fn allow_unauthenticated(
+  listener: HttpListener(context),
+) -> HttpListener(context) {
+  HttpListener(..listener, unauthenticated_allowed: True)
 }
 
 pub opaque type HttpServer(context) {
@@ -430,14 +460,47 @@ pub fn local_http_policy(host: String) -> HttpPolicy {
   )
 }
 
-/// Validates the entire description before allocating the hub or listener.
+/// Checks a listener description without starting it. It fails with
+/// `InvalidListenerSettings` for invalid options, policy or TLS files, and
+/// with `UnauthenticatedNonLoopbackBind` for a non-loopback host without
+/// `allow_unauthenticated`.
+pub fn validate(listener: HttpListener(context)) -> Result(Nil, ListenerError) {
+  case valid_listener(listener) {
+    False -> Error(InvalidListenerSettings)
+    True ->
+      case
+        listener.unauthenticated_allowed
+        || loopback_bind_host(listener.options.host)
+      {
+        True -> Ok(Nil)
+        False ->
+          Error(UnauthenticatedNonLoopbackBind(host: listener.options.host))
+      }
+  }
+}
+
+/// Renders a listener error as the message `start` returns.
+pub fn describe_listener_error(error: ListenerError) -> String {
+  case error {
+    InvalidListenerSettings ->
+      "Invalid Relay HTTP listener options, policy, or TLS settings"
+    UnauthenticatedNonLoopbackBind(host) ->
+      "Relay HTTP listener refuses to bind non-loopback host "
+      <> host
+      <> " without authorization: bind a loopback host, or call "
+      <> "http.allow_unauthenticated(listener) when a trusted network or "
+      <> "proxy protects it"
+  }
+}
+
+/// Validates the entire description with `validate` before allocating the hub
+/// or listener, and returns `describe_listener_error` of a refusal.
 pub fn start(
   listener: HttpListener(context),
 ) -> Result(HttpServer(context), String) {
-  case valid_listener(listener) {
-    False ->
-      Error("Invalid Relay HTTP listener options, policy, or TLS settings")
-    True ->
+  case validate(listener) {
+    Error(error) -> Error(describe_listener_error(error))
+    Ok(Nil) ->
       case start_hub(listener.server) {
         Error(_) -> Error("Relay subscription hub failed to start")
         Ok(hub) -> {
