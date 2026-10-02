@@ -8,15 +8,19 @@ description = "A Gleam MCP server and client for the frozen 2026-07-28 revision,
 repository = { type = "github", user = "gleam-dream", repo = "relay" }
 
 [dependencies]
-gleam_stdlib = ">= 0.70.0 and < 1.0.0"
+gleam_stdlib = ">= 0.70.0 and < 2.0.0"
 gleam_json = ">= 3.0.0 and < 4.0.0"
 gleam_http = ">= 4.4.0 and < 5.0.0"
 gleam_erlang = ">= 1.0.0 and < 2.0.0"
 gleam_otp = ">= 1.0.0 and < 2.0.0"
 json_blueprint = { path = "../json_blueprint" }
 sinal = { path = "../sinal" }
-mist = "== 6.0.2"
-gun = "== 2.6.0"
+# relay_ffi.erl reads mist's internal `Connection` record (body, socket,
+# transport, factory_name) to set SSE send timeouts and write keepalive
+# comments. The record shape is identical in mist 6.0.2 and 6.0.3; recheck it
+# and the SSE keepalive tests when a new mist 6.x release appears.
+mist = ">= 6.0.2 and < 7.0.0"
+gun = ">= 2.6.0 and < 3.0.0"
 
 [dev-dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"
