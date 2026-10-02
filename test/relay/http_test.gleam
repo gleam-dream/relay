@@ -31,6 +31,24 @@ fn disconnect_after_first_sse_event(
   body: BitArray,
 ) -> Result(Int, String)
 
+@external(erlang, "relay_http_ffi", "send_and_hold")
+fn send_and_hold(
+  port: Int,
+  method: String,
+  headers: List(#(String, String)),
+  body: BitArray,
+) -> Result(HeldConnection, String)
+
+@external(erlang, "relay_http_ffi", "abort_connection")
+fn abort_connection(connection: HeldConnection) -> BitArray
+
+type HeldConnection
+
+type SlowNotice {
+  SlowStarted(process.Pid)
+  SlowFinished
+}
+
 type ProgressNotice {
   ProgressBurstStarted(process.Pid)
   ProgressBurstFinished
@@ -392,6 +410,78 @@ pub fn live_sse_progress_burst_disconnect_cancels_worker_test() {
     Error(Nil) -> Nil
   }
   http.stop_http_server(listener)
+}
+
+/// Streamable HTTP cancels a request when its client disconnects. A buffered
+/// JSON call writes nothing until it finishes, so the listener must notice the
+/// closed socket itself, cancel the invocation, and write no result.
+pub fn buffered_call_disconnect_cancels_worker_test() {
+  let policy =
+    http.HttpPolicy(
+      max_body_bytes: 4096,
+      max_response_bytes: 4096,
+      request_timeout_ms: 5000,
+      sse_keepalive_ms: 250,
+      allowed_hosts: ["127.0.0.1"],
+      allowed_origins: ["http://127.0.0.1"],
+    )
+  let notices = process.new_subject()
+  let assert Ok(listener) = {
+    let options = http.HttpOptions(port: 0, host: "127.0.0.1")
+    http.listener(slow_server(), fn() { notices })
+    |> http.with_options(options)
+    |> http.with_policy(policy)
+    |> http.start()
+  }
+  let body =
+    envelope("tools/call", True, [
+      #("name", json.string("slow_probe")),
+      #("arguments", json.object([])),
+    ])
+  let assert Ok(connection) =
+    send_and_hold(
+      http.http_server_port(listener),
+      "POST",
+      headers_with_name("tools/call", "slow_probe", "application/json"),
+      body,
+    )
+  let assert Ok(SlowStarted(worker)) = process.receive(notices, 1000)
+  // No response has been written while the call runs.
+  let written = abort_connection(connection)
+  let stopped = worker_exits_within(worker, 50)
+  // Without cancellation the worker would outlive this test and emit
+  // telemetry into later ones, so stop it before asserting.
+  case stopped {
+    True -> Nil
+    False -> process.kill(worker)
+  }
+  http.stop_http_server(listener)
+  should.equal(written, <<>>)
+  should.be_true(stopped)
+  // The handler never finished, so no result was produced for the call.
+  should.equal(process.receive(notices, 300), Error(Nil))
+}
+
+fn slow_server() -> server.Server(process.Subject(SlowNotice)) {
+  let assert Ok(name) = tool.tool_name("slow_probe")
+  let assert Ok(definition) =
+    tool.definition(
+      name,
+      codec.object(codec.empty()),
+      codec.object(codec.empty()),
+    )
+  let definition = tool.with_metadata(definition, tool.empty_metadata())
+  let slow_tool =
+    tool.handle_advanced(definition, fn(call, _input) {
+      let tool.HandlerCallContext(notices, _input_responses, _report_progress) =
+        call
+      process.send(notices, SlowStarted(process.self()))
+      process.sleep(2000)
+      process.send(notices, SlowFinished)
+      Ok(tool.Complete(Nil, []))
+    })
+  let assert Ok(registry) = tool.registry([slow_tool])
+  server.server(registry)
 }
 
 fn progress_call_envelope() -> BitArray {

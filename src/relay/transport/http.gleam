@@ -1,5 +1,6 @@
 import gleam/bit_array
 import gleam/bytes_tree
+import gleam/erlang/atom
 import gleam/erlang/process
 import gleam/float
 import gleam/http.{Post}
@@ -405,6 +406,9 @@ fn ffi_set_sse_send_timeout(
   timeout_ms: Int,
 ) -> Result(Nil, Nil)
 
+@external(erlang, "relay_ffi", "watch_client_close")
+fn ffi_watch_client_close(connection: mist.Connection) -> Result(Nil, Nil)
+
 @external(erlang, "relay_ffi", "send_sse_comment")
 fn ffi_send_sse_comment(
   connection: mist.SSEConnection,
@@ -768,6 +772,7 @@ fn handle_body(
                       )
                     False ->
                       handle_buffered_request(
+                        req,
                         server,
                         context,
                         policy,
@@ -782,7 +787,44 @@ fn handle_body(
   }
 }
 
+/// One input to a buffered request while it waits for its response.
+type BufferedEvent {
+  BufferedFrame(BitArray)
+  BufferedClientClosed
+}
+
+/// Streamable HTTP cancels a request when its client disconnects. A buffered
+/// JSON request writes nothing until its response is ready, so it watches the
+/// socket for closure instead. When the socket cannot be watched, the request
+/// waits for its response or its timeout.
+fn buffered_events(
+  req: Request(mist.Connection),
+  frames: process.Subject(BitArray),
+) -> process.Selector(BufferedEvent) {
+  let selector =
+    process.new_selector()
+    |> process.select_map(frames, BufferedFrame)
+  case ffi_watch_client_close(req.body) {
+    Error(Nil) -> selector
+    Ok(Nil) ->
+      selector
+      |> process.select_record(atom.create("tcp_closed"), 1, fn(_) {
+        BufferedClientClosed
+      })
+      |> process.select_record(atom.create("ssl_closed"), 1, fn(_) {
+        BufferedClientClosed
+      })
+      |> process.select_record(atom.create("tcp_error"), 2, fn(_) {
+        BufferedClientClosed
+      })
+      |> process.select_record(atom.create("ssl_error"), 2, fn(_) {
+        BufferedClientClosed
+      })
+  }
+}
+
 fn handle_buffered_request(
+  req: Request(mist.Connection),
   server: server_mod.Server(context),
   context: fn() -> context,
   policy: HttpPolicy,
@@ -831,20 +873,33 @@ fn handle_buffered_request(
             True -> {
               let collected =
                 collect_response(
-                  reply_subject,
+                  buffered_events(req, reply_subject),
                   policy.request_timeout_ms,
                   policy.max_response_bytes,
                   0,
                   [],
                 )
-              runtime.stop(runtime_instance, 1000)
               case collected {
-                Error(_) ->
+                Error(CollectClientClosed) -> {
+                  // The same reducer path as a stdio cancellation: the
+                  // exchange closes, its invocation is cancelled, and no
+                  // response is written for it.
+                  runtime.exchange_closed(runtime_instance, exchange)
+                  runtime.stop(runtime_instance, 1000)
+                  plain_response(499, "Client closed the request")
+                  |> response.set_header("connection", "close")
+                }
+                Error(CollectFailed) -> {
+                  runtime.stop(runtime_instance, 1000)
                   plain_response(
                     504,
                     "Relay response timed out or exceeded its limit",
                   )
-                Ok(events) -> respond_with_events(events)
+                }
+                Ok(events) -> {
+                  runtime.stop(runtime_instance, 1000)
+                  respond_with_events(events)
+                }
               }
             }
           }
@@ -1404,25 +1459,31 @@ fn header_value(
   request.get_header(req, name)
 }
 
+type CollectError {
+  CollectFailed
+  CollectClientClosed
+}
+
 fn collect_response(
-  subject: process.Subject(BitArray),
+  selector: process.Selector(BufferedEvent),
   timeout_ms: Int,
   limit: Int,
   used: Int,
   events: List(BitArray),
-) -> Result(List(BitArray), Nil) {
-  case process.receive(subject, timeout_ms) {
-    Error(_) -> Error(Nil)
-    Ok(bytes) -> {
+) -> Result(List(BitArray), CollectError) {
+  case process.selector_receive(selector, timeout_ms) {
+    Error(_) -> Error(CollectFailed)
+    Ok(BufferedClientClosed) -> Error(CollectClientClosed)
+    Ok(BufferedFrame(bytes)) -> {
       let new_size = used + bit_array.byte_size(bytes)
       case new_size > limit {
-        True -> Error(Nil)
+        True -> Error(CollectFailed)
         False ->
           case v2026.is_response_frame(bytes) {
             True -> Ok(list.append(events, [bytes]))
             False ->
               collect_response(
-                subject,
+                selector,
                 timeout_ms,
                 limit,
                 new_size,

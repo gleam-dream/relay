@@ -29,6 +29,7 @@
     read_file/1,
     git_head/1,
     send_sse_comment/2,
+    watch_client_close/1,
     set_sse_send_timeout/2,
     decode_base64_strict/1,
     start_stdio_client_port/3,
@@ -61,6 +62,21 @@ set_sse_send_timeout(
         ok -> {ok, nil};
         {error, _} -> {error, nil}
     end.
+
+%% Arms one closure message ({tcp_closed, S}, {ssl_closed, S}, or an error
+%% tuple) for the connection process that runs a buffered HTTP handler. Data
+%% that arrives instead stays in the mailbox for mist's own loop.
+watch_client_close({connection, _Body, Socket, Transport, _Factory}) ->
+    Result = case Transport of
+        tcp -> inet:setopts(Socket, [{active, once}]);
+        ssl -> ssl:setopts(Socket, [{active, once}])
+    end,
+    case Result of
+        ok -> {ok, nil};
+        {error, _} -> {error, nil}
+    end;
+watch_client_close(_) ->
+    {error, nil}.
 
 decode_base64_strict(Encoded) when is_binary(Encoded) ->
     try
