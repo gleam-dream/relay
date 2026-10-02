@@ -1,3 +1,4 @@
+import gleam/string
 import gleeunit
 import gleeunit/should
 import json/blueprint/value
@@ -116,4 +117,13 @@ pub fn retains_attested_scopes_and_rechecks_registry_requirements_test() {
     authorization.visible_declarations(stronger, Nil, weak_grant),
     Error(authorization.GrantMissingEndpointScope(write)),
   )
+}
+
+pub fn bearer_token_does_not_print_its_value_test() {
+  let secret = "relay-secret-bearer-value"
+  let assert Ok(token) = authorization.bearer_token(secret)
+  string.contains(string.inspect(token), secret) |> should.be_false
+  string.contains(string.inspect(Ok(token)), secret) |> should.be_false
+  string.contains(string.inspect(#("authorization", [token])), secret)
+  |> should.be_false
 }

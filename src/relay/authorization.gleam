@@ -4,9 +4,11 @@ import gleam/result
 import json/blueprint/value.{type Value}
 import relay/tool.{type ToolDeclaration}
 
-/// Opaque bearer token.
+/// Opaque bearer token. The raw value is held inside a closure, so
+/// `string.inspect`, crash reports and logger metadata print a function
+/// reference instead of the credential.
 pub opaque type BearerToken {
-  BearerToken(String)
+  BearerToken(reveal: fn() -> String)
 }
 
 /// Validated resource identifier.
@@ -28,7 +30,7 @@ pub type BoundaryValueError {
 pub fn bearer_token(raw: String) -> Result(BearerToken, BoundaryValueError) {
   case raw {
     "" -> Error(EmptyBearerToken)
-    _ -> Ok(BearerToken(raw))
+    _ -> Ok(BearerToken(reveal: fn() { raw }))
   }
 }
 

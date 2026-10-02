@@ -12,6 +12,10 @@ Relay has no published release yet. This section describes the current implement
 - Pure server reduction and runtime exchange events for custom transports, with caller-owned dispatch and resource-template matching extensions.
 - Bounded transport, response, and paginated-listing settings; optional annotation hints independently preserve omitted, true, and false values.
 
+### Changed
+
+- `authorization.BearerToken` stores its raw value inside a closure, so `string.inspect`, crash reports and logger metadata print a function reference instead of the token. The opaque API is unchanged. No other public Relay value holds a credential: the HTTP client rejects URLs with userinfo, and telemetry metadata carries only ids, methods and reasons.
+
 ### Supported environment and limits
 
 - The package target is Erlang. `gleam.toml` admits Gleam `>= 1.18.0`; the GitHub workflow configures Gleam 1.18.1, Erlang/OTP 28, and rebar3 3.27.0. It does not establish support for other compiler or OTP combinations.
