@@ -4,8 +4,11 @@ import relay/tool
 
 pub fn invalid() {
   let assert Ok(name) = tool.tool_name("mismatch_tool")
-  let assert Ok(definition) =
-    tool.definition(name, codec.field("count", codec.int()), codec.string())
+  let input = {
+    use count <- codec.field("count", codec.int(), fn(count: Int) { count })
+    codec.success(count)
+  }
+  let assert Ok(definition) = tool.definition(name, input, codec.string())
   tool.handle(definition, fn(input: String) -> Result(String, String) {
     Ok(input)
   })

@@ -4,6 +4,7 @@ import gleam/string
 import json/blueprint/codec
 import relay/runtime.{RuntimeConfig}
 import relay/server
+import relay/test_codec
 import relay/tool
 import relay/transport/stdio
 
@@ -15,7 +16,7 @@ pub fn main() -> Nil {
   let assert Ok(greet_tool) = case
     tool.definition(
       greet_name,
-      codec.field("name", codec.string()),
+      test_codec.property("name", codec.string()),
       codec.string(),
     )
   {
@@ -45,9 +46,7 @@ pub fn main() -> Nil {
             }
           },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }
@@ -62,7 +61,7 @@ pub fn main() -> Nil {
   let assert Ok(fail_tool) = case
     tool.definition(
       fail_name,
-      codec.field("msg", codec.string()),
+      test_codec.property("msg", codec.string()),
       codec.string(),
     )
   {
@@ -82,7 +81,7 @@ pub fn main() -> Nil {
           fn(application_error) {
             case
               codec.encode_json(
-                codec.field("reason", codec.string()),
+                test_codec.property("reason", codec.string()),
                 application_error,
               )
             {
@@ -98,7 +97,11 @@ pub fn main() -> Nil {
 
   let assert Ok(slow_name) = tool.tool_name("slow")
   let assert Ok(slow_tool) = case
-    tool.definition(slow_name, codec.field("ms", codec.int()), codec.string())
+    tool.definition(
+      slow_name,
+      test_codec.property("ms", codec.int()),
+      codec.string(),
+    )
   {
     Ok(definition) -> {
       let definition =
@@ -117,9 +120,7 @@ pub fn main() -> Nil {
             Ok("slow response")
           },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }

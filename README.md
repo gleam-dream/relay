@@ -12,8 +12,11 @@ import relay/transport/stdio
 
 pub fn main() {
   let assert Ok(name) = tool.tool_name("greet")
-  let assert Ok(definition) =
-    tool.definition(name, codec.field("name", codec.string()), codec.string())
+  let input = {
+    use name <- codec.field("name", codec.string(), fn(name: String) { name })
+    codec.success(name)
+  }
+  let assert Ok(definition) = tool.definition(name, input, codec.string())
   let definition =
     definition |> tool.with_description("Greets the user by name")
   let bound = tool.handle(definition, fn(name) { Ok("Hello, " <> name <> "!") })

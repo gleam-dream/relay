@@ -39,8 +39,7 @@ pub fn is_object_schema(schema: Schema) -> Bool {
   case schema {
     codec.DescribedSchema(_, inner) -> is_object_schema(inner)
     codec.ObjectSchema(_) -> True
-    codec.FieldSchema(_, _) -> True
-    codec.TaggedSchema(_, _, _, _) -> True
+    codec.UnionSchema(_) -> True
     _ -> False
   }
 }
@@ -54,11 +53,10 @@ pub fn schema_type_name(schema: Schema) -> String {
     codec.NumberSchema -> "number"
     codec.BoolSchema -> "boolean"
     codec.PairSchema(_, _) -> "pair"
-    codec.FieldSchema(_, _) -> "field"
     codec.ListSchema(_) -> "list"
     codec.NullableSchema(_) -> "nullable"
     codec.ObjectSchema(_) -> "object"
-    codec.TaggedSchema(_, _, _, _) -> "tagged"
+    codec.UnionSchema(_) -> "union"
     codec.IntegerRangeSchema(_, _) -> "integer_range"
     codec.NumberRangeSchema(_, _) -> "number_range"
   }

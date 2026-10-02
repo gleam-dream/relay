@@ -42,8 +42,6 @@ import gleam/result
 import gleam/string
 import gleam/uri
 import json/blueprint/codec.{type Codec, encode}
-import json/blueprint/parser as blueprint_parser
-import json/blueprint/parser_limits
 import json/blueprint/value as blueprint_value
 import relay/completion
 import relay/content
@@ -2187,14 +2185,10 @@ fn decode_structured_content(
   {
     Error(_) -> Ok(None)
     Ok(_) -> {
-      use limits <- result.try(
-        parser_limits.with_max_bytes(
-          blueprint_parser.default_limits(),
-          max_response_bytes,
-        )
-        |> result.map_error(fn(_) { "invalid configured response byte limit" }),
-      )
-      case blueprint_parser.parse_value(limits, bytes) {
+      let limits =
+        blueprint_value.default_limits()
+        |> blueprint_value.with_max_bytes(max_response_bytes)
+      case blueprint_value.parse_bits(bytes, limits) {
         Error(_) ->
           Error("structured tool result contains an invalid JSON value")
         Ok(root) ->
@@ -2410,87 +2404,12 @@ fn optional_json_field(
 }
 
 fn dynamic_to_json(value: Dynamic) -> Result(json.Json, String) {
-  case dyn_decode.run(value, dyn_decode.optional(dyn_decode.dynamic)) {
-    Ok(None) -> Ok(json.null())
-    Error(_) -> Error("JSON value could not be inspected")
-    Ok(Some(non_null)) ->
-      case dyn_decode.run(non_null, dyn_decode.bool) {
-        Ok(boolean) -> Ok(json.bool(boolean))
-        Error(_) ->
-          case dyn_decode.run(non_null, dyn_decode.int) {
-            Ok(integer) -> Ok(json.int(integer))
-            Error(_) ->
-              case dyn_decode.run(non_null, dyn_decode.float) {
-                Ok(decimal) -> Ok(json.float(decimal))
-                Error(_) ->
-                  case dyn_decode.run(non_null, dyn_decode.string) {
-                    Ok(text) -> Ok(json.string(text))
-                    Error(_) ->
-                      case
-                        dyn_decode.run(
-                          non_null,
-                          dyn_decode.list(dyn_decode.dynamic),
-                        )
-                      {
-                        Ok(values) ->
-                          dynamic_json_list(values)
-                          |> result.map(fn(items) {
-                            json.array(items, fn(item) { item })
-                          })
-                        Error(_) ->
-                          case
-                            dyn_decode.run(
-                              non_null,
-                              dyn_decode.dict(
-                                dyn_decode.string,
-                                dyn_decode.dynamic,
-                              ),
-                            )
-                          {
-                            Ok(fields) -> dynamic_json_object(fields)
-                            Error(_) ->
-                              Error("JSON value has an unsupported type")
-                          }
-                      }
-                  }
-              }
-          }
-      }
-  }
-}
-
-fn dynamic_json_list(values: List(Dynamic)) -> Result(List(json.Json), String) {
-  case values {
-    [] -> Ok([])
-    [value, ..rest] ->
-      dynamic_to_json(value)
-      |> result.try(fn(decoded) {
-        dynamic_json_list(rest)
-        |> result.map(fn(decoded_rest) { [decoded, ..decoded_rest] })
-      })
-  }
-}
-
-fn dynamic_json_object(
-  fields: Dict(String, Dynamic),
-) -> Result(json.Json, String) {
-  dict.to_list(fields)
-  |> dynamic_json_fields
-  |> result.map(json.object)
-}
-
-fn dynamic_json_fields(
-  fields: List(#(String, Dynamic)),
-) -> Result(List(#(String, json.Json)), String) {
-  case fields {
-    [] -> Ok([])
-    [#(key, value), ..rest] ->
-      dynamic_to_json(value)
-      |> result.try(fn(decoded) {
-        dynamic_json_fields(rest)
-        |> result.map(fn(decoded_rest) { [#(key, decoded), ..decoded_rest] })
-      })
-  }
+  use parsed <- result.try(
+    dyn_decode.run(value, blueprint_value.decoder())
+    |> result.replace_error("JSON value has an unsupported type"),
+  )
+  blueprint_value.to_json(parsed)
+  |> result.replace_error("JSON value has a number without an exact JSON form")
 }
 
 fn blueprint_at(

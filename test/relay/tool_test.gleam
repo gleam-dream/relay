@@ -9,6 +9,7 @@ import json/blueprint/codec
 import json/blueprint/number
 import json/blueprint/value
 import relay/content
+import relay/test_codec
 import relay/tool
 
 pub fn main() -> Nil {
@@ -18,7 +19,10 @@ pub fn main() -> Nil {
 pub fn described_input_preserves_object_root_admission_test() {
   let assert Ok(name) = tool.tool_name("described")
   let input =
-    codec.field("city", codec.describe(codec.string(), "City to look up"))
+    test_codec.property(
+      "city",
+      codec.describe(codec.string(), "City to look up"),
+    )
     |> codec.describe("Weather request")
   tool.definition(name, input, codec.string()) |> should.be_ok
   tool.definition(
@@ -39,7 +43,7 @@ pub fn heterogeneous_tools_registry_test() {
   let assert Ok(echo_tool) = case
     tool.definition(
       echo_name,
-      codec.field("message", codec.string()),
+      test_codec.property("message", codec.string()),
       codec.string(),
     )
   {
@@ -57,9 +61,7 @@ pub fn heterogeneous_tools_registry_test() {
           definition,
           fn(msg: String) { Ok("echo: " <> msg) },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }
@@ -72,7 +74,11 @@ pub fn heterogeneous_tools_registry_test() {
 
   // Tool 2: Int -> Int, error is String
   let assert Ok(math_tool) = case
-    tool.definition(math_name, codec.field("amount", codec.int()), codec.int())
+    tool.definition(
+      math_name,
+      test_codec.property("amount", codec.int()),
+      codec.int(),
+    )
   {
     Ok(definition) -> {
       let definition =
@@ -123,7 +129,11 @@ pub fn heterogeneous_tools_registry_test() {
 pub fn duplicate_tool_name_rejected_test() {
   let assert Ok(name) = tool.tool_name("duplicate")
   let assert Ok(tool1) = case
-    tool.definition(name, codec.field("a", codec.string()), codec.string())
+    tool.definition(
+      name,
+      test_codec.property("a", codec.string()),
+      codec.string(),
+    )
   {
     Ok(definition) -> {
       let definition = tool.with_metadata(definition, tool.empty_metadata())
@@ -132,9 +142,7 @@ pub fn duplicate_tool_name_rejected_test() {
           definition,
           fn(msg: String) { Ok(msg) },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }
@@ -145,7 +153,7 @@ pub fn duplicate_tool_name_rejected_test() {
     Error(error) -> Error(error)
   }
   let assert Ok(tool2) = case
-    tool.definition(name, codec.field("b", codec.int()), codec.int())
+    tool.definition(name, test_codec.property("b", codec.int()), codec.int())
   {
     Ok(definition) -> {
       let definition = tool.with_metadata(definition, tool.empty_metadata())
@@ -154,9 +162,7 @@ pub fn duplicate_tool_name_rejected_test() {
           definition,
           fn(n: Int) { Ok(n) },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }
@@ -194,9 +200,7 @@ pub fn primitive_root_input_schema_rejected_test() {
           definition,
           fn(_n: Int) { Ok("ok") },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }
@@ -227,7 +231,11 @@ pub fn unknown_tool_dispatch_test() {
 pub fn invalid_input_arguments_test() {
   let assert Ok(name) = tool.tool_name("strict_input")
   let assert Ok(t) = case
-    tool.definition(name, codec.field("msg", codec.string()), codec.string())
+    tool.definition(
+      name,
+      test_codec.property("msg", codec.string()),
+      codec.string(),
+    )
   {
     Ok(definition) -> {
       let definition = tool.with_metadata(definition, tool.empty_metadata())
@@ -236,9 +244,7 @@ pub fn invalid_input_arguments_test() {
           definition,
           fn(msg: String) { Ok(msg) },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }
@@ -263,7 +269,11 @@ pub fn invalid_input_arguments_test() {
 pub fn application_failure_dispatch_test() {
   let assert Ok(name) = tool.tool_name("app_fail")
   let assert Ok(t) = case
-    tool.definition(name, codec.field("in", codec.string()), codec.string())
+    tool.definition(
+      name,
+      test_codec.property("in", codec.string()),
+      codec.string(),
+    )
   {
     Ok(definition) -> {
       let definition = tool.with_metadata(definition, tool.empty_metadata())
@@ -274,7 +284,7 @@ pub fn application_failure_dispatch_test() {
           fn(application_error) {
             case
               codec.encode_json(
-                codec.field("err_code", codec.int()),
+                test_codec.property("err_code", codec.int()),
                 application_error,
               )
             {
@@ -302,7 +312,11 @@ pub fn application_failure_dispatch_test() {
 pub fn exact_blueprint_number_preservation_test() {
   let assert Ok(name) = tool.tool_name("exact_num")
   let assert Ok(t) = case
-    tool.definition(name, codec.field("num", codec.number()), codec.number())
+    tool.definition(
+      name,
+      test_codec.property("num", codec.number()),
+      codec.number(),
+    )
   {
     Ok(definition) -> {
       let definition = tool.with_metadata(definition, tool.empty_metadata())
@@ -311,9 +325,7 @@ pub fn exact_blueprint_number_preservation_test() {
           definition,
           fn(n: number.Number) { Ok(n) },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }
@@ -327,8 +339,8 @@ pub fn exact_blueprint_number_preservation_test() {
 
   // A 50-digit number that would lose precision in standard IEEE 754 Float
   let num_str = "12345678901234567890123456789012345678901234567890"
-  let assert Ok(limits) = number.number_limits(1024, 100, 1000)
-  let assert Ok(parsed_num) = number.parse_number(limits, num_str)
+  let assert Ok(parsed_num) =
+    number.parse(num_str, number.limits(1024, 100, 1000))
 
   let args = value.Object([#("num", value.Number(parsed_num))])
   let assert Ok(res) = tool.dispatch(reg, Nil, name, args)
@@ -341,12 +353,19 @@ pub fn missing_output_schema_admission_rejection_test() {
   let assert Ok(name) = tool.tool_name("bad_schema_tool")
   let calls = process.new_subject()
   let broken_codec =
-    codec.new(fn(_x: String) { Ok(value.String("ok")) }, fn(_v: value.Value) {
-      Ok("ok")
-    })
+    codec.custom(
+      encode: fn(_x: String) { Ok(value.String("ok")) },
+      decode: fn(_v: value.Value) { Ok("ok") },
+      schema: None,
+      placeholder: "ok",
+    )
 
   let res = case
-    tool.definition(name, codec.field("in", codec.string()), broken_codec)
+    tool.definition(
+      name,
+      test_codec.property("in", codec.string()),
+      broken_codec,
+    )
   {
     Ok(definition) -> {
       let definition = tool.with_metadata(definition, tool.empty_metadata())
@@ -358,9 +377,7 @@ pub fn missing_output_schema_admission_rejection_test() {
             Ok(msg)
           },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }
@@ -382,7 +399,11 @@ pub fn missing_output_schema_admission_rejection_test() {
 pub fn primitive_output_schema_is_a_valid_json_schema_test() {
   let assert Ok(name) = tool.tool_name("primitive_output_tool")
   let assert Ok(registered) = case
-    tool.definition(name, codec.field("input", codec.string()), codec.string())
+    tool.definition(
+      name,
+      test_codec.property("input", codec.string()),
+      codec.string(),
+    )
   {
     Ok(definition) -> {
       let definition = tool.with_metadata(definition, tool.empty_metadata())
@@ -391,9 +412,7 @@ pub fn primitive_output_schema_is_a_valid_json_schema_test() {
           definition,
           fn(input: String) { Ok(input) },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }
@@ -416,9 +435,13 @@ pub fn primitive_output_schema_is_a_valid_json_schema_test() {
 // Regression test: Invalid output from handler produces InvalidOutput error
 pub fn invalid_output_encoding_test() {
   let assert Ok(name) = tool.tool_name("range_tool")
-  let assert Ok(range_codec) = codec.integer_between(0, 10)
+  let range_codec = codec.integer_between(0, 10)
   let assert Ok(t) = case
-    tool.definition(name, codec.field("dummy", codec.string()), range_codec)
+    tool.definition(
+      name,
+      test_codec.property("dummy", codec.string()),
+      range_codec,
+    )
   {
     Ok(definition) -> {
       let definition = tool.with_metadata(definition, tool.empty_metadata())
@@ -429,9 +452,7 @@ pub fn invalid_output_encoding_test() {
           Ok(999)
         },
         fn(application_error) {
-          case
-            codec.encode_json(codec.object(codec.empty()), application_error)
-          {
+          case codec.encode_json(codec.success(Nil), application_error) {
             Ok(text) -> text
             Error(_) -> "Tool execution failed."
           }
@@ -453,9 +474,13 @@ pub fn invalid_output_encoding_test() {
 // A caller-owned renderer can choose a safe fallback when its encoding fails.
 pub fn error_encoding_failure_test() {
   let assert Ok(name) = tool.tool_name("range_err_tool")
-  let assert Ok(range_codec) = codec.integer_between(0, 10)
+  let range_codec = codec.integer_between(0, 10)
   let assert Ok(t) = case
-    tool.definition(name, codec.field("dummy", codec.string()), codec.string())
+    tool.definition(
+      name,
+      test_codec.property("dummy", codec.string()),
+      codec.string(),
+    )
   {
     Ok(definition) -> {
       let definition = tool.with_metadata(definition, tool.empty_metadata())
@@ -488,7 +513,11 @@ pub fn error_encoding_failure_test() {
 pub fn definition_metadata_and_annotation_modifiers_are_independent_test() {
   let assert Ok(name) = tool.tool_name("declared")
   let assert Ok(definition) =
-    tool.definition(name, codec.field("input", codec.string()), codec.string())
+    tool.definition(
+      name,
+      test_codec.property("input", codec.string()),
+      codec.string(),
+    )
   let annotations =
     tool.empty_annotations()
     |> tool.with_read_only_hint(Some(True))
@@ -533,11 +562,14 @@ pub fn definition_metadata_and_annotation_modifiers_are_independent_test() {
 
 pub fn definition_admission_and_generic_error_test() {
   let assert Ok(name) = tool.tool_name("plain_error")
-  let input = codec.field("input", codec.string())
+  let input = test_codec.property("input", codec.string())
   let broken =
-    codec.new(fn(_x: String) { Ok(value.String("ok")) }, fn(_v: value.Value) {
-      Ok("ok")
-    })
+    codec.custom(
+      encode: fn(_x: String) { Ok(value.String("ok")) },
+      decode: fn(_v: value.Value) { Ok("ok") },
+      schema: None,
+      placeholder: "ok",
+    )
   should.equal(
     tool.definition(name, codec.string(), codec.string()),
     Error(tool.InputSchemaMustBeObject("string")),
@@ -567,7 +599,7 @@ pub fn definition_admission_and_generic_error_test() {
 pub fn content_only_tool_does_not_need_output_codec_test() {
   let assert Ok(name) = tool.tool_name("content")
   let assert Ok(definition) =
-    tool.content_definition(name, codec.field("input", codec.string()))
+    tool.content_definition(name, test_codec.property("input", codec.string()))
   let bound =
     tool.handle_content(definition, fn(input) {
       Ok([content.text_content(input)])
@@ -589,7 +621,11 @@ pub fn content_only_tool_does_not_need_output_codec_test() {
 pub fn advanced_handler_composes_progress_content_and_input_test() {
   let assert Ok(name) = tool.tool_name("advanced")
   let assert Ok(definition) =
-    tool.definition(name, codec.field("input", codec.string()), codec.string())
+    tool.definition(
+      name,
+      test_codec.property("input", codec.string()),
+      codec.string(),
+    )
   let seen = process.new_subject()
   let bound =
     tool.handle_advanced(definition, fn(call, input) {
@@ -644,7 +680,7 @@ pub fn advanced_handler_composes_progress_content_and_input_test() {
 pub fn advanced_handler_can_return_content_without_structured_value_test() {
   let assert Ok(name) = tool.tool_name("advanced_content")
   let assert Ok(definition) =
-    tool.definition(name, codec.object(codec.empty()), codec.string())
+    tool.definition(name, codec.success(Nil), codec.string())
   let bound =
     tool.handle_advanced(definition, fn(_call, _input) {
       Ok(tool.Content([content.text_content("only")]))
@@ -659,7 +695,7 @@ pub fn advanced_handler_can_return_content_without_structured_value_test() {
 pub fn content_definition_retains_metadata_and_invocation_context_test() {
   let assert Ok(name) = tool.tool_name("content_context")
   let assert Ok(definition) =
-    tool.content_definition(name, codec.field("input", codec.string()))
+    tool.content_definition(name, test_codec.property("input", codec.string()))
   let metadata =
     tool.ToolMetadata(
       ..tool.empty_metadata(),
@@ -694,7 +730,7 @@ pub fn content_definition_retains_metadata_and_invocation_context_test() {
 pub fn content_definition_override_and_input_round_test() {
   let assert Ok(name) = tool.tool_name("content_round")
   let assert Ok(definition) =
-    tool.content_definition(name, codec.field("input", codec.string()))
+    tool.content_definition(name, test_codec.property("input", codec.string()))
   let override = value.Object([#("type", value.String("object"))])
   let assert Ok(definition) =
     tool.content_with_input_schema_override(definition, override)
@@ -746,7 +782,11 @@ pub fn content_definition_override_and_input_round_test() {
 pub fn schema_override_changes_discovery_but_codec_still_validates_test() {
   let assert Ok(name) = tool.tool_name("overridden")
   let assert Ok(definition) =
-    tool.definition(name, codec.field("input", codec.string()), codec.string())
+    tool.definition(
+      name,
+      test_codec.property("input", codec.string()),
+      codec.string(),
+    )
   let override =
     value.Object([
       #("type", value.String("object")),

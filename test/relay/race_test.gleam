@@ -11,6 +11,7 @@ import gleeunit/should
 import json/blueprint/codec
 import relay/runtime.{RuntimeConfig}
 import relay/server.{ExchangeClosed, MessageReceived}
+import relay/test_codec
 import relay/tool
 
 pub fn main() -> Nil {
@@ -47,7 +48,11 @@ fn repeat(times: Int, f: fn(Int) -> Nil) -> Nil {
 fn sample_registry() -> tool.Registry(String) {
   let assert Ok(name) = tool.tool_name("echo")
   let assert Ok(t) = case
-    tool.definition(name, codec.field("val", codec.string()), codec.string())
+    tool.definition(
+      name,
+      test_codec.property("val", codec.string()),
+      codec.string(),
+    )
   {
     Ok(definition) -> {
       let definition =
@@ -63,9 +68,7 @@ fn sample_registry() -> tool.Registry(String) {
           definition,
           fn(val: String) { Ok(val) },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }
@@ -82,7 +85,11 @@ fn sample_registry() -> tool.Registry(String) {
 fn slow_registry(delay_ms: Int) -> tool.Registry(String) {
   let assert Ok(name) = tool.tool_name("slow_tool")
   let assert Ok(t) = case
-    tool.definition(name, codec.field("val", codec.string()), codec.string())
+    tool.definition(
+      name,
+      test_codec.property("val", codec.string()),
+      codec.string(),
+    )
   {
     Ok(definition) -> {
       let definition =
@@ -101,9 +108,7 @@ fn slow_registry(delay_ms: Int) -> tool.Registry(String) {
             Ok(val)
           },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }

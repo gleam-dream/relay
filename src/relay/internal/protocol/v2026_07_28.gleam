@@ -6,7 +6,6 @@ import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
-import json/blueprint/json_text
 import json/blueprint/number
 import json/blueprint/value.{type Value}
 import relay/completion.{
@@ -1600,11 +1599,11 @@ pub fn encode_subscriptions_listen_result_response(id: RequestId) -> json.Json {
 fn text_mirror_of_value(val: Value) -> String {
   case val {
     value.String(s) -> s
-    value.Number(n) -> number.number_text(n)
+    value.Number(n) -> number.to_string(n)
     value.Bool(True) -> "true"
     value.Bool(False) -> "false"
     value.Null -> "null"
-    _ -> json_text.render_value(val)
+    _ -> value.to_string(val)
   }
 }
 
@@ -1614,5 +1613,5 @@ fn string_to_bytes(raw: String) -> BitArray {
 
 /// Converts a Blueprint Value into an exact json.Json representation.
 pub fn value_to_json(val: Value) -> json.Json {
-  ffi_raw_json(json_text.render_value(val))
+  ffi_raw_json(value.to_string(val))
 }

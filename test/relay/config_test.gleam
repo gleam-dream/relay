@@ -14,6 +14,7 @@ import relay/content
 import relay/prompts
 import relay/resources
 import relay/server
+import relay/test_codec
 import relay/tool
 import relay/transport/http
 
@@ -56,7 +57,7 @@ pub fn service_modifiers_replace_lists_and_preserve_dispatch_test() {
   let assert Ok(tool) = case
     tool.definition(
       name,
-      codec.field("message", codec.string()),
+      test_codec.property("message", codec.string()),
       codec.string(),
     )
   {

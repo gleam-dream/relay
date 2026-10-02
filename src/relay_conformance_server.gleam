@@ -536,11 +536,7 @@ fn json_schema_tool() -> tool.ContextTool(Nil) {
       #("additionalProperties", value.Bool(False)),
     ])
   let assert Ok(tool) = case
-    tool.definition(
-      name,
-      codec.object(codec.empty()),
-      codec.object(codec.empty()),
-    )
+    tool.definition(name, codec.success(Nil), codec.success(Nil))
   {
     Ok(definition) -> {
       let definition =
@@ -558,12 +554,7 @@ fn json_schema_tool() -> tool.ContextTool(Nil) {
               definition,
               fn(_input) { Ok(Nil) },
               fn(application_error) {
-                case
-                  codec.encode_json(
-                    codec.object(codec.empty()),
-                    application_error,
-                  )
-                {
+                case codec.encode_json(codec.success(Nil), application_error) {
                   Ok(text) -> text
                   Error(_) -> "Tool execution failed."
                 }
@@ -601,8 +592,15 @@ fn custom_header_tool() -> tool.ContextTool(Nil) {
   let assert Ok(tool) = case
     tool.definition(
       name,
-      codec.field("payload", codec.string()),
-      codec.object(codec.empty()),
+      {
+        use payload <- codec.field(
+          "payload",
+          codec.string(),
+          fn(payload: String) { payload },
+        )
+        codec.success(payload)
+      },
+      codec.success(Nil),
     )
   {
     Ok(definition) -> {
@@ -621,12 +619,7 @@ fn custom_header_tool() -> tool.ContextTool(Nil) {
               definition,
               fn(_payload) { Ok(Nil) },
               fn(application_error) {
-                case
-                  codec.encode_json(
-                    codec.object(codec.empty()),
-                    application_error,
-                  )
-                {
+                case codec.encode_json(codec.success(Nil), application_error) {
                   Ok(text) -> text
                   Error(_) -> "Tool execution failed."
                 }
@@ -647,11 +640,7 @@ fn input_required_tool(
 ) -> tool.ContextTool(Nil) {
   let assert Ok(tool_name) = tool.tool_name(name)
   let assert Ok(tool) = case
-    tool.definition(
-      tool_name,
-      codec.object(codec.empty()),
-      codec.object(codec.empty()),
-    )
+    tool.definition(tool_name, codec.success(Nil), codec.success(Nil))
   {
     Ok(definition) -> {
       let definition =
@@ -678,11 +667,7 @@ fn input_required_tool(
 fn capability_tool() -> tool.ContextTool(Nil) {
   let assert Ok(name) = tool.tool_name("test_missing_capability")
   let assert Ok(tool) = case
-    tool.definition(
-      name,
-      codec.object(codec.empty()),
-      codec.object(codec.empty()),
-    )
+    tool.definition(name, codec.success(Nil), codec.success(Nil))
   {
     Ok(definition) -> {
       let definition =
@@ -701,9 +686,7 @@ fn capability_tool() -> tool.ContextTool(Nil) {
           definition,
           fn(_input) { Ok(Nil) },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }
@@ -719,11 +702,7 @@ fn capability_tool() -> tool.ContextTool(Nil) {
 fn streaming_elicitation_tool() -> tool.ContextTool(Nil) {
   let assert Ok(name) = tool.tool_name("test_streaming_elicitation")
   let assert Ok(tool) = case
-    tool.definition(
-      name,
-      codec.object(codec.empty()),
-      codec.object(codec.empty()),
-    )
+    tool.definition(name, codec.success(Nil), codec.success(Nil))
   {
     Ok(definition) -> {
       let definition =
@@ -754,9 +733,7 @@ fn streaming_elicitation_tool() -> tool.ContextTool(Nil) {
           definition,
           advanced_handler,
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }
@@ -840,11 +817,7 @@ fn content_tool(
 ) -> tool.ContextTool(Nil) {
   let assert Ok(tool_name) = tool.tool_name(name)
   let assert Ok(tool) = case
-    tool.definition(
-      tool_name,
-      codec.object(codec.empty()),
-      codec.object(codec.empty()),
-    )
+    tool.definition(tool_name, codec.success(Nil), codec.success(Nil))
   {
     Ok(definition) -> {
       let definition =
@@ -874,9 +847,7 @@ fn content_tool(
           definition,
           advanced_handler,
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }
@@ -892,11 +863,7 @@ fn content_tool(
 fn error_tool(name: String) -> tool.ContextTool(Nil) {
   let assert Ok(tool_name) = tool.tool_name(name)
   let assert Ok(tool) = case
-    tool.definition(
-      tool_name,
-      codec.object(codec.empty()),
-      codec.object(codec.empty()),
-    )
+    tool.definition(tool_name, codec.success(Nil), codec.success(Nil))
   {
     Ok(definition) -> {
       let definition =
@@ -914,9 +881,7 @@ fn error_tool(name: String) -> tool.ContextTool(Nil) {
           definition,
           fn(_input) { Error(Nil) },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }
@@ -932,11 +897,7 @@ fn error_tool(name: String) -> tool.ContextTool(Nil) {
 fn progress_tool() -> tool.ContextTool(Nil) {
   let assert Ok(name) = tool.tool_name("test_tool_with_progress")
   let assert Ok(tool) = case
-    tool.definition(
-      name,
-      codec.object(codec.empty()),
-      codec.object(codec.empty()),
-    )
+    tool.definition(name, codec.success(Nil), codec.success(Nil))
   {
     Ok(definition) -> {
       let definition =
@@ -973,9 +934,7 @@ fn progress_tool() -> tool.ContextTool(Nil) {
           definition,
           advanced_handler,
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }

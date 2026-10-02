@@ -9,6 +9,7 @@ import relay/server.{
   CloseExchange, EmitRequestAdmitted, ExchangeClosed, InvocationFinished,
   MessageReceived, OutcomeSuccess, StartInvocation, Write,
 }
+import relay/test_codec
 import relay/tool
 
 pub fn main() -> Nil {
@@ -18,7 +19,11 @@ pub fn main() -> Nil {
 fn sample_registry() -> tool.Registry(String) {
   let assert Ok(name) = tool.tool_name("echo")
   let assert Ok(t) = case
-    tool.definition(name, codec.field("text", codec.string()), codec.string())
+    tool.definition(
+      name,
+      test_codec.property("text", codec.string()),
+      codec.string(),
+    )
   {
     Ok(definition) -> {
       let definition =
@@ -34,9 +39,7 @@ fn sample_registry() -> tool.Registry(String) {
           definition,
           fn(text: String) { Ok(text) },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }

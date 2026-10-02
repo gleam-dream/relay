@@ -82,7 +82,7 @@ pub fn rich_content_families_survive_server_wire_encoding_test() {
   ]
   let assert Ok(name) = tool.tool_name("rich")
   let assert Ok(tool) = case
-    tool.definition(name, codec.object(codec.empty()), codec.string())
+    tool.definition(name, codec.success(Nil), codec.string())
   {
     Ok(definition) -> {
       let definition = tool.with_metadata(definition, tool.empty_metadata())

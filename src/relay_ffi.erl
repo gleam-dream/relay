@@ -114,7 +114,7 @@ extract_arguments_as_blueprint_value(RawJsonBin) ->
         Params = maps:get(<<"params">>, Root, #{}),
         case maps:find(<<"arguments">>, Params) of
             {ok, ArgsTerm} ->
-                {ok, Limits} = json@blueprint@number:number_limits(1024, 100, 1000),
+                Limits = json@blueprint@number:limits(1024, 100, 1000),
                 case term_to_blueprint_value(ArgsTerm, Limits) of
                     {ok, {object, Entries}} -> {ok, {object, Entries}};
                     _ -> {error, invalid_arguments}
@@ -136,7 +136,7 @@ extract_input_responses_as_blueprint_value(RawJsonBin) ->
         Params = maps:get(<<"params">>, Root, #{}),
         case maps:find(<<"inputResponses">>, Params) of
             {ok, Responses} when is_map(Responses) ->
-                {ok, Limits} = json@blueprint@number:number_limits(1024, 100, 1000),
+                Limits = json@blueprint@number:limits(1024, 100, 1000),
                 term_to_blueprint_value(Responses, Limits);
             _ -> {error, invalid_input_responses}
         end
@@ -149,7 +149,7 @@ term_to_blueprint_value(true, _Limits) -> {ok, {bool, true}};
 term_to_blueprint_value(false, _Limits) -> {ok, {bool, false}};
 term_to_blueprint_value(Bin, _Limits) when is_binary(Bin) -> {ok, {string, Bin}};
 term_to_blueprint_value({raw_number, NumBin}, Limits) ->
-    case json@blueprint@number:parse_number(Limits, NumBin) of
+    case json@blueprint@number:parse(NumBin, Limits) of
         {ok, Num} -> {ok, {number, Num}};
         {error, _} -> {error, nil}
     end;

@@ -465,11 +465,7 @@ pub fn buffered_call_disconnect_cancels_worker_test() {
 fn slow_server() -> server.Server(process.Subject(SlowNotice)) {
   let assert Ok(name) = tool.tool_name("slow_probe")
   let assert Ok(definition) =
-    tool.definition(
-      name,
-      codec.object(codec.empty()),
-      codec.object(codec.empty()),
-    )
+    tool.definition(name, codec.success(Nil), codec.success(Nil))
   let definition = tool.with_metadata(definition, tool.empty_metadata())
   let slow_tool =
     tool.handle_advanced(definition, fn(call, _input) {
@@ -515,11 +511,7 @@ fn progress_call_envelope() -> BitArray {
 fn burst_progress_server() -> server.Server(process.Subject(ProgressNotice)) {
   let assert Ok(name) = tool.tool_name("disconnect_probe")
   let assert Ok(tool) = case
-    tool.definition(
-      name,
-      codec.object(codec.empty()),
-      codec.object(codec.empty()),
-    )
+    tool.definition(name, codec.success(Nil), codec.success(Nil))
   {
     Ok(definition) -> {
       let definition = tool.with_metadata(definition, tool.empty_metadata())
@@ -542,9 +534,7 @@ fn burst_progress_server() -> server.Server(process.Subject(ProgressNotice)) {
           definition,
           advanced_handler,
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }

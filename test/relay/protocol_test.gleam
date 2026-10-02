@@ -72,8 +72,8 @@ pub fn exact_blueprint_number_round_trips_through_wire_test() {
     <> "\"name\":\"exact\",\"arguments\":{\"n\":"
     <> number_text
     <> "}}}"
-  let assert Ok(limits) = number.number_limits(1024, 100, 1000)
-  let assert Ok(expected) = number.parse_number(limits, number_text)
+  let assert Ok(expected) =
+    number.parse(number_text, number.limits(1024, 100, 1000))
 
   case v2026.admit_message(raw) {
     v2026.AdmittedRequest(v2026.ToolsCall(

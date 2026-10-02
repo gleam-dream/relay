@@ -19,6 +19,7 @@ import relay/prompts
 import relay/resources
 import relay/server
 import relay/subscriptions
+import relay/test_codec
 import relay/tool
 import relay/transport/http
 
@@ -67,7 +68,11 @@ fn open_http_client(
 fn local_server() -> server.Server(Nil) {
   let assert Ok(name) = tool.tool_name("echo")
   let assert Ok(echo_tool) = case
-    tool.definition(name, codec.field("name", codec.string()), codec.string())
+    tool.definition(
+      name,
+      test_codec.property("name", codec.string()),
+      codec.string(),
+    )
   {
     Ok(definition) -> {
       let definition = tool.with_metadata(definition, tool.empty_metadata())
@@ -76,9 +81,7 @@ fn local_server() -> server.Server(Nil) {
           definition,
           fn(value) { Ok("hello " <> value) },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }
@@ -92,7 +95,7 @@ fn local_server() -> server.Server(Nil) {
   let assert Ok(fail_tool) = case
     tool.definition(
       fail_name,
-      codec.field("name", codec.string()),
+      test_codec.property("name", codec.string()),
       codec.string(),
     )
   {
@@ -116,11 +119,11 @@ fn local_server() -> server.Server(Nil) {
     Error(error) -> Error(error)
   }
   let assert Ok(error_encoding_name) = tool.tool_name("error_encoding")
-  let assert Ok(error_codec) = codec.integer_between(0, 10)
+  let error_codec = codec.integer_between(0, 10)
   let assert Ok(error_encoding_tool) = case
     tool.definition(
       error_encoding_name,
-      codec.field("name", codec.string()),
+      test_codec.property("name", codec.string()),
       codec.string(),
     )
   {
@@ -143,7 +146,10 @@ fn local_server() -> server.Server(Nil) {
   }
   let assert Ok(say_name) = tool.tool_name("say")
   let assert Ok(say_definition) =
-    tool.content_definition(say_name, codec.field("name", codec.string()))
+    tool.content_definition(
+      say_name,
+      test_codec.property("name", codec.string()),
+    )
   let say_tool =
     tool.handle_content(say_definition, fn(_value) {
       Ok([content.text_content("content-only reply")])
@@ -173,7 +179,7 @@ fn local_server() -> server.Server(Nil) {
   let assert Ok(rich_tool) = case
     tool.definition(
       rich_name,
-      codec.field("name", codec.string()),
+      test_codec.property("name", codec.string()),
       codec.string(),
     )
   {
@@ -210,7 +216,7 @@ fn local_server() -> server.Server(Nil) {
   let assert Ok(exact_tool) = case
     tool.definition(
       exact_name,
-      codec.field("value", codec.number()),
+      test_codec.property("value", codec.number()),
       codec.number(),
     )
   {
@@ -235,7 +241,7 @@ fn local_server() -> server.Server(Nil) {
   let assert Ok(slow_tool) = case
     tool.definition(
       slow_name,
-      codec.field("name", codec.string()),
+      test_codec.property("name", codec.string()),
       codec.string(),
     )
   {
@@ -249,9 +255,7 @@ fn local_server() -> server.Server(Nil) {
             Ok("finished")
           },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }
@@ -335,7 +339,7 @@ fn many_named_tools(count: Int) -> List(tool.ContextTool(Nil)) {
       let assert Ok(listed_tool) = case
         tool.definition(
           name,
-          codec.field("name", codec.string()),
+          test_codec.property("name", codec.string()),
           codec.string(),
         )
       {
@@ -346,12 +350,7 @@ fn many_named_tools(count: Int) -> List(tool.ContextTool(Nil)) {
               definition,
               fn(value) { Ok(value) },
               fn(application_error) {
-                case
-                  codec.encode_json(
-                    codec.object(codec.empty()),
-                    application_error,
-                  )
-                {
+                case codec.encode_json(codec.success(Nil), application_error) {
                   Ok(text) -> text
                   Error(_) -> "Tool execution failed."
                 }
@@ -367,12 +366,15 @@ fn many_named_tools(count: Int) -> List(tool.ContextTool(Nil)) {
 }
 
 fn fail_error_codec() -> codec.Codec(#(String, String)) {
-  let assert Ok(fields) =
-    codec.combine(
-      codec.required("code", codec.string()),
-      codec.required("message", codec.string()),
-    )
-  codec.object(fields)
+  use code <- codec.field("code", codec.string(), fn(error: #(String, String)) {
+    error.0
+  })
+  use message <- codec.field(
+    "message",
+    codec.string(),
+    fn(error: #(String, String)) { error.1 },
+  )
+  codec.success(#(code, message))
 }
 
 pub fn http_client_uses_explicit_ca_for_tls_test() {
@@ -449,7 +451,7 @@ pub fn stdio_client_uses_typed_request_surface_test() {
   let call = case
     tool.definition(
       greet_name,
-      codec.field("name", codec.string()),
+      test_codec.property("name", codec.string()),
       codec.string(),
     )
   {
@@ -761,7 +763,11 @@ pub fn gun_http_client_discovery_and_typed_call_test() {
 
   let assert Ok(name) = tool.tool_name("echo")
   let outcome = case
-    tool.definition(name, codec.field("name", codec.string()), codec.string())
+    tool.definition(
+      name,
+      test_codec.property("name", codec.string()),
+      codec.string(),
+    )
   {
     Ok(definition) -> client.call_definition(peer, definition, "MCP")
     Error(_) -> client.ProtocolFailure("invalid local tool definition")
@@ -777,7 +783,7 @@ pub fn gun_http_client_discovery_and_typed_call_test() {
   let failure = case
     tool.definition(
       fail_name,
-      codec.field("name", codec.string()),
+      test_codec.property("name", codec.string()),
       codec.string(),
     )
   {
@@ -811,7 +817,10 @@ pub fn gun_http_client_discovery_and_typed_call_test() {
 
   let assert Ok(say_name) = tool.tool_name("say")
   let assert Ok(say_definition) =
-    tool.content_definition(say_name, codec.field("name", codec.string()))
+    tool.content_definition(
+      say_name,
+      test_codec.property("name", codec.string()),
+    )
   should.equal(
     client.call_content_definition(peer, say_definition, "MCP"),
     client.ContentSuccess([
@@ -824,7 +833,7 @@ pub fn gun_http_client_discovery_and_typed_call_test() {
     case
       tool.definition(
         rich_name,
-        codec.field("name", codec.string()),
+        test_codec.property("name", codec.string()),
         codec.string(),
       )
     {
@@ -859,13 +868,13 @@ pub fn gun_http_client_discovery_and_typed_call_test() {
 
   let exact_token =
     "1234567890123456789012345678901234567890.1234567890123456789"
-  let assert Ok(number_limits) = number.number_limits(1024, 100, 1000)
-  let assert Ok(exact) = number.parse_number(number_limits, exact_token)
+  let assert Ok(exact) =
+    number.parse(exact_token, number.limits(1024, 100, 1000))
   let assert Ok(exact_name) = tool.tool_name("exact")
   let exact_outcome = case
     tool.definition(
       exact_name,
-      codec.field("value", codec.number()),
+      test_codec.property("value", codec.number()),
       codec.number(),
     )
   {
@@ -906,7 +915,7 @@ pub fn gun_http_client_discovery_and_typed_call_test() {
     case
       tool.definition(
         slow_name,
-        codec.field("name", codec.string()),
+        test_codec.property("name", codec.string()),
         codec.string(),
       )
     {
@@ -940,7 +949,7 @@ pub fn admitted_definition_uses_plain_mcp_errors_and_typed_client_call_test() {
   let assert Ok(success_name) = tool.tool_name("definition_success")
   let assert Ok(default_name) = tool.tool_name("definition_default_error")
   let assert Ok(rendered_name) = tool.tool_name("definition_rendered_error")
-  let input = codec.field("name", codec.string())
+  let input = test_codec.property("name", codec.string())
   let assert Ok(success_definition) =
     tool.definition(success_name, input, codec.string())
   let assert Ok(default_definition) =
@@ -1092,7 +1101,7 @@ pub fn http_subscription_receives_requested_list_change_test() {
       let assert Ok(dynamic_tool) = case
         tool.definition(
           dynamic_name,
-          codec.field("name", codec.string()),
+          test_codec.property("name", codec.string()),
           codec.string(),
         )
       {
@@ -1136,7 +1145,7 @@ pub fn http_subscription_receives_requested_list_change_test() {
       let called = case
         tool.definition(
           dynamic_name,
-          codec.field("name", codec.string()),
+          test_codec.property("name", codec.string()),
           codec.string(),
         )
       {
@@ -1222,7 +1231,11 @@ fn assert_subscription_reconciles_tool_change(
 ) -> Nil {
   let assert Ok(name) = tool.tool_name(late_tool_name)
   let assert Ok(late_tool) = case
-    tool.definition(name, codec.field("name", codec.string()), codec.string())
+    tool.definition(
+      name,
+      test_codec.property("name", codec.string()),
+      codec.string(),
+    )
   {
     Ok(definition) -> {
       let definition =
@@ -1358,7 +1371,11 @@ fn assert_subscription_reconciles_tool_change(
 pub fn http_subscription_reconciles_same_name_replacement_during_establishment_test() {
   let assert Ok(name) = tool.tool_name("replace-me")
   let assert Ok(old_tool) = case
-    tool.definition(name, codec.field("name", codec.string()), codec.string())
+    tool.definition(
+      name,
+      test_codec.property("name", codec.string()),
+      codec.string(),
+    )
   {
     Ok(definition) -> {
       let definition =
@@ -1385,7 +1402,11 @@ pub fn http_subscription_reconciles_same_name_replacement_during_establishment_t
     Error(error) -> Error(error)
   }
   let assert Ok(replacement_tool) = case
-    tool.definition(name, codec.field("name", codec.string()), codec.string())
+    tool.definition(
+      name,
+      test_codec.property("name", codec.string()),
+      codec.string(),
+    )
   {
     Ok(definition) -> {
       let definition =
@@ -1491,7 +1512,7 @@ pub fn http_subscription_reconciles_same_name_replacement_during_establishment_t
       let called = case
         tool.definition(
           name,
-          codec.field("name", codec.string()),
+          test_codec.property("name", codec.string()),
           codec.string(),
         )
       {
@@ -1601,7 +1622,7 @@ fn churn_registry(listener: http.HttpServer(Nil), remaining: Int) -> Nil {
       let assert Ok(new_tool) = case
         tool.definition(
           name,
-          codec.field("name", codec.string()),
+          test_codec.property("name", codec.string()),
           codec.string(),
         )
       {
@@ -1747,7 +1768,11 @@ fn continuation_server() -> #(
 ) {
   let assert Ok(name) = tool.tool_name("continue-echo")
   let assert Ok(definition) =
-    tool.definition(name, codec.field("name", codec.string()), codec.string())
+    tool.definition(
+      name,
+      test_codec.property("name", codec.string()),
+      codec.string(),
+    )
   let bound =
     tool.handle_advanced(definition, fn(call, name) {
       case call.input_responses {
@@ -1787,7 +1812,11 @@ pub fn configured_large_structured_response_uses_client_parser_bound_test() {
   let large_output = string.repeat("x", 10_486_000)
   let assert Ok(name) = tool.tool_name("large-structured")
   let assert Ok(definition) =
-    tool.definition(name, codec.field("name", codec.string()), codec.string())
+    tool.definition(
+      name,
+      test_codec.property("name", codec.string()),
+      codec.string(),
+    )
   let assert Ok(registry) =
     tool.registry([tool.handle(definition, fn(_name) { Ok(large_output) })])
   let policy =
@@ -1920,7 +1949,7 @@ pub fn input_required_accepts_state_only_and_rejects_empty_result_test() {
     |> client.connect_stdio()
   let assert Ok(state_name) = tool.tool_name("state-only")
   let assert Ok(state_definition) =
-    tool.definition(state_name, codec.object(codec.empty()), codec.string())
+    tool.definition(state_name, codec.success(Nil), codec.string())
   let assert client.InputRequired(continuation, requests) =
     client.call_definition(peer, state_definition, Nil)
   dict.is_empty(requests) |> should.be_true()
@@ -1930,7 +1959,7 @@ pub fn input_required_accepts_state_only_and_rejects_empty_result_test() {
   )
   let assert Ok(empty_name) = tool.tool_name("empty-requests")
   let assert Ok(empty_definition) =
-    tool.definition(empty_name, codec.object(codec.empty()), codec.string())
+    tool.definition(empty_name, codec.success(Nil), codec.string())
   let assert client.InputRequired(empty_continuation, empty_requests) =
     client.call_definition(peer, empty_definition, Nil)
   dict.is_empty(empty_requests) |> should.be_true()
@@ -1940,7 +1969,7 @@ pub fn input_required_accepts_state_only_and_rejects_empty_result_test() {
   )
   let assert Ok(invalid_name) = tool.tool_name("invalid")
   let assert Ok(invalid_definition) =
-    tool.definition(invalid_name, codec.object(codec.empty()), codec.string())
+    tool.definition(invalid_name, codec.success(Nil), codec.string())
   let assert client.ProtocolFailure(reason) =
     client.call_definition(peer, invalid_definition, Nil)
   string.contains(reason, "no requests or requestState") |> should.be_true()
@@ -1972,8 +2001,7 @@ pub fn content_only_continuation_has_no_output_codec_test() {
     )
   let assert Ok(peer) = client.connect_stdio(config)
   let assert Ok(name) = tool.tool_name("content-only")
-  let assert Ok(definition) =
-    tool.content_definition(name, codec.object(codec.empty()))
+  let assert Ok(definition) = tool.content_definition(name, codec.success(Nil))
   let assert client.ContentInputRequired(continuation, requests) =
     client.call_content_definition(peer, definition, Nil)
   dict.has_key(requests, "root") |> should.be_true()
@@ -2001,7 +2029,7 @@ pub fn stdio_tool_call_close_is_typed_cancellation_test() {
     |> client.connect_stdio()
   let assert Ok(name) = tool.tool_name("slow")
   let assert Ok(definition) =
-    tool.definition(name, codec.object(codec.empty()), codec.string())
+    tool.definition(name, codec.success(Nil), codec.string())
   let done = process.new_subject()
   let _ =
     process.spawn(fn() {

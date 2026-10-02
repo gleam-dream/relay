@@ -12,6 +12,7 @@ import relay/protocol/jsonrpc.{RequestString}
 import relay/resources
 import relay/server
 import relay/subscriptions
+import relay/test_codec
 import relay/tool
 
 pub fn main() -> Nil {
@@ -20,7 +21,7 @@ pub fn main() -> Nil {
   let assert Ok(greet_tool) = case
     tool.definition(
       greet_name,
-      codec.field("name", codec.string()),
+      test_codec.property("name", codec.string()),
       codec.string(),
     )
   {
@@ -38,9 +39,7 @@ pub fn main() -> Nil {
           definition,
           fn(name: String) { Ok("Hello " <> name) },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }
@@ -55,7 +54,7 @@ pub fn main() -> Nil {
   let assert Ok(fail_tool) = case
     tool.definition(
       fail_name,
-      codec.field("msg", codec.string()),
+      test_codec.property("msg", codec.string()),
       codec.string(),
     )
   {
@@ -75,7 +74,7 @@ pub fn main() -> Nil {
           fn(application_error) {
             case
               codec.encode_json(
-                codec.field("reason", codec.string()),
+                test_codec.property("reason", codec.string()),
                 application_error,
               )
             {
@@ -106,7 +105,7 @@ pub fn main() -> Nil {
 
   // 3. Call success response
   let assert Ok(args_val) =
-    codec.encode(codec.field("name", codec.string()), "World")
+    codec.encode(test_codec.property("name", codec.string()), "World")
   let assert Ok(call_success_val) =
     tool.dispatch(reg, "corpus", greet_name, args_val)
   let call_success_wire =

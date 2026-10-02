@@ -13,6 +13,7 @@ import json/blueprint/codec
 import relay/runtime.{RuntimeConfig}
 import relay/server
 import relay/telemetry
+import relay/test_codec
 import relay/tool
 import sinal
 
@@ -135,7 +136,7 @@ fn sample_server() -> server.Server(String) {
   let assert Ok(greet_tool) = case
     tool.definition(
       greet_name,
-      codec.field("name", codec.string()),
+      test_codec.property("name", codec.string()),
       codec.string(),
     )
   {
@@ -165,9 +166,7 @@ fn sample_server() -> server.Server(String) {
             }
           },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }
@@ -182,7 +181,7 @@ fn sample_server() -> server.Server(String) {
   let assert Ok(crash_tool) = case
     tool.definition(
       crash_name,
-      codec.field("name", codec.string()),
+      test_codec.property("name", codec.string()),
       codec.string(),
     )
   {
@@ -202,9 +201,7 @@ fn sample_server() -> server.Server(String) {
             panic as "Deliberate handler crash: secret-token-7B3F"
           },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }
@@ -217,7 +214,11 @@ fn sample_server() -> server.Server(String) {
 
   let assert Ok(slow_name) = tool.tool_name("slow")
   let assert Ok(slow_tool) = case
-    tool.definition(slow_name, codec.field("ms", codec.int()), codec.string())
+    tool.definition(
+      slow_name,
+      test_codec.property("ms", codec.int()),
+      codec.string(),
+    )
   {
     Ok(definition) -> {
       let definition =
@@ -236,9 +237,7 @@ fn sample_server() -> server.Server(String) {
             Ok("finished slow")
           },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }
@@ -379,14 +378,11 @@ pub fn runtime_crash_isolation_test() {
   let s = sample_server()
   let sink_subj = process.new_subject()
   let crash_subj = process.new_subject()
-  let assert Ok(crash_hid) = sinal.handler_id("runtime_crash_redaction")
   let crash_event = telemetry.invocation_crashed_event()
-  let crash_handler = fn(_ev, _meas, meta: telemetry.InvocationCrashedMeta) {
+  let crash_handler = fn(_meas, meta: telemetry.InvocationCrashedMeta) {
     process.send(crash_subj, meta)
-    Ok(Nil)
   }
-  let assert Ok(crash_attachment) =
-    sinal.attach(crash_hid, crash_event, crash_handler, fn(_, _) { Nil })
+  let crash_attachment = sinal.observe(crash_event, crash_handler)
   let config = runtime.default_config()
 
   let assert Ok(rt) =
@@ -442,13 +438,11 @@ pub fn runtime_crash_isolation_test() {
 
 pub fn request_admitted_runtime_observation_test() {
   let event_subj = process.new_subject()
-  let assert Ok(hid) = sinal.handler_id("runtime_request_admitted")
   let ev = telemetry.request_admitted_event()
-  let handler = fn(_ev, _meas, meta: telemetry.RequestAdmittedMeta) {
+  let handler = fn(_meas, meta: telemetry.RequestAdmittedMeta) {
     process.send(event_subj, meta)
-    Ok(Nil)
   }
-  let assert Ok(att) = sinal.attach(hid, ev, handler, fn(_, _) { Nil })
+  let att = sinal.observe(ev, handler)
   let assert Ok(rt) =
     runtime.start(sample_server(), runtime.default_config(), fn(_output) {
       Ok(Nil)
@@ -649,11 +643,7 @@ pub fn runtime_progress_backpressure_bounds_mailbox_test() {
   let gate = start_sink_gate()
   let assert Ok(name) = tool.tool_name("progress_burst")
   let assert Ok(tool) = case
-    tool.definition(
-      name,
-      codec.object(codec.empty()),
-      codec.object(codec.empty()),
-    )
+    tool.definition(name, codec.success(Nil), codec.success(Nil))
   {
     Ok(definition) -> {
       let definition = tool.with_metadata(definition, tool.empty_metadata())
@@ -676,9 +666,7 @@ pub fn runtime_progress_backpressure_bounds_mailbox_test() {
           definition,
           advanced_handler,
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }

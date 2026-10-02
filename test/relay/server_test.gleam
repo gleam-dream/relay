@@ -9,6 +9,7 @@ import relay/server.{
   type Server, CancelInvocation, CloseExchange, EmitRequestAdmitted,
   MessageReceived, StartInvocation, Write,
 }
+import relay/test_codec
 import relay/tool
 
 pub fn main() -> Nil {
@@ -18,7 +19,11 @@ pub fn main() -> Nil {
 fn sample_server() -> Server(String) {
   let assert Ok(name) = tool.tool_name("greet")
   let assert Ok(greet_tool) = case
-    tool.definition(name, codec.field("name", codec.string()), codec.string())
+    tool.definition(
+      name,
+      test_codec.property("name", codec.string()),
+      codec.string(),
+    )
   {
     Ok(definition) -> {
       let definition =
@@ -46,9 +51,7 @@ fn sample_server() -> Server(String) {
             }
           },
           fn(application_error) {
-            case
-              codec.encode_json(codec.object(codec.empty()), application_error)
-            {
+            case codec.encode_json(codec.success(Nil), application_error) {
               Ok(text) -> text
               Error(_) -> "Tool execution failed."
             }
