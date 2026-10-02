@@ -5,12 +5,50 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: relay
+      # gleam.toml reaches json_blueprint and sinal through ../ path
+      # dependencies, so CI checks out each sibling beside relay at the commit
+      # recorded in sibling-revisions.txt.
+      - name: Read pinned sibling revisions
+        id: siblings
+        run: |
+          echo "json_blueprint=$(grep '^json_blueprint=' relay/sibling-revisions.txt | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+          echo "sinal=$(grep '^sinal=' relay/sibling-revisions.txt | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: lostbean/json_blueprint
+          ref: ${{ steps.siblings.outputs.json_blueprint }}
+          path: json_blueprint
+      # gleam-dream/sinal is private, and the default GITHUB_TOKEN reads only
+      # this repository. SIBLINGS_READ_TOKEN must hold a token with read
+      # access to gleam-dream/sinal.
+      - uses: actions/checkout@v4
+        with:
+          repository: gleam-dream/sinal
+          ref: ${{ steps.siblings.outputs.sinal }}
+          path: sinal
+          token: ${{ secrets.SIBLINGS_READ_TOKEN || github.token }}
       - uses: erlef/setup-beam@v1
         with:
           otp-version: "28"
           gleam-version: "1.18.1"
           rebar3-version: "3.27.0"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install jsonschema==4.26.0
       - run: gleam deps download
+        working-directory: relay
       - run: gleam format --check src test
+        working-directory: relay
       - run: gleam build --warnings-as-errors
+        working-directory: relay
       - run: gleam test
+        working-directory: relay
+      - run: python3 scripts/check_negative_fixtures.py
+        working-directory: relay
+      - run: python3 scripts/relay_schema_check.py
+        working-directory: relay
+      - run: ./scripts/verify_checksums.sh
+        working-directory: relay
