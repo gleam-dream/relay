@@ -634,13 +634,15 @@ pub fn correlation_reaches_the_handler_and_client_telemetry_test() {
     Some(_),
     Some("correlated-client"),
   ) = first
+  // The untagged view minted the correlation the server saw.
   let assert telemetry.ClientCallMeta(
     "tools/call",
     Some("whoami"),
     telemetry.CallCompleted,
-    None,
+    Some(untagged_correlation),
     _,
   ) = untagged
+  let assert True = correlation.to_string(untagged_correlation) == minted
   let assert telemetry.ClientCallMeta(
     "tools/call",
     Some("fail"),

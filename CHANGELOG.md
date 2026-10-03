@@ -85,7 +85,9 @@ refusals; the
   travels in the request `_meta` key `io.github.gleam-dream/correlation` and,
   over HTTP, in the `x-correlation-id` header. The server accepts 1 to 128
   visible ASCII characters, ignores anything else and never uses the value
-  to authorize (TH-7).
+  to authorize (TH-7). A view without a correlation mints a fresh one per
+  request, sends it and tags its own `[relay, client, call]` event with it,
+  so the client's and the server's events always share one (SMCP).
 - `authorization.IssuedForAnotherResource`: a verifier that checks the
   audience itself gets the same `invalid_token` "issued for another
   resource" challenge and `WrongResource` decision as an attestation for

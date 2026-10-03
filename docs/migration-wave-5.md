@@ -114,6 +114,23 @@ A view whose requests carry `key`. Use one view per logical request and its
 retries. A key that is not 1 to 128 visible ASCII characters fails each
 request with `InvalidArguments` before it is sent.
 
+### Per-call correlation (behaviour)
+
+A view without a correlation now mints `correlation.unique()` for each
+request, sends it like a view correlation, and puts it on its own
+`[relay, client, call]` event and HTTP Gun events, which before carried
+`None`. A handler of client events that treated `correlation: None` as
+"untagged" sees `Some(..)` instead; two calls through the same untagged view
+get two correlations.
+
+### Verifier 403
+
+No `VerificationError` variant for 403 is added. Warden's `Forbidden` arises
+only from a missing required scope, and Relay already answers that with 403
+`insufficient_scope` naming the endpoint's scopes: leave warden's
+`with_required_scopes` unset, attest the token's scopes, and put the
+required ones in `authorization.protection(resource, scopes)`.
+
 ### `with_correlation` (behaviour)
 
 The view's correlation now travels to the server in the `_meta` key and,

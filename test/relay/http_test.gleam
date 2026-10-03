@@ -1346,3 +1346,37 @@ pub fn endpoint_correlation_precedence_test() {
     |> string.length
   let assert 32 = whoami_request() |> answer |> string.length
 }
+
+/// Wave 5 (SMCP): a view without a correlation mints one per call, sends
+/// it, and tags its own `client.call` event with it, so client and server
+/// share one correlation; two calls get two.
+pub fn uncorrelated_client_mints_the_call_correlation_test() {
+  let calls = process.new_subject()
+  let attachment =
+    sinal.observe(telemetry.client_call_event(), fn(_, m) {
+      case m.client {
+        Some("minting-client") -> process.send(calls, m.correlation)
+        _ -> Nil
+      }
+    })
+  let seen = process.new_subject()
+  let listener = http.new(server.new([seen_tool(seen)])) |> started
+  let assert Ok(config) =
+    client.http(
+      "http://127.0.0.1:" <> int.to_string(http.port(listener)) <> "/",
+    )
+  let assert Ok(peer) =
+    config |> client.with_label("minting-client") |> client.connect
+
+  let assert Ok(client.Succeeded(first, _)) = client.call(peer, whoami(), Nil)
+  let assert Ok(client.Succeeded(second, _)) = client.call(peer, whoami(), Nil)
+  let assert Ok(Some(first_event)) = process.receive(calls, 1000)
+  let assert Ok(Some(second_event)) = process.receive(calls, 1000)
+  correlation.to_string(first_event) |> should.equal(first)
+  correlation.to_string(second_event) |> should.equal(second)
+  let assert True = first != second
+
+  client.close(peer)
+  http.stop(listener)
+  let assert Ok(Nil) = sinal.detach(attachment)
+}

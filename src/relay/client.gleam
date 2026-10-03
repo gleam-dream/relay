@@ -29,8 +29,10 @@
 //// under `io.github.gleam-dream/correlation` on every transport, and over
 //// HTTP also in the `x-correlation-id` header. A Relay server tags that
 //// request's events with it and hands it to the handler and the verifier.
-//// Only a correlation of visible ASCII characters (`!` to `~`) is sent; the
-//// server mints its own for any other. The server treats the value as
+//// A view without a correlation mints a fresh one per request and sends
+//// that, so the client's `[relay, client, call]` event and the server's
+//// events always share one. Only a correlation of visible ASCII characters
+//// (`!` to `~`) is sent; the server mints its own for any other. The server treats the value as
 //// untrusted telemetry and never uses it to authorize anything.
 ////
 //// ```gleam
@@ -707,8 +709,10 @@ pub fn with_cancellation(client: Client, token: Token) -> Client {
 /// A view whose operations carry this correlation in Relay's and HTTP
 /// Gun's telemetry, and send it to the server, which tags the request's
 /// events with it and hands it to the tool handler (`tool.correlation`).
-/// A correlation that is not visible ASCII stays local: the server mints
-/// its own.
+/// Without a view correlation, each request mints a fresh one and uses it
+/// the same way, so a `[relay, client, call]` event always shares its
+/// correlation with the server's events. A correlation that is not visible
+/// ASCII stays local: the server mints its own.
 pub fn with_correlation(client: Client, correlation: Correlation) -> Client {
   Client(..client, correlation: Some(correlation))
 }
@@ -726,6 +730,15 @@ pub fn with_correlation(client: Client, correlation: Correlation) -> Client {
 /// sent.
 pub fn with_idempotency_key(client: Client, key: String) -> Client {
   Client(..client, idempotency_key: Some(key))
+}
+
+// A view without a correlation gets a fresh one per request, so the
+// client's events and the server's always share one.
+fn call_correlation(client: Client) -> Client {
+  case client.correlation {
+    Some(_) -> client
+    None -> Client(..client, correlation: Some(correlation.unique()))
+  }
 }
 
 fn check_idempotency_key(client: Client) -> Result(Nil, Error) {
@@ -1350,6 +1363,7 @@ fn request(
   params: List(#(String, json.Json)),
 ) -> Result(Response, Error) {
   use Nil <- result.try(check_idempotency_key(client))
+  let client = call_correlation(client)
   let id = new_id()
   let started = monotonic_ms()
   let outcome =
@@ -2255,6 +2269,7 @@ pub fn listen(
   notifications: List(Notification),
 ) -> Result(Subscription, Error) {
   use Nil <- result.try(check_idempotency_key(client))
+  let client = call_correlation(client)
   let id = new_id()
   let body =
     envelope(client, id, "subscriptions/listen", [
