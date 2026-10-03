@@ -451,6 +451,49 @@ pub fn http_cancellation_ends_the_call_and_cancels_the_handler_test() {
   http.stop(handler)
 }
 
+/// Closing a client cancels its in-flight HTTP calls at once: each call's
+/// connection closes, which cancels it on the server, and `close` does not
+/// wait for the response to drain.
+pub fn http_close_cancels_in_flight_calls_without_draining_test() {
+  let observed = process.new_subject()
+  let #(handler, url) = start_http(local_server(observed))
+  let peer = connect_url(url)
+  let done = process.new_subject()
+  let _ =
+    process.spawn(fn() {
+      process.send(done, client.call(peer, slow_definition(), "in flight"))
+    })
+  // Let the request reach the handler.
+  process.sleep(300)
+  let closing = monotonic_ms()
+  client.close(peer)
+  let closed_in = monotonic_ms() - closing
+  let outcome = process.receive(done, 2000)
+  let cancelled = process.receive(observed, 2000)
+  http.stop(handler)
+  let assert True = closed_in < 1000
+  let assert Ok(Error(client.Cancelled(client.MaybeSent))) = outcome
+  let assert Ok("cancelled") = cancelled
+}
+
+pub fn in_process_close_cancels_in_flight_calls_at_once_test() {
+  let observed = process.new_subject()
+  let peer = testing.connect(local_server(observed), Nil)
+  let done = process.new_subject()
+  let _ =
+    process.spawn(fn() {
+      process.send(done, client.call(peer, slow_definition(), "in flight"))
+    })
+  process.sleep(200)
+  let closing = monotonic_ms()
+  client.close(peer)
+  let closed_in = monotonic_ms() - closing
+  let assert True = closed_in < 500
+  let assert Ok(Error(client.Cancelled(client.MaybeSent))) =
+    process.receive(done, 1000)
+  let assert Ok("cancelled") = process.receive(observed, 2000)
+}
+
 pub fn in_process_deadline_and_cancellation_cancel_the_handler_test() {
   let observed = process.new_subject()
   let peer = testing.connect(local_server(observed), Nil)

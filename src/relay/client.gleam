@@ -665,7 +665,13 @@ pub fn connect(config: Config) -> Result(Client, Error) {
   Ok(Client(peer, config, None, None, correlation))
 }
 
-/// Closes the connection and every request and stream on it.
+/// Closes the connection and every request and stream on it, without
+/// waiting for them. An in-flight call ends with `Cancelled(MaybeSent)`: over
+/// HTTP its connection closes, which cancels it on the server; over stdio the
+/// child is closed; in process its handler is cancelled and keeps the
+/// runtime's cancellation grace. A caller's HTTP Gun client
+/// (`with_http_client`) is not stopped, so calls in flight through it run
+/// until they end; cancel them with `with_cancellation`.
 pub fn close(client: Client) -> Nil {
   client.peer.close()
 }
@@ -746,6 +752,10 @@ fn http_peer(
         |> gun_config.with_connect_timeout(config.connect_timeout)
         |> gun_config.with_request_timeout(gun_config.After(config.timeout))
         |> gun_config.with_max_response_body_bytes(config.max_response_bytes)
+        // `close` cancels in-flight calls instead of draining them: stopping
+        // closes each open response's connection at once, which is how MCP
+        // cancels a request over Streamable HTTP.
+        |> gun_config.with_shutdown_timeout(duration.milliseconds(0))
       let settings = case config.ca_cert_file {
         Some(path) -> gun_config.with_trust(settings, gun_config.CustomCa(path))
         None -> settings
@@ -1061,10 +1071,17 @@ fn stdio_failure(failure: stdio_client.Failure) -> Error {
 // --- in process --------------------------------------------------------------
 
 type RouterMessage {
-  Register(exchange: Int, subject: Subject(runtime.Output), reply: Subject(Nil))
+  Register(exchange: Int, subject: Subject(Routed), reply: Subject(Nil))
   Unregister(exchange: Int)
   Route(output: runtime.Output)
   StopRouter
+}
+
+// What the router hands one in-process exchange: a runtime output, or the
+// client's `close`, which ends the exchange's call as cancelled.
+type Routed {
+  Routed(runtime.Output)
+  PeerClosed
 }
 
 fn in_process_peer(
@@ -1087,12 +1104,15 @@ fn in_process_peer(
               reducer.exchange_id_to_int(exchange)
           }
           case dict.get(routes, exchange) {
-            Ok(subject) -> process.send(subject, output)
+            Ok(subject) -> process.send(subject, Routed(output))
             Error(Nil) -> Nil
           }
           actor.continue(routes)
         }
-        StopRouter -> actor.stop()
+        StopRouter -> {
+          dict.each(routes, fn(_, subject) { process.send(subject, PeerClosed) })
+          actor.stop()
+        }
       }
     })
     |> actor.start
@@ -1152,8 +1172,9 @@ fn in_process_peer(
           next: fn(wait_ms) {
             case process.receive(outputs, wait_ms) {
               Error(Nil) -> Ok(None)
-              Ok(runtime.OutputWrite(_, bytes)) -> Ok(Some(bytes))
-              Ok(runtime.OutputClose(_)) -> Error(ConnectionClosed(Completed))
+              Ok(Routed(runtime.OutputWrite(_, bytes))) -> Ok(Some(bytes))
+              Ok(Routed(runtime.OutputClose(_))) | Ok(PeerClosed) ->
+                Error(ConnectionClosed(Completed))
             }
           },
           close: fn() {
@@ -1166,7 +1187,10 @@ fn in_process_peer(
         )
       },
       close: fn() {
-        runtime.stop(rt)
+        // Cancels every invocation without waiting for the handlers: the
+        // runtime stops itself once each has returned or its grace has ended.
+        runtime.close(rt)
+        let _ = process.spawn_unlinked(fn() { runtime.stop(rt) })
         process.send(router, StopRouter)
       },
     ),
@@ -1177,7 +1201,7 @@ fn in_process_peer(
 fn monotonic_ms() -> Int
 
 fn await_frame(
-  outputs: Subject(runtime.Output),
+  outputs: Subject(Routed),
   budget: Budget,
   deadline: Int,
 ) -> Result(BitArray, Error) {
@@ -1188,12 +1212,13 @@ fn await_frame(
     False, False ->
       case process.receive(outputs, int.min(left, 50)) {
         Error(Nil) -> await_frame(outputs, budget, deadline)
-        Ok(runtime.OutputWrite(_, bytes)) ->
+        Ok(PeerClosed) -> Error(Cancelled(MaybeSent))
+        Ok(Routed(runtime.OutputWrite(_, bytes))) ->
           case v2026.is_response_frame(bytes) {
             True -> Ok(bytes)
             False -> await_frame(outputs, budget, deadline)
           }
-        Ok(runtime.OutputClose(_)) -> Error(ConnectionClosed(MaybeSent))
+        Ok(Routed(runtime.OutputClose(_))) -> Error(ConnectionClosed(MaybeSent))
       }
   }
 }

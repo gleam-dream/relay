@@ -107,6 +107,13 @@ changed item with its replacement.
   started elsewhere (TH-3). `runtime.stop` now returns after that drain and
   waits at most the grace plus 5 s; the HTTP endpoint does not hold a
   response for it.
+- `client.close` no longer waits about 5 s per in-flight HTTP call for
+  HTTP Gun's drain. Closing a client stops its own HTTP Gun client without
+  draining, so each open call's connection closes at once, which cancels it
+  on the server, and the call ends with `Cancelled(MaybeSent)`, as over
+  stdio. An in-process call ends the same way at once instead of at its
+  timeout. A caller's client from `with_http_client` is not stopped; calls
+  in flight through it run until they end.
 - Client failures no longer arrive as `String`, `Dynamic` or a field-less
   configuration error; a 401 keeps its challenge and a JSON-RPC error its
   code and data (TH-4, SMCP-6).

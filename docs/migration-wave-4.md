@@ -587,7 +587,10 @@ let assert Ok(Nil) = stdio.serve(service, Nil)
 
 A deadline or a cancellation that ends an HTTP call closes that call's
 connection, which MCP `2026-07-28` defines as cancellation, so the server
-stops the handler; the next call reconnects.
+stops the handler; the next call reconnects. `close` cancels every call in
+flight the same way without waiting for a drain: each ends with
+`Cancelled(MaybeSent)`. It does not stop a caller's HTTP Gun client from
+`with_http_client`; calls in flight through that client run until they end.
 
 ```gleam
 // Before
