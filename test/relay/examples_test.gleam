@@ -32,6 +32,7 @@ import relay/telemetry
 import relay/testing
 import relay/tool
 import sinal
+import sinal/correlation.{type Correlation}
 
 // --- README: serve a tool and call it ----------------------------------------
 
@@ -188,6 +189,53 @@ pub fn readme_views_test() {
     )
   let assert Ok(client.Succeeded("Hi Ada", _)) = call_with_budget(peer, greet())
   client.close(peer)
+}
+
+// --- README: follow a call from client to server ----------------------------------
+
+fn ask(
+  peer: client.Client,
+  definition: tool.Definition(String, String),
+  question: Correlation,
+) -> Result(client.ToolResult(String), client.Error) {
+  peer
+  |> client.with_correlation(question)
+  |> client.call(definition, "Ada")
+}
+
+pub fn readme_follow_a_call_test() {
+  let echo_correlation =
+    tool.handle_call(greet(), fn(call, name) {
+      Ok(tool.complete(
+        name <> " " <> correlation.to_string(tool.correlation(call)),
+      ))
+    })
+  let peer = testing.connect(server.new([echo_correlation]), Nil)
+  let question = correlation.from_key("question-7")
+  let assert Ok(client.Succeeded("Ada question-7", _)) =
+    ask(peer, greet(), question)
+  client.close(peer)
+}
+
+fn introspecting_verifier(
+  introspect: fn(authorization.BearerToken, Correlation) ->
+    Result(authorization.Attestation(String), authorization.VerificationError),
+) -> authorization.Verifier(String) {
+  use token, correlation <- authorization.correlated_verifier("introspection")
+  introspect(token, correlation)
+}
+
+pub fn readme_correlated_verifier_test() {
+  let verifier =
+    introspecting_verifier(fn(_token, _correlation) {
+      Error(authorization.IssuedForAnotherResource)
+    })
+  let assert Ok(token) = authorization.bearer_token("t")
+  let assert Ok(resource) =
+    authorization.protected_resource("https://mcp.example.com/mcp")
+  let assert Error(authorization.VerificationFailed(error)) =
+    authorization.admit(verifier, token, authorization.protection(resource, []))
+  let assert authorization.InvalidToken = authorization.verification_kind(error)
 }
 
 // --- module docs ------------------------------------------------------------------

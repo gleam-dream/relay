@@ -13,6 +13,7 @@ import relay/content.{
   type Annotations, type ContentBlock, type Icon, type Meta,
   type ResourceContents,
 }
+import relay/internal/jsonrpc
 import sinal/correlation.{type Correlation}
 
 // --- tools -------------------------------------------------------------------
@@ -77,7 +78,8 @@ pub type Call(context) {
     context: context,
     input_responses: List(#(String, Value)),
     invocation_id: Int,
-    correlation: Option(Correlation),
+    request_id: jsonrpc.RequestId,
+    correlation: Correlation,
     client_info: Option(#(String, String)),
     progress: fn(Float, Option(Float), Option(String)) -> Nil,
     cancelled: process.Selector(Nil),

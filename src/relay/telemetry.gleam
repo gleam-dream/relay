@@ -15,10 +15,15 @@
 //// | `[relay, client, call]` | a client request finished; measures `duration_ms` |
 ////
 //// Server events carry the method, the tool name when there is one, the
-//// `sinal/correlation` the transport attached, and the `listener` label set
-//// with `relay/http.with_label` or `relay/runtime.with_label`. Read metadata
-//// by label: a later release may add fields. Status and reason fields are
-//// enums, never prose.
+//// request's `sinal/correlation`, and the `listener` label set with
+//// `relay/http.with_label` or `relay/runtime.with_label`. Every request has
+//// a correlation, and all of its server events, `exchange.closed` included,
+//// carry the same one: the endpoint's `relay/http.with_correlation` value,
+//// else the one the client sent (a Relay client sends its
+//// `relay/client.with_correlation`), else a fresh one. Only a frame the
+//// runtime refuses before admission (`frame.rejected`) has none. Read
+//// metadata by label: a later release may add fields. Status and reason
+//// fields are enums, never prose.
 ////
 //// ```gleam
 //// import gleam/io
@@ -172,7 +177,11 @@ pub type InvocationCrashedMeta {
 
 /// Metadata of `[relay, exchange, closed]`.
 pub type ExchangeClosedMeta {
-  ExchangeClosedMeta(exchange_id: Int, listener: Option(String))
+  ExchangeClosedMeta(
+    exchange_id: Int,
+    correlation: Option(Correlation),
+    listener: Option(String),
+  )
 }
 
 /// Metadata of `[relay, http, rejected]`.
@@ -470,8 +479,11 @@ pub fn exchange_closed_event() -> Event(Nil, ExchangeClosedMeta) {
     use exchange_id <- fields.include(fields.int("exchange_id"), get: fn(m) {
       m.exchange_id
     })
+    use correlation <- fields.include(correlation.field(), get: fn(m) {
+      m.correlation
+    })
     use listener <- fields.include(listener(), get: fn(m) { m.listener })
-    fields.success(ExchangeClosedMeta(exchange_id:, listener:))
+    fields.success(ExchangeClosedMeta(exchange_id:, correlation:, listener:))
   }
   sinal.event(["relay", "exchange", "closed"], fields.empty(), meta)
 }

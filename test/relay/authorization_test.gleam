@@ -5,6 +5,7 @@ import gleam/http/response
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/result
 import gleam/string
 import gleeunit/should
 import json/blueprint/codec
@@ -15,6 +16,7 @@ import relay/telemetry
 import relay/testing
 import relay/tool
 import sinal
+import sinal/correlation
 
 const resource_raw = "https://relay.example/mcp"
 
@@ -41,6 +43,14 @@ fn fixed_verifier(
   authorization.verifier("test-verifier", fn(_token) { Ok(attestation) })
 }
 
+fn admit(
+  verifier: authorization.Verifier(principal),
+  token: authorization.BearerToken,
+  protection: authorization.Protection,
+) -> Result(authorization.Grant(principal), authorization.AdmissionError) {
+  authorization.admit(verifier, token, protection)
+}
+
 // --- admission ----------------------------------------------------------------
 
 pub fn admits_verified_principal_and_configured_scope_test() {
@@ -50,8 +60,7 @@ pub fn admits_verified_principal_and_configured_scope_test() {
       authorization.attestation("principal", [resource_raw], ["tools:read"]),
     )
   let protection = authorization.protection(resource(), [read])
-  let assert Ok(grant) =
-    authorization.admit(verifier, token("opaque-token"), protection)
+  let assert Ok(grant) = admit(verifier, token("opaque-token"), protection)
   should.equal(authorization.grant_principal(grant), "principal")
   should.equal(authorization.grant_scopes(grant), [read])
   should.equal(authorization.grant_resource(grant), resource())
@@ -70,7 +79,7 @@ pub fn rejects_verifier_failure_without_grant_test() {
   |> list.each(fn(failure) {
     let verifier =
       authorization.verifier("test-verifier", fn(_token) { Error(failure) })
-    authorization.admit(verifier, token("expired"), protection)
+    admit(verifier, token("expired"), protection)
     |> should.equal(Error(authorization.VerificationFailed(failure)))
   })
 }
@@ -86,7 +95,7 @@ pub fn rejects_wrong_missing_and_additional_audiences_test() {
   |> list.each(fn(audiences) {
     let verifier =
       fixed_verifier(authorization.attestation("principal", audiences, []))
-    authorization.admit(verifier, token("opaque-token"), protection)
+    admit(verifier, token("opaque-token"), protection)
     |> should.equal(Error(authorization.ResourceNotGranted))
   })
   // Empty audience strings are ignored.
@@ -94,8 +103,7 @@ pub fn rejects_wrong_missing_and_additional_audiences_test() {
     fixed_verifier(
       authorization.attestation("principal", [resource_raw, ""], []),
     )
-  let assert Ok(_) =
-    authorization.admit(verifier, token("opaque-token"), protection)
+  let assert Ok(_) = admit(verifier, token("opaque-token"), protection)
 }
 
 pub fn retains_attested_scopes_and_requires_every_endpoint_scope_test() {
@@ -108,18 +116,16 @@ pub fn retains_attested_scopes_and_requires_every_endpoint_scope_test() {
       ]),
     )
   let admitting = authorization.protection(resource(), [read])
-  let assert Ok(grant) =
-    authorization.admit(verifier, token("opaque-token"), admitting)
+  let assert Ok(grant) = admit(verifier, token("opaque-token"), admitting)
   should.equal(authorization.grant_scopes(grant), [read, write])
 
   let stronger = authorization.protection(resource(), [read, write])
-  let assert Ok(_) =
-    authorization.admit(verifier, token("opaque-token"), stronger)
+  let assert Ok(_) = admit(verifier, token("opaque-token"), stronger)
   let weak_verifier =
     fixed_verifier(
       authorization.attestation("principal", [resource_raw], ["tools:read"]),
     )
-  authorization.admit(weak_verifier, token("weak-token"), stronger)
+  admit(weak_verifier, token("weak-token"), stronger)
   |> should.equal(Error(authorization.MissingEndpointScope(write)))
   authorization.required_scopes(stronger) |> should.equal([read, write])
   authorization.protected(stronger) |> should.equal(resource())
@@ -515,4 +521,152 @@ pub fn tool_access_follows_the_principal_in_the_context_test() {
   allowed.status |> should.equal(200)
   string.contains(testing.body_text(allowed), "secret for admin")
   |> should.be_true
+}
+
+// --- wave 5: audience refusals and correlation ---------------------------------
+
+/// A verifier that checks the audience itself reports
+/// `IssuedForAnotherResource`, and Relay answers with the same challenge and
+/// decision as an attestation for another resource.
+pub fn issued_for_another_resource_gets_the_resource_challenge_test() {
+  let protection = protection()
+  let refusing =
+    authorization.verifier("audience-checking", fn(_token) {
+      Error(authorization.IssuedForAnotherResource)
+    })
+  admit(refusing, token("foreign"), protection)
+  |> should.equal(
+    Error(authorization.VerificationFailed(
+      authorization.IssuedForAnotherResource,
+    )),
+  )
+  authorization.challenge(
+    protection,
+    authorization.VerificationFailed(authorization.IssuedForAnotherResource),
+  )
+  |> should.equal(authorization.challenge(
+    protection,
+    authorization.ResourceNotGranted,
+  ))
+
+  let grants = process.new_subject()
+  let handler = protected_handler(refusing, grants)
+  let decided = process.new_subject()
+  let attachment =
+    sinal.observe(telemetry.authorization_decided_event(), fn(_, meta) {
+      case meta.verifier {
+        "audience-checking" -> process.send(decided, meta.decision)
+        _ -> Nil
+      }
+    })
+  let response = http.handle(handler, bearer(call("whoami"), "foreign"))
+  response.status |> should.equal(401)
+  response.get_header(response, "www-authenticate")
+  |> should.equal(Ok(
+    "Bearer error=\"invalid_token\", error_description=\"The access token was issued for another resource\", resource_metadata=\""
+    <> metadata_raw
+    <> "\"",
+  ))
+  process.receive(decided, 1000) |> should.equal(Ok(telemetry.WrongResource))
+  process.receive(grants, 0) |> should.equal(Error(Nil))
+  let assert Ok(Nil) = sinal.detach(attachment)
+}
+
+pub fn verification_errors_have_a_stable_kind_test() {
+  [
+    #(authorization.BearerRejected, authorization.InvalidToken),
+    #(authorization.VerifierUnmapped, authorization.InvalidToken),
+    #(authorization.IssuedForAnotherResource, authorization.InvalidToken),
+    #(authorization.VerifierUnavailable, authorization.Unavailable),
+  ]
+  |> list.each(fn(pair) {
+    authorization.verification_kind(pair.0) |> should.equal(pair.1)
+    let assert False = authorization.describe_verification_error(pair.0) == ""
+  })
+  authorization.describe_verification_error(
+    authorization.IssuedForAnotherResource,
+  )
+  |> should.equal("the access token was issued for another resource")
+}
+
+pub fn admit_hands_the_correlation_to_a_correlated_verifier_test() {
+  let seen = process.new_subject()
+  let verifier =
+    authorization.correlated_verifier("correlated", fn(_token, correlation) {
+      process.send(seen, correlation)
+      Ok(authorization.attestation("principal", [resource_raw], []))
+    })
+  let correlation = correlation.from_key("admission-17")
+  let assert Ok(_) =
+    authorization.admit_with_correlation(
+      verifier,
+      token("t"),
+      authorization.protection(resource(), []),
+      correlation,
+    )
+  process.receive(seen, 0) |> should.equal(Ok(correlation))
+  authorization.verifier_name(verifier) |> should.equal("correlated")
+}
+
+fn correlation_tool() -> tool.Tool(String) {
+  tool.define("whoami", no_input(), codec.string())
+  |> tool.handle_call(fn(call, _input) {
+    Ok(tool.complete(correlation.to_string(tool.correlation(call))))
+  })
+}
+
+/// Wave 5: the verifier, the authorization decision and the handler see the
+/// one correlation of the request, whether the client sent it or Relay
+/// minted it.
+pub fn verifier_decision_and_handler_share_the_request_correlation_test() {
+  let seen = process.new_subject()
+  let verifier =
+    authorization.correlated_verifier("correlated", fn(token, correlation) {
+      process.send(seen, correlation)
+      list.key_find(tokens(), authorization.token_value(token))
+      |> result.replace_error(authorization.BearerRejected)
+    })
+  let assert Ok(handler) =
+    http.new_protected(
+      server.new([correlation_tool()]),
+      verifier,
+      protection(),
+      fn(_request, grant) { Ok(authorization.grant_principal(grant)) },
+    )
+    |> http.handler
+  let decided = process.new_subject()
+  let attachment =
+    sinal.observe(telemetry.authorization_decided_event(), fn(_, meta) {
+      case meta.verifier {
+        "correlated" -> process.send(decided, meta.correlation)
+        _ -> Nil
+      }
+    })
+
+  let sent =
+    bearer(call("whoami"), "alice-token")
+    |> request.set_header("x-correlation-id", "question-9")
+  let response = http.handle(handler, sent)
+  response.status |> should.equal(200)
+  let assert Ok(question) = correlation.from_string("question-9")
+  process.receive(seen, 1000) |> should.equal(Ok(question))
+  process.receive(decided, 1000) |> should.equal(Ok(Some(question)))
+  string.contains(testing.body_text(response), "question-9") |> should.be_true
+
+  let response = http.handle(handler, bearer(call("whoami"), "alice-token"))
+  response.status |> should.equal(200)
+  let assert Ok(minted) = process.receive(seen, 1000)
+  process.receive(decided, 1000) |> should.equal(Ok(Some(minted)))
+  string.contains(testing.body_text(response), correlation.to_string(minted))
+  |> should.be_true
+
+  // A refused request still names its correlation.
+  let refused =
+    bearer(call("whoami"), "stolen-token")
+    |> request.set_header("x-correlation-id", "question-10")
+  http.handle(handler, refused).status |> should.equal(401)
+  let assert Ok(refused_correlation) = correlation.from_string("question-10")
+  process.receive(seen, 1000) |> should.equal(Ok(refused_correlation))
+  process.receive(decided, 1000) |> should.equal(Ok(Some(refused_correlation)))
+  let assert Ok(Nil) = sinal.detach(attachment)
 }

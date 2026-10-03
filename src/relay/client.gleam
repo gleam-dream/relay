@@ -18,11 +18,20 @@
 //// is the `ToolFailed` result.
 ////
 //// Per-call controls are views on the client: `with_deadline`,
-//// `with_cancellation` and `with_correlation` return a new handle over the
-//// same connection, and every operation through it honours them. In MCP
-//// `2026-07-28` closing the connection cancels a request, so a deadline or a
-//// cancellation that ends an HTTP call closes that call's connection, and
-//// the server stops its handler; the next call reconnects.
+//// `with_cancellation`, `with_correlation` and `with_request_id` return a
+//// new handle over the same connection, and every operation through it
+//// honours them. In MCP `2026-07-28` closing the connection cancels a
+//// request, so a deadline or a cancellation that ends an HTTP call closes
+//// that call's connection, and the server stops its handler; the next call
+//// reconnects.
+////
+//// A view's correlation travels to the server: in the request's `_meta`
+//// under `io.github.gleam-dream/correlation` on every transport, and over
+//// HTTP also in the `x-correlation-id` header. A Relay server tags that
+//// request's events with it and hands it to the handler and the verifier.
+//// Only a correlation of visible ASCII characters (`!` to `~`) is sent; the
+//// server mints its own for any other. The server treats the value as
+//// untrusted telemetry and never uses it to authorize anything.
 ////
 //// ```gleam
 //// import gleam/result
@@ -82,6 +91,7 @@ import json/blueprint/codec
 import json/blueprint/value.{type Value}
 import relay/completion
 import relay/content.{type ContentBlock, type ResourceContents}
+import relay/internal/carrier
 import relay/internal/core
 import relay/internal/emit
 import relay/internal/protocol/v2026_07_28 as v2026
@@ -589,6 +599,10 @@ type Budget {
   )
 }
 
+fn carried(budget: Budget) -> Option(String) {
+  option.then(budget.correlation, carrier.sendable)
+}
+
 type Incoming {
   Incoming(status: Int, body: BitArray, www_authenticate: Option(String))
 }
@@ -614,6 +628,7 @@ pub opaque type Client {
     deadline: Option(Deadline),
     cancellation: Option(Token),
     correlation: Option(Correlation),
+    request_id: Option(String),
   )
 }
 
@@ -662,7 +677,7 @@ pub fn connect(config: Config) -> Result(Client, Error) {
     Some(gun) -> http_gun.correlation(gun)
     None -> None
   }
-  Ok(Client(peer, config, None, None, correlation))
+  Ok(Client(peer, config, None, None, correlation, None))
 }
 
 /// Closes the connection and every request and stream on it, without
@@ -690,9 +705,33 @@ pub fn with_cancellation(client: Client, token: Token) -> Client {
 }
 
 /// A view whose operations carry this correlation in Relay's and HTTP
-/// Gun's telemetry.
+/// Gun's telemetry, and send it to the server, which tags the request's
+/// events with it and hands it to the tool handler (`tool.correlation`).
+/// A correlation that is not visible ASCII stays local: the server mints
+/// its own.
 pub fn with_correlation(client: Client, correlation: Correlation) -> Client {
   Client(..client, correlation: Some(correlation))
+}
+
+/// A view whose requests use `id` as their JSON-RPC request id instead of a
+/// fresh one, so a server can recognise a retry: the handler reads it with
+/// `relay/tool.request_id` as `StringId(id)`.
+///
+/// Use one view for one logical operation and its retries, and choose an id
+/// that is unique per logical operation, such as an order id. Every
+/// operation through the view sends the same id, so a second, different
+/// call through it looks like a retry of the first. MCP `2026-07-28` has no
+/// session, so the server can scope the id only by what it authenticated
+/// itself; see `relay/tool.request_id`.
+pub fn with_request_id(client: Client, id: String) -> Client {
+  Client(..client, request_id: Some(id))
+}
+
+fn request_id(client: Client) -> String {
+  case client.request_id {
+    Some(id) -> id
+    None -> new_id()
+  }
 }
 
 fn budget(client: Client) -> Budget {
@@ -775,7 +814,7 @@ fn http_peer(
     True -> http.Https
     False -> http.Http
   }
-  let build = fn(out: Outgoing, accept: String) {
+  let build = fn(out: Outgoing, accept: String, budget: Budget) {
     let extra = case config.headers {
       Some(headers) -> headers()
       None -> []
@@ -795,6 +834,10 @@ fn http_peer(
     let base = case out.name {
       Some(name) ->
         request.set_header(base, "mcp-name", uri.percent_encode(name))
+      None -> base
+    }
+    let base = case carried(budget) {
+      Some(text) -> request.set_header(base, carrier.header, text)
       None -> base
     }
     list.fold(extra, base, fn(req, header) {
@@ -825,7 +868,7 @@ fn http_peer(
             gun_config.After(duration.milliseconds(budget.timeout_ms)),
           )
           |> http_gun.with_body_limit(budget.max_bytes, http_gun.Fail)
-        case http_gun.send(client, build(out, "application/json")) {
+        case http_gun.send(client, build(out, "application/json", budget)) {
           Ok(buffered) ->
             Ok(Incoming(
               buffered.response.status,
@@ -837,7 +880,7 @@ fn http_peer(
       },
       listen: fn(out, budget) {
         let client = view(budget, gun_config.Infinity)
-        case http_gun.open(client, build(out, "text/event-stream")) {
+        case http_gun.open(client, build(out, "text/event-stream", budget)) {
           Error(failure) -> Error(gun_failure(failure, budget.max_bytes))
           Ok(response) ->
             case response.status {
@@ -1130,7 +1173,7 @@ fn in_process_peer(
     )
     |> result.replace_error(Nil),
   )
-  let open = fn(out: Outgoing, budget: Budget) {
+  let open = fn(out: Outgoing) {
     let exchange = reducer.new_exchange_id()
     let outputs = process.new_subject()
     let _ =
@@ -1139,9 +1182,9 @@ fn in_process_peer(
         outputs,
         _,
       ))
-    case
-      runtime.send_frame(rt, exchange, context, out.body, budget.correlation)
-    {
+    // The correlation travels in the frame's `_meta`, as on stdio, so the
+    // in-process server accepts exactly what a wire server would.
+    case runtime.send_frame(rt, exchange, context, out.body, None) {
       Ok(Nil) -> Ok(#(exchange, outputs))
       Error(runtime.FrameTooLarge(..)) | Error(runtime.FrameTooDeep(..)) -> {
         process.send(router, Unregister(reducer.exchange_id_to_int(exchange)))
@@ -1156,7 +1199,7 @@ fn in_process_peer(
   Ok(
     Peer(
       send: fn(out, budget) {
-        use #(exchange, outputs) <- result.try(open(out, budget))
+        use #(exchange, outputs) <- result.try(open(out))
         let deadline = monotonic_ms() + remaining_ms(budget)
         let outcome = await_frame(outputs, budget, deadline)
         case outcome {
@@ -1166,8 +1209,8 @@ fn in_process_peer(
         process.send(router, Unregister(reducer.exchange_id_to_int(exchange)))
         result.map(outcome, fn(frame) { Incoming(200, frame, None) })
       },
-      listen: fn(out, budget) {
-        use #(exchange, outputs) <- result.map(open(out, budget))
+      listen: fn(out, _budget) {
+        use #(exchange, outputs) <- result.map(open(out))
         Stream(
           next: fn(wait_ms) {
             case process.receive(outputs, wait_ms) {
@@ -1267,6 +1310,10 @@ fn envelope(
         "io.modelcontextprotocol/clientCapabilities",
         input_capabilities(client.config.input_methods),
       ),
+      ..case option.then(client.correlation, carrier.sendable) {
+        Some(text) -> [#(carrier.meta_key, json.string(text))]
+        None -> []
+      }
     ])
   json.object([
     #("jsonrpc", json.string("2.0")),
@@ -1288,7 +1335,7 @@ fn request(
   name: Option(String),
   params: List(#(String, json.Json)),
 ) -> Result(Response, Error) {
-  let id = new_id()
+  let id = request_id(client)
   let started = monotonic_ms()
   let outcome =
     client.peer.send(
@@ -2192,7 +2239,7 @@ pub fn listen(
   client: Client,
   notifications: List(Notification),
 ) -> Result(Subscription, Error) {
-  let id = new_id()
+  let id = request_id(client)
   let body =
     envelope(client, id, "subscriptions/listen", [
       #("notifications", v2026.filter_to_json(subs.filter_of(notifications))),

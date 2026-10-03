@@ -559,12 +559,7 @@ pub fn correlation_reaches_the_handler_and_client_telemetry_test() {
   let whoami =
     tool.define("whoami", codec.success(Nil), codec.string())
     |> tool.handle_call(fn(call, _) {
-      Ok(
-        tool.complete(case tool.correlation(call) {
-          Some(found) -> correlation.to_string(found)
-          None -> "none"
-        }),
-      )
+      Ok(tool.complete(correlation.to_string(tool.correlation(call))))
     })
   let ask =
     tool.define("ask", codec.success(Nil), codec.string())
@@ -612,8 +607,11 @@ pub fn correlation_reaches_the_handler_and_client_telemetry_test() {
   let assert Ok(client.Succeeded(seen, _)) =
     client.call(tagged, whoami_definition, Nil)
   let assert True = seen == correlation.to_string(tag)
-  let assert Ok(client.Succeeded("none", _)) =
+  // A client without a correlation sends none; the server mints one.
+  let assert Ok(client.Succeeded(minted, _)) =
     client.call(peer, whoami_definition, Nil)
+  let assert True = minted != correlation.to_string(tag)
+  let assert 32 = string.length(minted)
   let assert Ok(client.ToolFailed(_, _)) =
     client.call(tagged, fail_definition(), "x")
   let assert Ok(client.InputRequired(_, _)) =

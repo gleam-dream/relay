@@ -36,7 +36,29 @@
 //// `Tool execution failed.`. `handle_with_error_renderer` publishes the
 //// `ToolError` a renderer builds, and `handle_call` receives the `Call`:
 //// application context, input responses, progress reporting, a
-//// cancellation signal, the invocation id and the correlation.
+//// cancellation signal, the invocation id, the JSON-RPC request id and the
+//// correlation.
+////
+//// ## Ids and retries
+////
+//// MCP `2026-07-28` has no session and no idempotency key, so nothing in
+//// the protocol identifies a retried call. A handler has two ids:
+////
+//// - `invocation_id(call)` is Relay's own: unique among the invocations
+////   this node has run since it started, and new for every request,
+////   retries included. It joins the call's telemetry.
+//// - `request_id(call)` is the JSON-RPC `id` exactly as the client sent
+////   it. The client chooses it, and the protocol only requires that it
+////   differ from that client's other requests in flight. It may repeat
+////   across clients, and a retry carries the same id only when the client
+////   reuses it on purpose. Relay's client sends a fresh id per request
+////   unless the caller sets one with `relay/client.with_request_id`.
+////
+//// To recognise a retry, key idempotent work by the request id together
+//// with what the server authenticated itself, such as the principal of
+//// the `relay/authorization.Grant`, and accept the key only from clients
+//// that promise to reuse ids on retry. Never treat a request id or a
+//// correlation as proof of who sent the request.
 
 import gleam/dict.{type Dict}
 import gleam/erlang/process
@@ -50,6 +72,7 @@ import json/blueprint/contract.{type Contract, type DocumentError}
 import json/blueprint/value.{type Value}
 import relay/content.{type ContentBlock, type Icon, type Meta}
 import relay/internal/core
+import relay/internal/jsonrpc
 import relay/internal/schema
 import relay/internal/wire
 import sinal/correlation.{type Correlation}
@@ -65,7 +88,7 @@ pub type Tool(context) =
 
 /// One invocation as a `handle_call` handler sees it. Read it with
 /// `context`, `input_responses`, `report_progress`, `cancelled`,
-/// `invocation_id`, `correlation` and `client_info`.
+/// `invocation_id`, `request_id`, `correlation` and `client_info`.
 pub type Call(context) =
   core.Call(context)
 
@@ -650,13 +673,36 @@ pub fn cancelled(call: Call(context)) -> process.Selector(Nil) {
   call.cancelled
 }
 
-/// The id Relay's telemetry uses for this invocation.
+/// Relay's id for this invocation, the `invocation_id` of its telemetry:
+/// unique among the invocations this node has run since it started. A
+/// retried request is a new invocation with a new id.
 pub fn invocation_id(call: Call(context)) -> Int {
   call.invocation_id
 }
 
-/// The correlation the transport attached to this request, if any.
-pub fn correlation(call: Call(context)) -> Option(Correlation) {
+/// A JSON-RPC request id, which MCP allows to be a string or an integer.
+/// `StringId("1")` and `IntegerId(1)` are different ids.
+pub type RequestId {
+  StringId(String)
+  IntegerId(Int)
+}
+
+/// The JSON-RPC `id` of this request, exactly as the client sent it. It is
+/// chosen by the client and is not authenticated: it may repeat across
+/// clients, and a retry carries the same id only when the client reuses it.
+/// See the module doc for keying idempotent work by it.
+pub fn request_id(call: Call(context)) -> RequestId {
+  case call.request_id {
+    jsonrpc.RequestString(id) -> StringId(id)
+    jsonrpc.RequestInteger(id) -> IntegerId(id)
+  }
+}
+
+/// This request's correlation: the transport's (`relay/http.with_correlation`),
+/// else the one the client sent (`relay/client.with_correlation`), else a
+/// fresh one. Pass it to the packages the handler calls. It is client
+/// input: use it to join telemetry, never to authorize.
+pub fn correlation(call: Call(context)) -> Correlation {
   call.correlation
 }
 

@@ -24,6 +24,7 @@ import relay/telemetry
 import relay/testing
 import relay/tool
 import sinal
+import sinal/correlation
 
 // --- the raw HTTP client ------------------------------------------------------
 
@@ -1100,4 +1101,188 @@ pub fn mounted_handler_sees_registered_tools_test() {
   http.unregister_tool(handler, "echo") |> should.be_true
   let gone = http.handle(handler, echo_call("registered"))
   string.contains(testing.body_text(gone), "-32602") |> should.be_true
+}
+
+// --- wave 5: correlation and request ids across the wire -----------------------
+
+type Seen {
+  Seen(correlation: correlation.Correlation, request_id: tool.RequestId)
+}
+
+fn seen_tool(seen: process.Subject(Seen)) -> tool.Tool(context) {
+  tool.define("whoami", no_input(), codec.string())
+  |> tool.handle_call(fn(call, _input) {
+    process.send(seen, Seen(tool.correlation(call), tool.request_id(call)))
+    Ok(tool.complete(correlation.to_string(tool.correlation(call))))
+  })
+}
+
+fn whoami() -> tool.Definition(Nil, String) {
+  tool.define("whoami", no_input(), codec.string())
+}
+
+fn whoami_request() -> request.Request(BitArray) {
+  testing.request("tools/call", [
+    #("name", json.string("whoami")),
+    #("arguments", json.object([])),
+  ])
+}
+
+/// TH-7: a Relay client's correlation reaches the server over HTTP, and
+/// every server event of the call carries it.
+pub fn client_correlation_names_the_server_side_of_the_call_test() {
+  let label = "carried-http"
+  let events = process.new_subject()
+  let forward = fn(name, listener, correlation) {
+    case listener {
+      Some(found) if found == label -> process.send(events, #(name, correlation))
+      _ -> Nil
+    }
+  }
+  let attachments = [
+    sinal.observe(telemetry.request_admitted_event(), fn(_, m) {
+      forward("admitted", m.listener, m.correlation)
+    }),
+    sinal.observe(telemetry.invocation_started_event(), fn(_, m) {
+      forward("started", m.listener, m.correlation)
+    }),
+    sinal.observe(telemetry.invocation_completed_event(), fn(_, m) {
+      forward("completed", m.listener, m.correlation)
+    }),
+    sinal.observe(telemetry.exchange_closed_event(), fn(_, m) {
+      forward("closed", m.listener, m.correlation)
+    }),
+  ]
+  let seen = process.new_subject()
+  let listener =
+    http.new(server.new([seen_tool(seen)]))
+    |> http.with_label(label)
+    |> started
+  let peer = connect(listener)
+  let assert Ok(tag) = correlation.from_string("question-41")
+
+  let assert Ok(client.Succeeded("question-41", _)) =
+    client.call(client.with_correlation(peer, tag), whoami(), Nil)
+  let assert Ok(Seen(correlation: found, request_id: tool.StringId(id))) =
+    process.receive(seen, 1000)
+  found |> should.equal(tag)
+  string.starts_with(id, "relay-") |> should.be_true
+  let names =
+    list.map(["admitted", "started", "completed", "closed"], fn(_) {
+      let assert Ok(#(name, correlation)) = process.receive(events, 1000)
+      correlation |> should.equal(Some(tag))
+      name
+    })
+  list.sort(names, string.compare)
+  |> should.equal(["admitted", "closed", "completed", "started"])
+
+  // A correlation that is not visible ASCII is not sent; the server mints.
+  let local = correlation.from_key("two words")
+  let assert Ok(client.Succeeded(minted, _)) =
+    client.call(client.with_correlation(peer, local), whoami(), Nil)
+  let assert True = minted != "two words"
+  string.length(minted) |> should.equal(32)
+
+  client.close(peer)
+  http.stop(listener)
+  list.each(attachments, fn(attachment) {
+    let assert Ok(Nil) = sinal.detach(attachment)
+  })
+}
+
+/// A client view's request id reaches the handler as sent, so a retry
+/// through the same view is recognisable.
+pub fn request_id_view_reaches_the_handler_test() {
+  let seen = process.new_subject()
+  let listener = http.new(server.new([seen_tool(seen)])) |> started
+  let peer = connect(listener)
+  let retrying = client.with_request_id(peer, "order-1001")
+
+  let assert Ok(client.Succeeded(_, _)) = client.call(retrying, whoami(), Nil)
+  let assert Ok(client.Succeeded(_, _)) = client.call(retrying, whoami(), Nil)
+  let assert Ok(Seen(request_id: first, ..)) = process.receive(seen, 1000)
+  let assert Ok(Seen(request_id: second, ..)) = process.receive(seen, 1000)
+  first |> should.equal(tool.StringId("order-1001"))
+  second |> should.equal(first)
+
+  // Without the view each request gets a fresh id.
+  let assert Ok(client.Succeeded(_, _)) = client.call(peer, whoami(), Nil)
+  let assert Ok(client.Succeeded(_, _)) = client.call(peer, whoami(), Nil)
+  let assert Ok(Seen(request_id: a, ..)) = process.receive(seen, 1000)
+  let assert Ok(Seen(request_id: b, ..)) = process.receive(seen, 1000)
+  let assert True = a != b
+  client.close(peer)
+  http.stop(listener)
+}
+
+pub fn integer_request_ids_reach_the_handler_as_integers_test() {
+  let seen = process.new_subject()
+  let handler = http.new(server.new([seen_tool(seen)])) |> mounted
+  let body =
+    json.object([
+      #("jsonrpc", json.string("2.0")),
+      #("id", json.int(5)),
+      #("method", json.string("tools/call")),
+      #(
+        "params",
+        json.object([
+          #(
+            "_meta",
+            json.object([
+              #(
+                "io.modelcontextprotocol/protocolVersion",
+                json.string("2026-07-28"),
+              ),
+              #("io.modelcontextprotocol/clientCapabilities", json.object([])),
+            ]),
+          ),
+          #("name", json.string("whoami")),
+          #("arguments", json.object([])),
+        ]),
+      ),
+    ])
+    |> json.to_string
+    |> bit_array.from_string
+  let response = http.handle(handler, request.set_body(whoami_request(), body))
+  response.status |> should.equal(200)
+  let assert Ok(Seen(request_id: id, ..)) = process.receive(seen, 1000)
+  id |> should.equal(tool.IntegerId(5))
+}
+
+/// The endpoint's builder wins over the client's header, which wins over a
+/// fresh value; a header Relay cannot accept is ignored.
+pub fn endpoint_correlation_precedence_test() {
+  let seen = process.new_subject()
+  let handler =
+    http.new(server.new([seen_tool(seen)]))
+    |> http.with_correlation(fn(request) {
+      request.get_header(request, "x-request-id")
+      |> result.try(fn(raw) {
+        correlation.from_string(raw) |> result.replace_error(Nil)
+      })
+      |> option.from_result
+    })
+    |> mounted
+  let answer = fn(request) {
+    let response = http.handle(handler, request)
+    response.status |> should.equal(200)
+    let assert Ok(Seen(correlation: found, ..)) = process.receive(seen, 1000)
+    correlation.to_string(found)
+  }
+
+  whoami_request()
+  |> request.set_header("x-request-id", "from-app")
+  |> request.set_header("x-correlation-id", "from-client")
+  |> answer
+  |> should.equal("from-app")
+  whoami_request()
+  |> request.set_header("x-correlation-id", "from-client")
+  |> answer
+  |> should.equal("from-client")
+  let assert 32 =
+    whoami_request()
+    |> request.set_header("x-correlation-id", string.repeat("x", 129))
+    |> answer
+    |> string.length
+  let assert 32 = whoami_request() |> answer |> string.length
 }

@@ -20,6 +20,15 @@
 //// been killed. A crash becomes the JSON-RPC internal error on its exchange
 //// only.
 ////
+//// Every request has one correlation, which its events, its handler
+//// (`relay/tool.correlation`) and its `exchange.closed` event carry: the one
+//// the transport passes to `send_frame`, else the one the client sent in the
+//// request's `_meta` under `io.github.gleam-dream/correlation` (1 to 128
+//// visible ASCII characters; anything else is ignored), else a fresh
+//// `sinal/correlation.unique()`. A carried value is untrusted telemetry:
+//// Relay never uses it to authorize anything, and two clients can send the
+//// same one.
+////
 //// | Setting | Default | Setter |
 //// | --- | --- | --- |
 //// | live exchanges | 100 | `with_max_live_exchanges` |
@@ -58,6 +67,7 @@ import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
 import gleam/time/duration.{type Duration}
+import relay/internal/carrier
 import relay/internal/emit
 import relay/internal/protocol/v2026_07_28 as v2026
 import relay/reducer.{type ExchangeId, type Invocation, type InvocationId}
@@ -315,6 +325,9 @@ type State(context) {
     closed: Bool,
     self: Subject(Message(context)),
     frame_correlation: Option(Correlation),
+    // The correlation of each admitted exchange, for its `exchange.closed`
+    // event; an entry leaves when the exchange closes.
+    exchange_correlations: Dict(Int, Correlation),
   )
 }
 
@@ -392,6 +405,7 @@ fn builder(
         closed: False,
         self: self,
         frame_correlation: None,
+        exchange_correlations: dict.new(),
       )
       |> actor.initialised
       |> actor.selecting(selector)
@@ -408,8 +422,10 @@ fn builder(
 const call_timeout = 5000
 
 /// Submits one frame on a fresh exchange, with the context and the
-/// correlation the transport built for it. Returns once the runtime has
-/// admitted or refused the frame; responses arrive through the sink.
+/// correlation the transport built for it. With `None`, the runtime uses
+/// the correlation the frame carries in `_meta`, or a fresh one. Returns
+/// once the runtime has admitted or refused the frame; responses arrive
+/// through the sink.
 pub fn send_frame(
   runtime: Runtime(context),
   exchange: ExchangeId,
@@ -657,23 +673,32 @@ fn receive_frame(
               )
             }
             False -> {
+              let correlation = carrier.resolve(correlation, bytes)
               let #(next, effects) =
                 reducer.step(
                   state.reducer,
-                  reducer.Received(exchange, context, bytes, correlation),
+                  reducer.Received(exchange, context, bytes, Some(correlation)),
                 )
               // The reducer drops a frame on an exchange it already knows
               // without effects; only an admitted exchange holds a slot.
-              let live = case effects {
-                [] -> state.live_exchanges
-                _ -> state.live_exchanges + 1
+              let #(live, correlations) = case effects {
+                [] -> #(state.live_exchanges, state.exchange_correlations)
+                _ -> #(
+                  state.live_exchanges + 1,
+                  dict.insert(
+                    state.exchange_correlations,
+                    exchange_int,
+                    correlation,
+                  ),
+                )
               }
               let state =
                 State(
                   ..state,
                   reducer: next,
                   live_exchanges: live,
-                  frame_correlation: correlation,
+                  frame_correlation: Some(correlation),
+                  exchange_correlations: correlations,
                 )
               let state = list.fold(effects, state, interpret)
               #(State(..state, frame_correlation: None), Ok(Nil))
@@ -702,12 +727,18 @@ fn interpret(
         Error(Nil) -> apply(state, reducer.ExchangeClosed(exchange))
       }
     reducer.Close(exchange) -> {
+      let id = reducer.exchange_id_to_int(exchange)
       emit.exchange_closed(
-        reducer.exchange_id_to_int(exchange),
+        id,
+        dict.get(state.exchange_correlations, id) |> option.from_result,
         state.config.label,
       )
       let _ = state.sink(OutputClose(exchange))
-      State(..state, live_exchanges: int.max(0, state.live_exchanges - 1))
+      State(
+        ..state,
+        live_exchanges: int.max(0, state.live_exchanges - 1),
+        exchange_correlations: dict.delete(state.exchange_correlations, id),
+      )
     }
     reducer.Start(invocation) -> start_worker(state, invocation)
     reducer.Cancel(invocation) -> {
@@ -754,7 +785,7 @@ fn start_worker(
         reducer.exchange_id_to_int(reducer.invocation_exchange(invocation))
       let method = reducer.invocation_method(invocation)
       let tool = reducer.invocation_tool(invocation)
-      let correlation = reducer.invocation_correlation(invocation)
+      let correlation = Some(reducer.invocation_correlation(invocation))
       emit.invocation_started(telemetry.InvocationStartedMeta(
         exchange_id: exchange,
         invocation_id: id,

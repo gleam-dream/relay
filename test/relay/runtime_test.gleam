@@ -892,7 +892,110 @@ pub fn request_admitted_runtime_observation_test() {
     runtime.send_frame(rt, uncorrelated, "ctx", discover_frame("b"), None)
   let meta = expect_event(admitted)
   meta.exchange_id |> should.equal(reducer.exchange_id_to_int(uncorrelated))
-  meta.correlation |> should.equal(None)
+  // Without a transport or carried correlation the runtime mints one.
+  let assert Some(minted) = meta.correlation
+  let assert True = minted != corr
+
+  runtime.stop(rt)
+  let assert Ok(Nil) = sinal.detach(attachment)
+}
+
+const carrier_key = "io.github.gleam-dream/correlation"
+
+fn carried_discover(id: String, carried: json.Json) -> BitArray {
+  request_frame(id, "server/discover", [], [#(carrier_key, carried)])
+}
+
+/// Wave 5: a client's `_meta` correlation names every server event of the
+/// request, `exchange.closed` included, and reaches the handler.
+pub fn carried_meta_correlation_names_the_request_test() {
+  let label = "carried"
+  let #(admitted_attachment, admitted) =
+    capture(telemetry.request_admitted_event(), label, fn(m) { m.listener })
+  let #(started_attachment, started) =
+    capture(telemetry.invocation_started_event(), label, fn(m) { m.listener })
+  let #(closed_attachment, closed) =
+    capture(telemetry.exchange_closed_event(), label, fn(m) { m.listener })
+  let seen = process.new_subject()
+  let echo_correlation =
+    tool.define("whoami", codec.success(Nil), codec.string())
+    |> tool.handle_call(fn(call, _) {
+      process.send(seen, tool.correlation(call))
+      Ok(tool.complete("ok"))
+    })
+  let config = runtime.config() |> runtime.with_label(label)
+  let #(rt, _outputs) = start_collecting(server.new([echo_correlation]), config)
+  let assert Ok(sent) = correlation.from_string("order-42/question-7")
+
+  let frame =
+    request_frame(
+      "w",
+      "tools/call",
+      [#("name", json.string("whoami")), #("arguments", json.object([]))],
+      [#(carrier_key, json.string(correlation.to_string(sent)))],
+    )
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, reducer.new_exchange_id(), "ctx", frame, None)
+  expect_event(admitted).correlation |> should.equal(Some(sent))
+  expect_event(started).correlation |> should.equal(Some(sent))
+  process.receive(seen, 1000) |> should.equal(Ok(sent))
+  expect_event(closed).correlation |> should.equal(Some(sent))
+
+  runtime.stop(rt)
+  let assert Ok(Nil) = sinal.detach(admitted_attachment)
+  let assert Ok(Nil) = sinal.detach(started_attachment)
+  let assert Ok(Nil) = sinal.detach(closed_attachment)
+}
+
+/// Wave 5: a carried correlation is untrusted input. A value that is empty,
+/// longer than 128 bytes, not visible ASCII or not a string is ignored and
+/// the request gets a fresh one; the transport's own value wins over it.
+pub fn carried_meta_correlation_is_validated_test() {
+  let label = "carried-invalid"
+  let #(attachment, admitted) =
+    capture(telemetry.request_admitted_event(), label, fn(m) { m.listener })
+  let config = runtime.config() |> runtime.with_label(label)
+  let #(rt, _outputs) = start_collecting(sample_server(), config)
+  let invalid = [
+    json.string(""),
+    json.string(string.repeat("a", 129)),
+    json.string("two words"),
+    json.string("line\nbreak"),
+    json.string("caf\u{e9}"),
+    json.int(42),
+    json.null(),
+  ]
+  let _ =
+    list.index_map(invalid, fn(carried, index) {
+      let frame = carried_discover("i" <> int.to_string(index), carried)
+      let assert Ok(Nil) =
+        runtime.send_frame(rt, reducer.new_exchange_id(), "ctx", frame, None)
+      let assert Some(minted) = expect_event(admitted).correlation
+      string.length(correlation.to_string(minted)) |> should.equal(32)
+    })
+
+  let longest = string.repeat("z", 128)
+  let assert Ok(Nil) =
+    runtime.send_frame(
+      rt,
+      reducer.new_exchange_id(),
+      "ctx",
+      carried_discover("longest", json.string(longest)),
+      None,
+    )
+  let assert Some(kept) = expect_event(admitted).correlation
+  correlation.to_string(kept) |> should.equal(longest)
+
+  let transport = correlation.from_key("transport-wins")
+  let assert Ok(Nil) =
+    runtime.send_frame(
+      rt,
+      reducer.new_exchange_id(),
+      "ctx",
+      carried_discover("both", json.string("client-value")),
+      Some(transport),
+    )
+  expect_event(admitted).correlation |> should.equal(Some(transport))
 
   runtime.stop(rt)
   let assert Ok(Nil) = sinal.detach(attachment)
@@ -972,11 +1075,13 @@ pub fn exchange_closed_telemetry_carries_label_test() {
   let exchange = reducer.new_exchange_id()
   let assert Ok(Nil) =
     runtime.send_frame(rt, exchange, "ctx", discover_frame("c"), None)
-  expect_event(closed)
-  |> should.equal(telemetry.ExchangeClosedMeta(
-    exchange_id: reducer.exchange_id_to_int(exchange),
-    listener: Some(label),
-  ))
+  let assert telemetry.ExchangeClosedMeta(
+    exchange_id:,
+    correlation: Some(_),
+    listener: Some(found),
+  ) = expect_event(closed)
+  exchange_id |> should.equal(reducer.exchange_id_to_int(exchange))
+  found |> should.equal(label)
 
   runtime.stop(rt)
   let assert Ok(Nil) = sinal.detach(attachment)

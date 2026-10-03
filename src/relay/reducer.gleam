@@ -42,6 +42,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import json/blueprint/value.{type Value}
 import relay/content.{type ResourceContents}
+import relay/internal/carrier
 import relay/internal/core
 import relay/internal/jsonrpc.{type ProgressToken, type RequestId}
 import relay/internal/protocol/v2026_07_28 as v2026
@@ -109,7 +110,8 @@ pub fn outcome_status(outcome: Outcome) -> Status {
 /// What the reducer reacts to.
 pub type Input(context) {
   /// A frame arrived on a new exchange, with the context and correlation
-  /// the transport built for it.
+  /// the transport built for it. With `None`, the request uses the
+  /// correlation the frame carries in `_meta`, or a fresh one.
   Received(
     exchange: ExchangeId,
     context: context,
@@ -156,7 +158,7 @@ pub opaque type Invocation(context) {
     context: context,
     method: String,
     tool: Option(String),
-    correlation: Option(Correlation),
+    correlation: Correlation,
     metadata: v2026.RequestMetadata,
     input_responses: List(#(String, Value)),
     identity: v2026.Identity,
@@ -201,10 +203,9 @@ pub fn invocation_tool(invocation: Invocation(context)) -> Option(String) {
   invocation.tool
 }
 
-/// The correlation the transport attached to the request.
-pub fn invocation_correlation(
-  invocation: Invocation(context),
-) -> Option(Correlation) {
+/// The request's correlation: the transport's, else the one the frame
+/// carried, else a fresh one.
+pub fn invocation_correlation(invocation: Invocation(context)) -> Correlation {
   invocation.correlation
 }
 
@@ -384,7 +385,13 @@ fn admit(
       [Close(exchange)],
     )
     v2026.AdmittedRequest(request) ->
-      route(state, exchange, context, correlation, request)
+      route(
+        state,
+        exchange,
+        context,
+        carrier.resolve(correlation, bytes),
+        request,
+      )
   }
 }
 
@@ -421,7 +428,7 @@ fn route(
   state: State(context),
   exchange: ExchangeId,
   context: context,
-  correlation: Option(Correlation),
+  correlation: Correlation,
   request: v2026.Request,
 ) -> #(State(context), List(Effect(context))) {
   let srv = state.server
@@ -673,7 +680,7 @@ fn start(
   state: State(context),
   exchange: ExchangeId,
   context: context,
-  correlation: Option(Correlation),
+  correlation: Correlation,
   request_id: RequestId,
   metadata: v2026.RequestMetadata,
   method: String,
@@ -968,6 +975,7 @@ pub fn perform(
       context: invocation.context,
       input_responses: invocation.input_responses,
       invocation_id: invocation_id_to_int(invocation.id),
+      request_id: invocation.request_id,
       correlation: invocation.correlation,
       client_info: option.map(invocation.metadata.client_info, fn(info) {
         #(info.name, info.version)

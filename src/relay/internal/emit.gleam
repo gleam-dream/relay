@@ -58,11 +58,15 @@ pub fn invocation_crashed(meta: telemetry.InvocationCrashedMeta) -> Nil {
   sinal.emit(telemetry.invocation_crashed_event(), Nil, meta)
 }
 
-pub fn exchange_closed(exchange_id: Int, listener: Option(String)) -> Nil {
+pub fn exchange_closed(
+  exchange_id: Int,
+  correlation: Option(Correlation),
+  listener: Option(String),
+) -> Nil {
   sinal.emit(
     telemetry.exchange_closed_event(),
     Nil,
-    telemetry.ExchangeClosedMeta(exchange_id:, listener:),
+    telemetry.ExchangeClosedMeta(exchange_id:, correlation:, listener:),
   )
 }
 

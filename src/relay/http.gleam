@@ -45,6 +45,14 @@
 //// | concurrent requests | 1,024, then 503 | `with_max_concurrent_requests` |
 //// | concurrent `subscriptions/listen` streams | 64, then 503 | `with_max_listen_streams` |
 //// | JSON nesting depth | 64 | `with_max_json_depth` |
+//// | request correlation | the client's `x-correlation-id`, else fresh | `with_correlation` |
+////
+//// Every request has one `sinal/correlation`, read before the body: the
+//// `with_correlation` builder's value, else the client's `x-correlation-id`
+//// header (1 to 128 visible ASCII characters; Relay's client sends its
+//// `relay/client.with_correlation` there), else a fresh one. The request's
+//// telemetry, its verifier and its handler (`relay/tool.correlation`) carry
+//// the same value. It is client input and never authorizes anything.
 ////
 //// MCP `2026-07-28` cancels a request when its client closes the
 //// connection: the endpoint then cancels the invocation and writes nothing.
@@ -78,6 +86,7 @@ import mist
 import relay/authorization.{
   type Grant, type Protection, type Verifier, VerificationFailed,
 }
+import relay/internal/carrier
 import relay/internal/emit
 import relay/internal/http_mist
 import relay/internal/jsonrpc
@@ -108,7 +117,7 @@ type ContextSource(context) {
   Plain(build: fn(Request(BitArray)) -> Result(context, Response(BytesTree)))
   Protected(
     protection: Protection,
-    build: fn(Request(BitArray), Option(Correlation), Option(String)) ->
+    build: fn(Request(BitArray), Correlation, Option(String)) ->
       Result(context, Response(BytesTree)),
   )
 }
@@ -191,12 +200,17 @@ pub fn new_protected(
     }
     let admitted =
       result.try(token, fn(token) {
-        authorization.admit(verifier, token, protection)
+        authorization.admit_with_correlation(
+          verifier,
+          token,
+          protection,
+          correlation,
+        )
       })
     emit.authorization_decided(
       authorization.verifier_name(verifier),
       decision(admitted),
-      correlation,
+      Some(correlation),
       label,
     )
     case admitted {
@@ -218,8 +232,9 @@ fn decision(
     Error(authorization.MissingToken) -> telemetry.MissingToken
     Error(VerificationFailed(authorization.VerifierUnavailable)) ->
       telemetry.VerifierUnavailable
+    Error(VerificationFailed(authorization.IssuedForAnotherResource))
+    | Error(authorization.ResourceNotGranted) -> telemetry.WrongResource
     Error(VerificationFailed(_)) -> telemetry.InvalidToken
-    Error(authorization.ResourceNotGranted) -> telemetry.WrongResource
     Error(authorization.MissingEndpointScope(_)) -> telemetry.InsufficientScope
   }
 }
@@ -354,8 +369,14 @@ pub fn with_max_json_depth(
 }
 
 /// Builds each request's `sinal/correlation`, for example from a request-id
-/// header; Relay's telemetry and `relay/tool.correlation` carry it. The
-/// default attaches none.
+/// header. When it returns `None`, which the default always does, the
+/// request uses the correlation the client sent in the `x-correlation-id`
+/// header (as Relay's client does for `relay/client.with_correlation`),
+/// else a fresh `correlation.unique()`. A sent value counts only when it is
+/// 1 to 128 visible ASCII characters. The request's telemetry, its
+/// verifier (`authorization.correlated_verifier`) and its handler
+/// (`relay/tool.correlation`) all carry the one value. It is client input:
+/// Relay never uses it to authorize, and neither should the builder.
 pub fn with_correlation(
   config: Config(context),
   correlation: fn(Request(BitArray)) -> Option(Correlation),
@@ -1036,7 +1057,8 @@ fn serve_leased(
   streaming: Bool,
 ) -> http_mist.Reply {
   let config = lease.config
-  let correlation = config.correlation(request)
+  let resolved = request_correlation(config, request)
+  let correlation = Some(resolved)
   case metadata_request(config, request) {
     Some(reply) -> reply
     None ->
@@ -1062,7 +1084,7 @@ fn serve_leased(
                     "Request body exceeds the configured limit",
                   )
                 False ->
-                  case build_context(config, request, correlation) {
+                  case build_context(config, request, resolved) {
                     Error(response) -> http_mist.Buffered(response)
                     Ok(context) ->
                       dispatch(
@@ -1124,10 +1146,25 @@ fn metadata_request(
   }
 }
 
+// The endpoint's builder, else the client's header, else a fresh value.
+fn request_correlation(
+  config: Config(context),
+  request: Request(BitArray),
+) -> Correlation {
+  case config.correlation(request) {
+    Some(correlation) -> correlation
+    None ->
+      request.get_header(request, carrier.header)
+      |> option.from_result
+      |> option.then(carrier.parse)
+      |> option.lazy_unwrap(correlation.unique)
+  }
+}
+
 fn build_context(
   config: Config(context),
   request: Request(BitArray),
-  correlation: Option(Correlation),
+  correlation: Correlation,
 ) -> Result(context, Response(BytesTree)) {
   case config.context {
     Plain(build) -> build(request)
@@ -1140,7 +1177,7 @@ fn build_context(
               emit.http_rejected(
                 response.status,
                 telemetry.Unauthenticated,
-                correlation,
+                Some(correlation),
                 config.label,
               )
             _ -> Nil

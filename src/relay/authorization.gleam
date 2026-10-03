@@ -10,6 +10,12 @@
 //// names exactly the protected resource as its one audience and carries
 //// every required scope, and returns a `Grant`.
 ////
+//// A verifier built with `correlated_verifier` also receives the request's
+//// `sinal/correlation`, the same value the request's telemetry and its tool
+//// handler see, so an introspection call can carry it. The correlation may
+//// come from the client and is never evidence of identity: decide only on
+//// the token.
+////
 //// `relay/http.new_protected` wires this module into the HTTP endpoint: it
 //// reads the `Authorization` header, answers a refusal with the `challenge`
 //// status and `WWW-Authenticate` header, and serves `resource_metadata` at
@@ -50,6 +56,7 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
 import gleam/uri
+import sinal/correlation.{type Correlation}
 
 /// A bearer token. Read it with `token_value` inside a verifier.
 pub opaque type BearerToken {
@@ -199,13 +206,46 @@ pub type VerificationError {
   /// The token is valid but its claims could not be mapped to a principal:
   /// 401.
   VerifierUnmapped
+  /// The token is valid but was issued for another resource, for a verifier
+  /// that checks the audience itself: 401 `invalid_token`, with the same
+  /// challenge `admit` gives when an attestation names another audience.
+  IssuedForAnotherResource
+}
+
+/// The stable classification of a `VerificationError`, which may gain
+/// variants: branch on it instead of matching the error exhaustively.
+pub type VerificationKind {
+  /// The token is refused: 401 `invalid_token`.
+  InvalidToken
+  /// The verifier could not decide: 503, worth retrying later.
+  Unavailable
+}
+
+/// The error's classification.
+pub fn verification_kind(error: VerificationError) -> VerificationKind {
+  case error {
+    VerifierUnavailable -> Unavailable
+    BearerRejected | VerifierUnmapped | IssuedForAnotherResource -> InvalidToken
+  }
+}
+
+/// A one-line description of the error, for logs.
+pub fn describe_verification_error(error: VerificationError) -> String {
+  case error {
+    BearerRejected -> "the access token is invalid or expired"
+    VerifierUnavailable -> "the verifier could not decide"
+    VerifierUnmapped -> "the access token could not be interpreted"
+    IssuedForAnotherResource ->
+      "the access token was issued for another resource"
+  }
 }
 
 /// A token verifier with a name for telemetry.
 pub opaque type Verifier(principal) {
   Verifier(
     name: String,
-    verify: fn(BearerToken) -> Result(Attestation(principal), VerificationError),
+    verify: fn(BearerToken, Correlation) ->
+      Result(Attestation(principal), VerificationError),
   )
 }
 
@@ -214,6 +254,24 @@ pub opaque type Verifier(principal) {
 pub fn verifier(
   name: String,
   verify: fn(BearerToken) -> Result(Attestation(principal), VerificationError),
+) -> Verifier(principal) {
+  Verifier(name, fn(token, _correlation) { verify(token) })
+}
+
+/// A verifier whose validation function also receives the request's
+/// correlation, to pass to a call it makes, such as token introspection:
+///
+/// ```gleam
+/// use token, correlation <- authorization.correlated_verifier("introspection")
+/// introspect(token, correlation)
+/// ```
+///
+/// The correlation is the one the request's events and its tool handler
+/// carry. It may come from the client, so it never decides admission.
+pub fn correlated_verifier(
+  name: String,
+  verify: fn(BearerToken, Correlation) ->
+    Result(Attestation(principal), VerificationError),
 ) -> Verifier(principal) {
   Verifier(name, verify)
 }
@@ -283,13 +341,27 @@ pub fn parse_authorization(
 
 /// Verifies the token and admits the request when the attestation names
 /// exactly the protected resource as its only audience and carries every
-/// required scope.
+/// required scope. A `correlated_verifier` receives a fresh correlation;
+/// a custom transport that has the request's uses
+/// `admit_with_correlation`.
 pub fn admit(
   verifier: Verifier(principal),
   token: BearerToken,
   protection: Protection,
 ) -> Result(Grant(principal), AdmissionError) {
-  case verifier.verify(token) {
+  admit_with_correlation(verifier, token, protection, correlation.unique())
+}
+
+/// `admit` for a request with this correlation, which a
+/// `correlated_verifier` receives; `relay/http.new_protected` passes the
+/// request's.
+pub fn admit_with_correlation(
+  verifier: Verifier(principal),
+  token: BearerToken,
+  protection: Protection,
+  correlation: Correlation,
+) -> Result(Grant(principal), AdmissionError) {
+  case verifier.verify(token, correlation) {
     Error(error) -> Error(VerificationFailed(error))
     Ok(Attestation(principal, audiences, scopes)) -> {
       let scopes = list.map(scopes, Scope)
@@ -332,7 +404,7 @@ pub fn challenge(protection: Protection, error: AdmissionError) -> Challenge {
       invalid_token(metadata, "The access token is invalid or expired")
     VerificationFailed(VerifierUnmapped) ->
       invalid_token(metadata, "The access token could not be interpreted")
-    ResourceNotGranted ->
+    ResourceNotGranted | VerificationFailed(IssuedForAnotherResource) ->
       invalid_token(
         metadata,
         "The access token was issued for another resource",

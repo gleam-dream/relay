@@ -195,10 +195,12 @@ pub fn crash_and_cancel_observation_test() {
     received(crash_events).1 |> should.equal(crashed)
   })
 
-  emit.exchange_closed(101, Some(label))
+  let closed_correlation = correlation.from_key("closed-exchange")
+  emit.exchange_closed(101, Some(closed_correlation), Some(label))
   received(close_events).1
   |> should.equal(telemetry.ExchangeClosedMeta(
     exchange_id: 101,
+    correlation: Some(closed_correlation),
     listener: Some(label),
   ))
 

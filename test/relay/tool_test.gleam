@@ -779,7 +779,8 @@ type Observed {
     context: String,
     responses: dict.Dict(String, value.Value),
     invocation_id: Int,
-    correlation: option.Option(correlation.Correlation),
+    request_id: tool.RequestId,
+    correlation: correlation.Correlation,
     client_info: option.Option(tool.ClientInfo),
   )
 }
@@ -828,6 +829,7 @@ pub fn call_accessors_expose_the_invocation_test() {
           context: tool.context(call),
           responses: tool.input_responses(call),
           invocation_id: tool.invocation_id(call),
+          request_id: tool.request_id(call),
           correlation: tool.correlation(call),
           client_info: tool.client_info(call),
         ),
@@ -862,7 +864,8 @@ pub fn call_accessors_expose_the_invocation_test() {
     invocation_id: reducer.invocation_id_to_int(reducer.invocation_id(
       invocation,
     )),
-    correlation: Some(corr),
+    request_id: tool.IntegerId(7),
+    correlation: corr,
     client_info: Some(tool.ClientInfo("probe", "1.2.3")),
   ))
   process.receive(progress, 100)
