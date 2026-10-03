@@ -1,131 +1,263 @@
 # relay
 
-Relay implements the frozen MCP `2026-07-28` revision in Gleam. Its public surface has a pure server reducer, typed tools and services, bounded stdio and Streamable HTTP transports, a typed client, and optional authorization primitives. See [Release status](#release-status) for the supported environment and current limits.
+Relay implements the frozen MCP `2026-07-28` revision in Gleam: typed tools,
+resources, prompts and completion on the server; a typed client; Streamable
+HTTP and stdio transports; bearer-token protection; and a pure reducer for
+custom transports.
 
-## Native tools
+## Serve a tool and call it
+
+One `Definition` serves both sides: the server binds a handler to it, and
+the client calls it and decodes the output with the same codecs.
 
 ```gleam
+import gleam/int
 import json/blueprint/codec
+import relay/client
+import relay/http
 import relay/server
 import relay/tool
-import relay/transport/stdio
 
-pub fn main() {
-  let assert Ok(name) = tool.tool_name("greet")
+pub fn greet() -> tool.Definition(String, String) {
   let input = {
     use name <- codec.field("name", codec.string(), get: fn(name) { name })
     codec.success(name)
   }
-  let assert Ok(definition) = tool.definition(name, input, codec.string())
-  let definition =
-    definition |> tool.with_description("Greets the user by name")
-  let bound = tool.handle(definition, fn(name) { Ok("Hello, " <> name <> "!") })
-  let assert Ok(registry) = tool.registry([bound])
-  let service = server.server(registry)
-  let assert Ok(Nil) = stdio.run_local_unprotected_stdio_server(
-    service,
-    stdio.default_stdio_config(),
-    Nil,
-  )
+  tool.define("greet", input, codec.string())
+  |> tool.with_description("Greets the user by name")
+  |> tool.with_read_only_hint(True)
+}
+
+pub fn main() {
+  let service =
+    server.new([tool.handle(greet(), fn(name) { Ok("Hello, " <> name <> "!") })])
+  let assert Ok(mcp) = http.start(http.new(service))
+  let url = "http://127.0.0.1:" <> int.to_string(http.port(mcp)) <> "/"
+
+  let assert Ok(config) = client.http(url)
+  let assert Ok(peer) = client.connect(config)
+  let assert Ok(client.Succeeded("Hello, Ada!", _)) =
+    client.call(peer, greet(), "Ada")
+  client.close(peer)
+  http.stop(mcp)
 }
 ```
 
-The same `Definition(input, output)` supplies `client.call_definition` and the input/output codecs used by an application-owned LLM adapter. Remote JSON Schema documents do not reconstruct native types, and provider tool names need their own admission checks. A caller-supplied object schema can be attached with `tool.with_input_schema_override`; the input codec still validates every call.
+`client.call` returns `Ok(Succeeded(output, content))`, `Ok(ToolFailed(..))`
+when the tool reported a failure, `Ok(InputRequired(..))` when the tool asks
+the client for input first, or `Error(client.Error)`. The error carries the
+HTTP status, the JSON-RPC error, or the transport failure with its
+submission evidence; branch on `client.kind(error)` and
+`client.evidence(error)`, and log `client.describe_error(error)`.
 
-`tool.handle` exposes the generic message `Tool execution failed.` for application errors. `tool.handle_with_error_renderer` deliberately publishes a caller-rendered message. A renderer may return JSON text, for example `codec.encode_json(error_codec, error)`, when a peer needs an encoded error shape; no error codec is required for registration. `tool.handle_advanced` and its renderer variant receive `HandlerCallContext`, which carries per-invocation application context, client input responses, and a progress callback. `HandlerResult` distinguishes structured output with content, content-only output, and another input round.
-
-A content-only tool uses `tool.content_definition(name, input_codec)` and `tool.handle_content`. It has no output codec or structured result promise. `client.call_content_definition` returns `ContentCallOutcome`: `ContentSuccess`, `ContentToolFailure`, `ContentInputRequired`, and distinct protocol, transport, encoding, and response failures. `tool.content_with_input_schema_override` admits a caller-supplied discovery schema while the input codec still validates calls. An advanced handler uses `tool.handle_content_advanced` and returns `ContentComplete(blocks)` or `ContentNeedsInput(requests)`; it receives application context, progress, and prior input responses. Metadata is a caller-owned `ToolMetadata` value; `tool.content_with_metadata` attaches it to the admitted content definition. Annotation hints compose independently with `tool.empty_annotations` and the hint modifiers. `None` omits a hint; `Some(False)` publishes false.
-
-For example, these hints publish `readOnlyHint: true` and `destructiveHint: false` while omitting the other boolean hints:
+## Serve over stdio
 
 ```gleam
-import gleam/option.{Some}
-import relay/tool
+import relay/server
+import relay/stdio
 
-pub fn mark_read_only(
-  definition: tool.Definition(input, output),
-) -> tool.Definition(input, output) {
-  let annotations =
-    tool.empty_annotations()
-    |> tool.with_read_only_hint(Some(True))
-    |> tool.with_destructive_hint(Some(False))
-  tool.with_annotations(definition, annotations)
+pub fn main() {
+  let assert Ok(Nil) = stdio.serve(server.new([]), Nil)
 }
 ```
 
-## Services and transports
+A client launches it with `client.stdio("my_server", ["--flag"])`. The stdio
+transport enforces no authorization: run it under a trusted parent process.
 
-`server.server(registry)` creates an immutable description. `server.with_resources`, `server.with_resource_templates`, and `server.with_prompts` replace their respective lists; `server.with_completion` sets or clears completion. Each modifier preserves the registry, custom dispatch, and unrelated services. `server.with_dispatch` receives the current registry at every invocation, including after dynamic registration. Simple resource, prompt, and completion handlers may return application-owned errors; their details are hidden by the existing wire failure mapping.
+## Mount the endpoint in your application
 
-`resources.resource_template` admits a URI template before it can be advertised. The built-in matcher accepts one simple `{name}` variable per slash segment, including embedded forms such as `urn:record:{id}.png`, and rejects unsupported operators or composite variables. `resources.resource_template_with_matcher` accepts a caller-owned matcher for other syntax after validating the URI scheme. Value-first template modifiers retain title, description, MIME type, and annotations.
+`http.handler` starts the endpoint without a listener. `http.handle` takes a
+`gleam_http` `Request(BitArray)` and returns a buffered `Response(BytesTree)`,
+so it mounts in wisp with one line; `http.mist_handler` mounts the full
+streaming endpoint in a mist application. The context builder sees the
+request, so a context can carry the tenant or the caller:
 
-The public reducer (`server.step`) and runtime support custom transports. `runtime.start` validates its `RuntimeConfig` before creating an actor and sends `OutputWrite(exchange, bytes)` and `OutputClose(exchange)` to the transport sink. A failed write closes only its exchange; `runtime.exchange_closed` lets the transport report a peer disconnect without stopping unrelated invocations. `runtime.close` still closes the full connection. Stdio validates its chunk size and runtime settings before touching standard I/O.
+```gleam
+import gleam/bytes_tree
+import gleam/http/request
+import gleam/http/response
+import relay/http
+import relay/server
 
-`http.listener(service, fn() { context })` starts with a local ephemeral bind and local Host/Origin policy. Apply `http.with_options`, `http.with_policy`, and optionally `http.with_tls`, then call `http.start`. `HttpPolicy.sse_keepalive_ms` is a positive caller-controlled SSE keepalive interval; the default remains 250 ms. Changing bind options does not widen the policy or add authentication. Startup checks bounds, bind interface, and readable TLS files before allocating the runtime hub. The listener does not enforce bearer grants, so `http.start` refuses a non-loopback host (anything other than `localhost`, `127.0.0.0/8` or `::1`, including `0.0.0.0`) unless the listener carries `http.allow_unauthenticated`; `http.validate` returns the typed `UnauthenticatedNonLoopbackBind(host)` refusal. Use `allow_unauthenticated` only on a trusted network or behind a proxy that authenticates every request, and widen the Host and Origin allow-lists with `http.with_policy`. As MCP `2026-07-28` defines for Streamable HTTP, a client cancels a request by closing its connection, for both SSE and buffered JSON responses: the listener cancels the invocation and writes no result. A `notifications/cancelled` POST is accepted with `202` and does not reach a call on another POST, because the revision has no session that could scope the request id.
+pub type Tenant {
+  Tenant(id: String)
+}
 
-`client.http_config("https://localhost:8443/")` derives host, port, path, and TLS from an absolute HTTP(S) URL. It rejects userinfo, query, fragment, malformed authority/path, and invalid ports; a missing path becomes `/`. `client.with_timeout`, `client.with_max_response_bytes`, and `client.with_ca_cert_file` change explicit settings before `client.connect_http`; a CA setting on plain HTTP is rejected. For a local child process, `client.stdio_config(executable, args)` supplies bounded timeout and response defaults, with named record updates available for different limits before `client.connect_stdio`.
+pub fn mount(service: server.Server(Tenant)) -> http.Handler(Tenant) {
+  let assert Ok(mcp) =
+    http.new_with_context(service, fn(req) {
+      case request.get_header(req, "x-tenant") {
+        Ok(id) -> Ok(Tenant(id))
+        Error(Nil) ->
+          Error(response.new(400) |> response.set_body(bytes_tree.new()))
+      }
+    })
+    |> http.with_allowed_hosts(["mcp.example.com"])
+    |> http.handler
+  mcp
+}
+```
 
-`client.list_tools` returns remote declarations with their JSON Schema documents intact. `client.call_discovered(peer, declaration, arguments)` accepts exact Blueprint `Value` arguments and returns exact `Value` structured output together with rich content blocks; `ToolFailure`, `ProtocolFailure`, and `TransportFailure` remain separate. A caller can parse provider-authored argument JSON with Blueprint's public parser and forward the result without a native input codec or numeric rounding. The native `call_definition` path keeps its output codec. `call_content_definition` returns `ContentCallOutcome` without a dummy structured type. `raw_json_call` remains for methods the typed client does not cover.
+```gleam
+// In a wisp router:
+["mcp"] -> {
+  use body <- wisp.require_bit_array_body(req)
+  http.handle(mcp, request.set_body(req, body)) |> response.map(wisp.Bytes)
+}
+```
 
-For a known tool, configure the HTTP client and call the same definition used by the server. This helper returns the peer because an `InputRequired` outcome needs that connection to remain open. Close it after handling the terminal outcome:
+`handle` buffers: progress notifications are dropped, a client disconnect
+is not seen (the request timeout bounds the call), and `subscriptions/listen`
+answers 406. `http.start`, `http.supervised` and `http.mist_handler` stream
+server-sent events, send keepalives, and cancel a call when its client
+disconnects, which is how MCP `2026-07-28` cancels over HTTP.
+
+## Protect the endpoint
+
+`http.new_protected` reads the bearer token, asks your verifier, admits the
+request for the protected resource and its scopes, answers a refusal with
+the RFC 6750 challenge, and serves the RFC 9728 metadata document. The
+verifier is your function: Relay never parses tokens.
 
 ```gleam
 import gleam/result
+import relay/authorization
+import relay/http
+import relay/server
+
+pub type Claims {
+  Claims(subject: String, audiences: List(String), scopes: List(String))
+}
+
+pub fn protect(
+  service: server.Server(Claims),
+  validate: fn(String) -> Result(Claims, Nil),
+) -> http.Config(Claims) {
+  let assert Ok(resource) =
+    authorization.protected_resource("https://mcp.example.com/mcp")
+  let assert Ok(reports) = authorization.scope("reports")
+  let protection =
+    authorization.protection(resource, [reports])
+    |> authorization.with_authorization_servers(["https://login.example.com"])
+  let verifier = {
+    use token <- authorization.verifier("jwt")
+    validate(authorization.token_value(token))
+    |> result.map(fn(c) { authorization.attestation(c, c.audiences, c.scopes) })
+    |> result.replace_error(authorization.BearerRejected)
+  }
+  http.new_protected(service, verifier, protection, fn(_request, grant) {
+    Ok(authorization.grant_principal(grant))
+  })
+}
+```
+
+A token validator such as a local JWT or introspection client plugs in as
+`validate`; it owns signatures, expiry and issuers. `server.with_tool_access`
+then hides or refuses tools per principal. A refused request gets 401 with
+`WWW-Authenticate: Bearer resource_metadata="..."`, 403 with
+`error="insufficient_scope"`, or 503 when the verifier cannot decide.
+
+## Call with a deadline, cancellation and headers
+
+Per-call controls are views on the client; every operation honours them.
+
+```gleam
+import gleam/time/duration
+import http_gun/cancellation
+import http_gun/deadline
 import relay/client
 import relay/tool
 
-pub fn call_greet(
+pub fn call_with_budget(
+  peer: client.Client,
   definition: tool.Definition(String, String),
-) -> Result(#(client.Client, client.ToolCallOutcome(String)), client.ClientError) {
-  use config <- result.try(client.http_config("http://127.0.0.1:3000/"))
-  use peer <- result.try(
-    config |> client.with_timeout(30_000) |> client.connect_http(),
-  )
-  Ok(#(peer, client.call_definition(peer, definition, "Ada")))
+) -> Result(client.ToolResult(String), client.Error) {
+  use token <- cancellation.with_token
+  peer
+  |> client.with_deadline(deadline.after(duration.seconds(10)))
+  |> client.with_cancellation(token)
+  |> client.call(definition, "Ada")
 }
 ```
 
-For a discovered tool, pass an object `json/blueprint/value.Value` to `client.call_discovered`. It returns the same `ToolCallOutcome` variants, with an exact `Value` in `StructuredSuccess`; the peer's input schema is retained as `json.Json` on the declaration, not converted into a native type. A non-object argument returns `InputEncodingFailure`. The caller should select the declaration by name and validate its arguments according to the remote contract before calling it.
+A deadline or a cancellation that ends an HTTP call closes that call's
+connection, so the server stops its handler; the next call reconnects.
+`client.with_headers(config, fn() { [#("authorization", "Bearer " <> token())] })`
+adds headers to every request, computed per request. Over plain `http://`
+a client with headers reaches only loopback addresses unless
+`client.allow_plaintext_headers`.
 
-Input rounds are explicit. HTTP `client.with_input_methods(config, [client.Elicitation])` and the corresponding `StdioConfig.input_methods` field advertise supported methods per request; both default to `[]`. An `InputRequired(continuation, requests)` result retains the client, tool name, original arguments, and opaque request state. The application handles each request and calls `client.resume_tool(continuation, responses)` with exactly one JSON result object per request key. For `elicitation/create`, an accepted form response is `json.object([#("action", json.string("accept")), #("content", json.object([...]))])`; `sampling/createMessage` expects a CreateMessageResult object and `roots/list` a ListRootsResult object. These are the frozen protocol result bodies, without a JSON-RPC envelope. An empty request map can still carry request state and be resumed with an empty response map. The client does not run an automatic responder.
+## Defaults
 
-After an application has handled the input requests, the continuation can be resumed with its replies. This helper accepts the application's responses; the client checks that every request key has exactly one JSON object response. Further `InputRequired` outcomes need another round; handle them before closing the peer:
+Every wait, read and queue is bounded.
 
-```gleam
-import gleam/dict.{type Dict}
-import gleam/json
-import relay/client
+| Setting                                     | Default                             | Change with                                                       |
+| ------------------------------------------- | ----------------------------------- | ----------------------------------------------------------------- |
+| HTTP bind                                   | `127.0.0.1`, ephemeral port         | `http.with_bind`                                                  |
+| HTTP bind off loopback without protection   | `start` fails                       | `http.new_protected`, or `http.allow_unauthenticated`             |
+| Host and Origin allow-lists                 | loopback names and the bind host    | `http.with_allowed_hosts`, `http.with_allowed_origins`            |
+| HTTP request body                           | 1 MiB, then 413                     | `http.with_max_body_bytes`                                        |
+| HTTP response, or one stream's events       | 1 MiB                               | `http.with_max_response_bytes`                                    |
+| HTTP request and handler timeout            | 30 s                                | `http.with_request_timeout`                                       |
+| SSE keepalive                               | 15 s                                | `http.with_sse_keepalive`                                         |
+| concurrent HTTP requests                    | 1,024, then 503                     | `http.with_max_concurrent_requests`                               |
+| concurrent `subscriptions/listen` streams   | 64, then 503                        | `http.with_max_listen_streams`                                    |
+| JSON nesting depth                          | 64, then 400                        | `http.with_max_json_depth`, `runtime.with_max_json_depth`         |
+| runtime live exchanges, frame size          | 100; 1 MiB                          | `runtime.with_max_live_exchanges`, `runtime.with_max_frame_bytes` |
+| runtime handler timeout                     | 30 s                                | `runtime.with_invocation_timeout`                                 |
+| cancelled handler grace before kill         | 5 s                                 | `runtime.with_cancellation_grace`                                 |
+| tombstones                                  | 60 s, at most 10,000                | `runtime.with_tombstone_retention`, `runtime.with_max_tombstones` |
+| closed exchange records per connection      | about 10,000                        | fixed                                                             |
+| stdio read chunk                            | 4 KiB                               | `stdio.with_chunk_size`                                           |
+| client request timeout                      | 30 s                                | `client.with_timeout`, per call `client.with_deadline`            |
+| client connect                              | 10 s                                | `client.with_connect_timeout`                                     |
+| client response size                        | 1 MiB                               | `client.with_max_response_bytes`                                  |
+| client listings                             | 256 pages, 10,000 items             | `client.with_listing_limits`                                      |
+| client stdio pending calls                  | 64, then `TooManyPendingCalls`      | `client.with_max_pending_calls`                                   |
+| client input methods advertised             | none                                | `client.with_input_methods`                                       |
+| client headers over plain HTTP off loopback | refused                             | `client.allow_plaintext_headers`                                  |
+| client retries                              | none: decide with `client.evidence` | —                                                                 |
+| completion values per response              | 100                                 | `completion.Values(total:, has_more:)`                            |
 
-pub fn continue_once(
-  outcome: client.ToolCallOutcome(output),
-  responses: Dict(String, json.Json),
-) -> client.ToolCallOutcome(output) {
-  case outcome {
-    client.InputRequired(continuation, _) ->
-      client.resume_tool(continuation, responses)
-    other -> other
-  }
-}
-```
+## Modules
 
-`client.default_listing_limits()` bounds aggregate listings to 256 pages and 10,000 items. Use `client.with_listing_limits(config, client.ListingLimits(max_pages, max_items))` for HTTP or the `StdioConfig.listing_limits` field for stdio. Nonpositive limits fail before opening a transport. Tool-call transport failures distinguish `ConnectionClosed`, `RequestCancelled`, `RequestTimedOut`, `ResponseLimitExceeded`, and other `TransportFault(message)` values without inspecting diagnostic strings.
-
-The server handles discovery, typed tool calls, rich text/image/audio/resource content, resources/templates, prompts, completion, progress, multi-round tool and prompt input, subscriptions, and bounded request-scoped SSE. The client offers typed listings, paginated checked JSON listings, typed resource/prompt/completion operations, raw checked JSON-RPC calls, and live subscriptions. The stdio transport serializes stdout and isolates diagnostics on stderr. Sinal events cover admission, rejection, invocation lifecycle, and exchange closure.
+| Module                                                 | Purpose                                                                  |
+| ------------------------------------------------------ | ------------------------------------------------------------------------ |
+| `relay/tool`                                           | tool definitions, handlers, the `Call` a handler sees, declarations      |
+| `relay/resources`, `relay/prompts`, `relay/completion` | the other server services                                                |
+| `relay/content`, `relay/subscriptions`                 | protocol data                                                            |
+| `relay/server`                                         | the server description                                                   |
+| `relay/http`, `relay/stdio`                            | the transports                                                           |
+| `relay/client`                                         | the client                                                               |
+| `relay/authorization`                                  | bearer tokens, admission, challenges and metadata                        |
+| `relay/telemetry`                                      | Sinal event descriptors                                                  |
+| `relay/runtime`, `relay/reducer`                       | custom transports: the runtime actor and the pure reducer                |
+| `relay/testing`                                        | an in-process client, MCP requests for a mounted handler, test verifiers |
 
 ## Release status
 
-Relay targets Erlang. The manifest admits Gleam `>= 1.18.0`; CI configures Gleam 1.18.1 with Erlang/OTP 28 and rebar3 3.27.0. Other Gleam and OTP combinations are not established by this CI. The development shell provides OTP 28 and tools for the schema and conformance checks. The package currently depends on sibling `json_blueprint` and `sinal` through local paths, so a standalone checkout or Hex installation cannot resolve its manifest yet. See [CHANGELOG.md](CHANGELOG.md) for the initial release notes and release prerequisites.
+Relay targets Erlang. The manifest admits Gleam `>= 1.18.0`; CI runs Gleam
+1.18.1 with Erlang/OTP 28 and rebar3 3.27.0. Relay depends on its siblings
+`json_blueprint`, `sinal` and `http_gun` through local paths, pinned in
+[`sibling-revisions.txt`](sibling-revisions.txt), so a standalone checkout or
+Hex installation cannot resolve it yet.
 
-The currently available stdio and HTTP listeners are unprotected. The authorization module provides verifier, grant, policy, and protected-registry primitives, but those listeners do not yet enforce bearer grants. The HTTP listener fails closed: it starts on a non-loopback host only after `http.allow_unauthenticated`. Bind it to trusted local environments. Relay does not claim complete MCP conformance or production readiness. Legacy `2025-11-25` support, `logging/setLevel`, and resource-read continuation remain outside this implementation. The built-in resource-template matcher supports one simple variable per slash segment, including embedded `{id}.png` forms; operators and composite variables require `resource_template_with_matcher`. Native tool definitions require admitted Blueprint codecs with an object-root input schema and an output schema for structured results. Remote discovery retains arbitrary JSON Schema documents without generating native codecs or guaranteeing local validation of those schemas.
+Relay implements `2026-07-28` only. Legacy `2025-11-25` sessions,
+`logging/setLevel`, resource-read continuation, MCP client authorization
+flows and tasks are outside this release. The built-in resource-template
+matcher supports one simple `{name}` variable per segment; other syntax
+needs `resources.template_with_matcher`. The pinned
+`@modelcontextprotocol/conformance@0.2.0-alpha.10` server suite reports
+108 passed checks and no failures; the result covers the exercised
+scenarios only.
 
-The pinned `@modelcontextprotocol/conformance@0.2.0-alpha.10` Streamable HTTP server suite previously reported 109 passed checks and 0 failures across 40 requirement scenarios. One scenario emits no checks for this revision, so this result does not establish complete conformance.
+See [CHANGELOG.md](CHANGELOG.md) and the
+[wave 4 migration guide](docs/migration-wave-4.md).
 
 ## Verification
 
 ```bash
-nix develop --command gleam format --check src test
-nix develop --command gleam check
-nix develop --command gleam build
+nix develop --command gleam format --check src test dev
 nix develop --command gleam build --warnings-as-errors
 nix develop --command gleam test
 nix develop --command python3 scripts/check_negative_fixtures.py
