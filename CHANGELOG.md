@@ -5,9 +5,17 @@
 Relay has no published release yet. This section describes the first
 release candidate. Wave 4 redesigned the public API before publication; the
 [wave 4 migration guide](docs/migration-wave-4.md) lists every removed and
-changed item with its replacement.
+changed item with its replacement. Wave 5 carries a client's correlation
+to the server and adds request ids and audience refusals; the
+[wave 5 migration guide](docs/migration-wave-5.md) lists its changes.
 
 ### Changed (breaking)
+
+- **One correlation per request (wave 5).** `tool.correlation(call)` and
+  `reducer.invocation_correlation` return a `Correlation`, not an `Option`:
+  a request uses the transport's correlation, else the one the client sent,
+  else a fresh one, and every server event of the request carries it.
+  `telemetry.ExchangeClosedMeta` gains `correlation` (TH-7).
 
 - **Modules.** `relay/transport/http` and `relay/transport/stdio` became
   `relay/http` and `relay/stdio`. The pure reducer moved from `relay/server`
@@ -68,6 +76,23 @@ changed item with its replacement.
 
 ### Added
 
+- **Correlation across the wire (wave 5).** A client view's correlation
+  travels in the request `_meta` key `io.github.gleam-dream/correlation` and,
+  over HTTP, in the `x-correlation-id` header. The server accepts 1 to 128
+  visible ASCII characters, ignores anything else and never uses the value
+  to authorize (TH-7).
+- `authorization.correlated_verifier` and `admit_with_correlation`: a
+  verifier receives the request's correlation, so an introspection call
+  joins the request (SMCP-9).
+- `authorization.IssuedForAnotherResource`: a verifier that checks the
+  audience itself gets the same `invalid_token` "issued for another
+  resource" challenge and `WrongResource` decision as an attestation for
+  another audience. `VerificationKind`, `verification_kind` and
+  `describe_verification_error` classify `VerificationError`.
+- `tool.request_id(call)` with `RequestId` (`StringId`, `IntegerId`): the
+  JSON-RPC id as sent, and `client.with_request_id(view, id)` so a retry
+  through the view carries the same id. MCP `2026-07-28` has no session, so
+  the id is scoped only by what the server authenticates.
 - A mountable HTTP endpoint (`http.handler`, `handle`, `mist_handler`) with
   a request-aware context (RELAY-R1, SMCP-2).
 - Bearer protection on the HTTP endpoint: `http.new_protected` reads the

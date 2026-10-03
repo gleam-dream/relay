@@ -156,6 +156,20 @@ A token validator such as a local JWT or introspection client plugs in as
 then hides or refuses tools per principal. A refused request gets 401 with
 `WWW-Authenticate: Bearer resource_metadata="..."`, 403 with
 `error="insufficient_scope"`, or 503 when the verifier cannot decide.
+A verifier that checks the audience itself returns
+`authorization.IssuedForAnotherResource` for a token issued for another
+resource, and the client gets the same `invalid_token` challenge as for an
+attestation that names another audience. Branch on
+`authorization.verification_kind(error)` rather than on the variants.
+
+A verifier built with `authorization.correlated_verifier` also receives the
+request's correlation, so its introspection call joins the request's
+telemetry:
+
+```gleam
+use token, correlation <- authorization.correlated_verifier("introspection")
+introspect(token, correlation)
+```
 
 ## Call with a deadline, cancellation and headers
 
@@ -187,6 +201,44 @@ adds headers to every request, computed per request. Over plain `http://`
 a client with headers reaches only loopback addresses unless
 `client.allow_plaintext_headers`.
 
+## Follow a call from client to server
+
+A client view's correlation travels with each request: in `_meta` under
+`io.github.gleam-dream/correlation` on every transport, and over HTTP also
+in the `x-correlation-id` header. The server tags the request's events with
+it, `exchange.closed` included, and hands it to the verifier and the
+handler. Without one, the server uses its `http.with_correlation` value or
+mints a fresh one, so `tool.correlation(call)` always returns a value.
+
+```gleam
+import relay/client
+import relay/tool
+import sinal/correlation.{type Correlation}
+
+pub fn ask(
+  peer: client.Client,
+  definition: tool.Definition(String, String),
+  question: Correlation,
+) -> Result(client.ToolResult(String), client.Error) {
+  peer
+  |> client.with_correlation(question)
+  |> client.call(definition, "Ada")
+}
+```
+
+The value is untrusted client input: Relay accepts 1 to 128 visible ASCII
+characters, ignores anything else, and never uses it to authorize.
+
+MCP `2026-07-28` has no session and no idempotency key, so nothing in the
+protocol marks a retry. `tool.request_id(call)` returns the JSON-RPC id as
+the client sent it (`StringId` or `IntegerId`); it may repeat across
+clients, and a retry carries the same id only when the client reuses it.
+`client.with_request_id(peer, "order-1001")` makes every request through the
+view use that id, so one view per logical call makes its retries
+recognisable. Key idempotent work by the id together with the principal the
+server authenticated. `tool.invocation_id(call)` is Relay's own id, new for
+every request, and joins the call's telemetry.
+
 ## Defaults
 
 Every wait, read and queue is bounded.
@@ -217,6 +269,8 @@ Every wait, read and queue is bounded.
 | client input methods advertised             | none                                | `client.with_input_methods`                                       |
 | client headers over plain HTTP off loopback | refused                             | `client.allow_plaintext_headers`                                  |
 | client retries                              | none: decide with `client.evidence` | —                                                                 |
+| request correlation                         | the client's, else a fresh one      | `http.with_correlation`, `client.with_correlation`                |
+| client JSON-RPC request id                  | fresh per request                   | `client.with_request_id`                                          |
 | completion values per response              | 100                                 | `completion.Values(total:, has_more:)`                            |
 
 ## Modules
@@ -251,8 +305,8 @@ needs `resources.template_with_matcher`. The pinned
 108 passed checks and no failures; the result covers the exercised
 scenarios only.
 
-See [CHANGELOG.md](CHANGELOG.md) and the
-[wave 4 migration guide](docs/migration-wave-4.md).
+See [CHANGELOG.md](CHANGELOG.md) and the migration guides for
+[wave 4](docs/migration-wave-4.md) and [wave 5](docs/migration-wave-5.md).
 
 ## Verification
 
