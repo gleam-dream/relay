@@ -61,6 +61,18 @@ pub fn described_input_preserves_object_root_admission_test() {
   |> should.equal(Error(tool.InputSchemaNotObject("described", "string")))
 }
 
+pub fn any_value_root_input_is_not_an_object_test() {
+  tool.try_define("any_input", codec.value(), codec.string())
+  |> should.equal(Error(tool.InputSchemaNotObject("any_input", "any")))
+  tool.try_define_content("any_input", codec.value())
+  |> should.equal(Error(tool.InputSchemaNotObject("any_input", "any")))
+}
+
+pub fn any_value_field_input_is_admitted_test() {
+  let input = test_codec.property("payload", codec.value())
+  tool.try_define("any_field", input, codec.string()) |> should.be_ok
+}
+
 pub fn invalid_tool_name_test() {
   tool.try_define("", text_input("a"), codec.string())
   |> should.equal(Error(tool.EmptyName))

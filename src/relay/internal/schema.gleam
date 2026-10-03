@@ -1,3 +1,4 @@
+import gleam/list
 import json/blueprint/codec.{type Schema, type SchemaError}
 import json/blueprint/value.{type Value}
 
@@ -34,19 +35,38 @@ pub fn validate_output_schema(
   }
 }
 
-/// Checks if a schema represents an object-like structure.
+/// Checks if a schema represents an object-like structure. Fails closed: the
+/// any schema, and a kind this package does not know, is accepted only when
+/// its document declares `"type": "object"`.
 pub fn is_object_schema(schema: Schema) -> Bool {
-  case schema {
-    codec.DescribedSchema(_, inner) -> is_object_schema(inner)
+  case codec.view(schema) {
     codec.ObjectSchema(_) -> True
     codec.UnionSchema(_) -> True
+    codec.OtherSchema(document) -> document_declares_object(document)
+    codec.AnySchema -> False
+    codec.StringSchema
+    | codec.StringEnumSchema(_)
+    | codec.IntSchema
+    | codec.IntegerRangeSchema(_, _)
+    | codec.NumberSchema
+    | codec.NumberRangeSchema(_, _)
+    | codec.BoolSchema
+    | codec.PairSchema(_, _)
+    | codec.ListSchema(_)
+    | codec.NullableSchema(_) -> False
+  }
+}
+
+fn document_declares_object(document: Value) -> Bool {
+  case document {
+    value.Object(entries) ->
+      list.any(entries, fn(entry) { entry == #("type", value.String("object")) })
     _ -> False
   }
 }
 
 pub fn schema_type_name(schema: Schema) -> String {
-  case schema {
-    codec.DescribedSchema(_, inner) -> schema_type_name(inner)
+  case codec.view(schema) {
     codec.StringSchema -> "string"
     codec.StringEnumSchema(_) -> "string_enum"
     codec.IntSchema -> "integer"
@@ -59,6 +79,8 @@ pub fn schema_type_name(schema: Schema) -> String {
     codec.UnionSchema(_) -> "union"
     codec.IntegerRangeSchema(_, _) -> "integer_range"
     codec.NumberRangeSchema(_, _) -> "number_range"
+    codec.AnySchema -> "any"
+    codec.OtherSchema(_) -> "other"
   }
 }
 
