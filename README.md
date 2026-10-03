@@ -140,7 +140,7 @@ pub fn protect(
     authorization.protection(resource, [reports])
     |> authorization.with_authorization_servers(["https://login.example.com"])
   let verifier = {
-    use token <- authorization.verifier("jwt")
+    use token, _correlation <- authorization.verifier("jwt")
     validate(authorization.token_value(token))
     |> result.map(fn(c) { authorization.attestation(c, c.audiences, c.scopes) })
     |> result.replace_error(authorization.BearerRejected)
@@ -162,12 +162,11 @@ resource, and the client gets the same `invalid_token` challenge as for an
 attestation that names another audience. Branch on
 `authorization.verification_kind(error)` rather than on the variants.
 
-A verifier built with `authorization.correlated_verifier` also receives the
-request's correlation, so its introspection call joins the request's
-telemetry:
+The verifier also receives the request's correlation, so an introspection
+call joins the request's telemetry:
 
 ```gleam
-use token, correlation <- authorization.correlated_verifier("introspection")
+use token, correlation <- authorization.verifier("introspection")
 introspect(token, correlation)
 ```
 
@@ -203,9 +202,10 @@ a client with headers reaches only loopback addresses unless
 
 ## Follow a call from client to server
 
-A client view's correlation travels with each request: in `_meta` under
-`io.github.gleam-dream/correlation` on every transport, and over HTTP also
-in the `x-correlation-id` header. The server tags the request's events with
+Relay uses the gleam-dream ecosystem's correlation carrier: the request
+`_meta` key `io.github.gleam-dream/correlation` on every transport, and over
+HTTP also the `x-correlation-id` header. A client view's correlation
+travels in both. The server tags the request's events with
 it, `exchange.closed` included, and hands it to the verifier and the
 handler. Without one, the server uses its `http.with_correlation` value or
 mints a fresh one, so `tool.correlation(call)` always returns a value.
@@ -229,15 +229,21 @@ pub fn ask(
 The value is untrusted client input: Relay accepts 1 to 128 visible ASCII
 characters, ignores anything else, and never uses it to authorize.
 
-MCP `2026-07-28` has no session and no idempotency key, so nothing in the
-protocol marks a retry. `tool.request_id(call)` returns the JSON-RPC id as
-the client sent it (`StringId` or `IntegerId`); it may repeat across
-clients, and a retry carries the same id only when the client reuses it.
-`client.with_request_id(peer, "order-1001")` makes every request through the
-view use that id, so one view per logical call makes its retries
-recognisable. Key idempotent work by the id together with the principal the
-server authenticated. `tool.invocation_id(call)` is Relay's own id, new for
-every request, and joins the call's telemetry.
+MCP `2026-07-28` has no session and no idempotency key, so Relay carries
+an optional one of its own, in `_meta` under
+`io.github.gleam-dream/idempotency-key`.
+`client.with_idempotency_key(peer, "order-1001")` sends it on every request
+through the view; the handler reads `tool.idempotency_key(call)`. A retry
+that carries the same key is the client's promise that it is the same
+request. The key is untrusted: Relay accepts 1 to 128 visible ASCII
+characters and refuses any other value as invalid params, and a handler
+keys its work by the authenticated principal together with the key, so one
+client cannot replay or block another's work.
+
+`tool.request_id(call)` returns the JSON-RPC id as the client sent it
+(`StringId` or `IntegerId`); it may repeat across clients and is fresh on a
+retry, so it does not identify one. `tool.invocation_id(call)` is Relay's
+own id, new for every request, and joins the call's telemetry.
 
 ## Defaults
 
@@ -270,7 +276,7 @@ Every wait, read and queue is bounded.
 | client headers over plain HTTP off loopback | refused                             | `client.allow_plaintext_headers`                                  |
 | client retries                              | none: decide with `client.evidence` | —                                                                 |
 | request correlation                         | the client's, else a fresh one      | `http.with_correlation`, `client.with_correlation`                |
-| client JSON-RPC request id                  | fresh per request                   | `client.with_request_id`                                          |
+| request idempotency key                     | none                                | `client.with_idempotency_key`                                     |
 | completion values per response              | 100                                 | `completion.Values(total:, has_more:)`                            |
 
 ## Modules
