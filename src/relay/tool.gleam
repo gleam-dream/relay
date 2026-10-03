@@ -643,8 +643,9 @@ pub fn report_progress(
 
 /// Fires once when the call is cancelled: the client disconnected, sent a
 /// cancellation, or the invocation timed out. Select on it while the
-/// handler waits, and stop work it started elsewhere; Relay kills the
-/// handler after the runtime's cancellation grace period.
+/// handler waits, and stop work it started elsewhere: Relay waits up to the
+/// runtime's cancellation grace period for the handler to return, then
+/// kills it.
 pub fn cancelled(call: Call(context)) -> process.Selector(Nil) {
   call.cancelled
 }

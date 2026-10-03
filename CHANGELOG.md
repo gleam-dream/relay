@@ -82,6 +82,8 @@ changed item with its replacement.
   server (RELAY-R3, SMCP-6, TH-2).
 - `tool.cancelled(call)`: a cancelled or timed-out handler is told before it
   is killed after a grace period (TH-3).
+- `http.with_cancellation_grace` (default 5 s) and the `CancellationGrace`
+  config field set the grace of the endpoint's cancelled handlers.
 - Supervision: `http.supervised` and `runtime.supervised` with `named`
   handles that stay valid across restarts.
 - `relay/testing`: an in-process client, MCP requests for a mounted handler,
@@ -95,6 +97,16 @@ changed item with its replacement.
 
 ### Fixed
 
+- A cancelled handler keeps its cancellation grace on every path: an HTTP
+  disconnect, a client timeout, `notifications/cancelled`, the invocation
+  timeout, `runtime.close`, `runtime.stop`, the end of stdio input, and the
+  exit of the process that started the runtime. The runtime fires
+  `tool.cancelled`, waits until the handler returns or its grace ends, kills
+  it only then, and stops after the last one. Before, an HTTP disconnect
+  killed the handler in the same step, so it could not cancel work it had
+  started elsewhere (TH-3). `runtime.stop` now returns after that drain and
+  waits at most the grace plus 5 s; the HTTP endpoint does not hold a
+  response for it.
 - Client failures no longer arrive as `String`, `Dynamic` or a field-less
   configuration error; a 401 keeps its challenge and a JSON-RPC error its
   code and data (TH-4, SMCP-6).

@@ -36,7 +36,8 @@ unbounded → 1,024 then 503; concurrent `subscriptions/listen` streams
 unbounded → 64 then 503; JSON nesting depth unbounded → 64; runtime
 tombstones unbounded in count → 10,000; stdio client pending calls unbounded
 → 64; client connect wait 30 s → 10 s; a cancelled handler is signalled and
-killed after a 5 s grace instead of killed at once.
+killed after a 5 s grace instead of killed at once, on every cancellation
+path, an HTTP disconnect included.
 
 Contents: [modules](#module-moves) · [tool](#relaytool) ·
 [content](#relaycontent) · [resources](#relayresources) ·
@@ -169,6 +170,11 @@ tool.handle_call(definition, fn(call, job) {
   }
 })
 ```
+
+The handler keeps the runtime's cancellation grace (5 s) on every path, an
+HTTP disconnect and the endpoint's shutdown included, so `stop(run)` runs
+before Relay would kill it. A bridge process that watched the disconnect
+for the handler is no longer needed (TH-3).
 
 ## `relay/content`
 
@@ -356,11 +362,14 @@ records.
 | `notify_resource_updated(rt, uri)`, `notify_tools_list_changed`, `notify_resources_list_changed`, `notify_prompts_list_changed`                                                               | `notify(rt, subscriptions.Notification)`                                                                                                                                                                                                                                                                                                        |
 | `register_tool(rt, tool)`, `unregister_tool(rt, ToolName)`                                                                                                                                    | `register_tool(rt, tool)`, `unregister_tool(rt, name: String)`                                                                                                                                                                                                                                                                                  |
 | `terminate_subscription(rt, RequestId)`                                                                                                                                                       | `end_streams(rt)`                                                                                                                                                                                                                                                                                                                               |
-| `stop(rt, timeout_ms)`                                                                                                                                                                        | `stop(rt)` (waits at most 5 s)                                                                                                                                                                                                                                                                                                                  |
+| `stop(rt, timeout_ms)`                                                                                                                                                                        | `stop(rt)`: returns once every cancelled handler has returned or been killed at the end of its grace, at most the grace plus 5 s                                                                                                                                                                                                                |
 | `close(rt)`, `exchange_closed(rt, ex)`                                                                                                                                                        | unchanged                                                                                                                                                                                                                                                                                                                                       |
 
 A cancelled or timed-out handler now sees `tool.cancelled(call)` fire and is
-killed after the cancellation grace (5 s).
+killed after the cancellation grace (5 s) unless it returns first. `close`,
+`stop` and the exit of the process that started the runtime cancel every
+handler the same way; the runtime stops after the last one exits. To stop
+without waiting, call `close`, then `stop` from another process.
 
 ```gleam
 // Before
@@ -474,7 +483,7 @@ let verifier = {
 | `listener(server, fn() -> ctx) -> HttpListener(ctx)`                                                                                                             | `new(server: Server(Nil)) -> Config(Nil)`, `new_with_context(server, fn(Request(BitArray)) -> Result(ctx, Response(BytesTree)))`, `new_protected(server, verifier, protection, fn(Request(BitArray), Grant(p)) -> Result(ctx, Response(BytesTree)))`                      |
 | `HttpOptions(port, host)`, `with_options`                                                                                                                        | `with_bind(config, host, port)`                                                                                                                                                                                                                                           |
 | `HttpPolicy(max_body_bytes, max_response_bytes, request_timeout_ms, sse_keepalive_ms, allowed_hosts, allowed_origins)`, `with_policy`, `local_http_policy(host)` | `with_max_body_bytes(Int)`, `with_max_response_bytes(Int)`, `with_request_timeout(Duration)`, `with_sse_keepalive(Duration)`, `with_allowed_hosts(List(String))`, `with_allowed_origins(List(String))`; the defaults are the old local policy except the keepalive (15 s) |
-| —                                                                                                                                                                | `with_max_concurrent_requests(Int)` (1,024), `with_max_listen_streams(Int)` (64), `with_max_json_depth(Int)` (64), `with_correlation(fn(Request) -> Option(Correlation))`, `with_label(String)`                                                                           |
+| —                                                                                                                                                                | `with_max_concurrent_requests(Int)` (1,024), `with_max_listen_streams(Int)` (64), `with_max_json_depth(Int)` (64), `with_cancellation_grace(Duration)` (5 s), `with_correlation(fn(Request) -> Option(Correlation))`, `with_label(String)`                                |
 | `with_tls`, `allow_unauthenticated`                                                                                                                              | unchanged, on `Config`                                                                                                                                                                                                                                                    |
 | `validate(listener) -> Result(Nil, ListenerError)`, `ListenerError`, `describe_listener_error`                                                                   | `validate(config) -> Result(Nil, StartError)`, `describe_start_error`; `StartError`: `InvalidConfig(field: ConfigField)`, `UnauthenticatedNonLoopbackBind(host)`, `HandlerFailed(e)`, `BindFailed(host, port)`                                                            |
 | `start(listener) -> Result(HttpServer(ctx), String)`                                                                                                             | `start(config) -> Result(Handler(ctx), StartError)`, linked to the caller                                                                                                                                                                                                 |

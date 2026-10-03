@@ -256,6 +256,10 @@ pub fn validate_reports_each_invalid_limit_test() {
       http.RequestTimeout,
     ),
     #(
+      http.with_cancellation_grace(base, duration.milliseconds(-1)),
+      http.CancellationGrace,
+    ),
+    #(
       http.with_sse_keepalive(base, duration.milliseconds(-1)),
       http.SseKeepalive,
     ),

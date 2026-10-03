@@ -40,6 +40,7 @@
 //// | request body | 1 MiB | `with_max_body_bytes` |
 //// | response, or one stream's events | 1 MiB | `with_max_response_bytes` |
 //// | request timeout (and handler timeout) | 30 s | `with_request_timeout` |
+//// | cancellation grace | 5 s | `with_cancellation_grace` |
 //// | SSE keepalive | 15 s | `with_sse_keepalive` |
 //// | concurrent requests | 1,024, then 503 | `with_max_concurrent_requests` |
 //// | concurrent `subscriptions/listen` streams | 64, then 503 | `with_max_listen_streams` |
@@ -47,6 +48,9 @@
 ////
 //// MCP `2026-07-28` cancels a request when its client closes the
 //// connection: the endpoint then cancels the invocation and writes nothing.
+//// The handler's `relay/tool.cancelled` selector fires, and it has the
+//// cancellation grace to stop work it started elsewhere and return before
+//// Relay kills it; the endpoint does not hold the response for it.
 //// A buffered `handle` cannot see the socket, so its requests end at the
 //// request timeout instead, and it answers `subscriptions/listen` with 406;
 //// use `mist_handler` or `start` for streaming.
@@ -122,6 +126,7 @@ pub opaque type Config(context) {
     max_body_bytes: Int,
     max_response_bytes: Int,
     request_timeout: Duration,
+    cancellation_grace: Duration,
     sse_keepalive: Duration,
     allowed_hosts: Option(List(String)),
     allowed_origins: List(String),
@@ -155,6 +160,7 @@ pub fn new_with_context(
     max_body_bytes: 1_048_576,
     max_response_bytes: 1_048_576,
     request_timeout: duration.seconds(30),
+    cancellation_grace: duration.seconds(5),
     sse_keepalive: duration.seconds(15),
     allowed_hosts: None,
     allowed_origins: ["http://localhost", "http://127.0.0.1", "http://[::1]"],
@@ -283,6 +289,17 @@ pub fn with_request_timeout(
   Config(..config, request_timeout: timeout)
 }
 
+/// How long a cancelled handler may keep running after its
+/// `relay/tool.cancelled` selector fires (the client disconnected, or the
+/// handler timed out, or the endpoint stopped), before Relay kills it. Zero
+/// kills it at once.
+pub fn with_cancellation_grace(
+  config: Config(context),
+  grace: Duration,
+) -> Config(context) {
+  Config(..config, cancellation_grace: grace)
+}
+
 /// How often an idle event stream writes a keepalive comment; a failed
 /// write detects a vanished client.
 pub fn with_sse_keepalive(
@@ -359,6 +376,7 @@ pub type ConfigField {
   MaxBodyBytes
   MaxResponseBytes
   RequestTimeout
+  CancellationGrace
   SseKeepalive
   AllowedHosts
   MaxConcurrentRequests
@@ -403,6 +421,7 @@ fn field_name(field: ConfigField) -> String {
     MaxBodyBytes -> "max_body_bytes"
     MaxResponseBytes -> "max_response_bytes"
     RequestTimeout -> "request_timeout"
+    CancellationGrace -> "cancellation_grace"
     SseKeepalive -> "sse_keepalive"
     AllowedHosts -> "allowed_hosts"
     MaxConcurrentRequests -> "max_concurrent_requests"
@@ -455,6 +474,12 @@ fn validate_limits(config: Config(context)) -> Result(Nil, StartError) {
     duration.to_milliseconds(config.request_timeout),
     RequestTimeout,
   ))
+  use _ <- result.try(
+    case duration.to_milliseconds(config.cancellation_grace) >= 0 {
+      True -> Ok(Nil)
+      False -> Error(InvalidConfig(CancellationGrace))
+    },
+  )
   use _ <- result.try(positive(
     duration.to_milliseconds(config.sse_keepalive),
     SseKeepalive,
@@ -1133,6 +1158,7 @@ fn runtime_config(config: Config(context)) -> runtime.Config {
     |> runtime.with_max_frame_bytes(config.max_body_bytes)
     |> runtime.with_max_json_depth(config.max_json_depth)
     |> runtime.with_invocation_timeout(config.request_timeout)
+    |> runtime.with_cancellation_grace(config.cancellation_grace)
     |> runtime.with_tombstone_retention(duration.seconds(1))
   case config.label {
     Some(label) -> runtime.with_label(rt, label)
@@ -1518,8 +1544,12 @@ fn client_gone(broker: Broker(context)) -> Nil {
   process.send(broker, ClientGone)
 }
 
+// Ends a buffered request's runtime without holding its response: `close`
+// cancels whatever still runs, and the runtime stops itself once each
+// cancelled handler has returned or its grace has ended.
 fn finish(broker: Broker(context), rt: runtime.Runtime(context)) -> Nil {
-  runtime.stop(rt)
+  runtime.close(rt)
+  let _ = process.spawn_unlinked(fn() { runtime.stop(rt) })
   process.send(broker, Finish)
 }
 

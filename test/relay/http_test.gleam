@@ -492,8 +492,10 @@ pub fn live_sse_progress_burst_disconnect_cancels_worker_test() {
   let listener =
     http.new_with_context(burst_progress_server(), fn(_) { Ok(notices) })
     // Long enough that only the disconnect, never the invocation timeout,
-    // can end the worker within the wait below.
+    // can end the worker within the wait below. The handler ignores the
+    // cancellation, so it is killed when the short grace ends.
     |> http.with_request_timeout(duration.seconds(10))
+    |> http.with_cancellation_grace(duration.milliseconds(100))
     |> started
   let assert Ok(200) =
     disconnect_after_first_sse_event(
@@ -508,7 +510,7 @@ pub fn live_sse_progress_burst_disconnect_cancels_worker_test() {
       progress_call_envelope("disconnect_probe"),
     )
   let assert Ok(ProgressBurstStarted(worker)) = process.receive(notices, 1000)
-  should.be_true(worker_exits_within(worker, 50))
+  should.be_true(worker_exits_within(worker, 100))
   case process.receive(notices, 0) {
     Ok(ProgressBurstFinished) -> should.fail()
     Ok(ProgressBurstStarted(_)) -> should.fail()
@@ -530,6 +532,9 @@ pub fn buffered_call_disconnect_cancels_worker_test() {
   let listener =
     http.new_with_context(slow_server(), fn(_) { Ok(notices) })
     |> http.with_request_timeout(duration.seconds(5))
+    // The handler ignores the cancellation: it is killed when the grace
+    // ends, well before it would finish.
+    |> http.with_cancellation_grace(duration.milliseconds(100))
     |> started
   let body =
     envelope("tools/call", True, [
@@ -546,7 +551,7 @@ pub fn buffered_call_disconnect_cancels_worker_test() {
   let assert Ok(SlowStarted(worker)) = process.receive(notices, 1000)
   // No response has been written while the call runs.
   let written = abort_connection(connection)
-  let stopped = worker_exits_within(worker, 50)
+  let stopped = worker_exits_within(worker, 100)
   // Without cancellation the worker would outlive this test and emit
   // telemetry into later ones, so stop it before asserting.
   case stopped {
@@ -563,6 +568,86 @@ pub fn buffered_call_disconnect_cancels_worker_test() {
   meta.tool |> should.equal(Some("slow_probe"))
   // The handler never finished, so no result was produced for the call.
   should.equal(process.receive(notices, 300), Error(Nil))
+}
+
+type DownstreamNotice {
+  DownstreamStarted(process.Pid)
+  DownstreamCancelConfirmed
+}
+
+/// TH-3: a handler that started work elsewhere cancels it when its
+/// `tool.cancelled` selector fires. After an HTTP disconnect it keeps the
+/// cancellation grace, so the cancellation is confirmed before Relay could
+/// kill the handler.
+pub fn disconnect_gives_the_cancelled_handler_its_grace_test() {
+  let notices = process.new_subject()
+  let listener =
+    http.new_with_context(downstream_server(), fn(_) { Ok(notices) })
+    |> http.with_request_timeout(duration.seconds(10))
+    |> started
+  let body =
+    envelope("tools/call", True, [
+      #("name", json.string("downstream_probe")),
+      #("arguments", json.object([])),
+    ])
+  let assert Ok(connection) =
+    send_and_hold(
+      http.port(listener),
+      "POST",
+      headers_with_name("tools/call", "downstream_probe", "application/json"),
+      body,
+    )
+  let assert Ok(DownstreamStarted(worker)) = process.receive(notices, 1000)
+  let monitor = process.monitor(worker)
+  let written = abort_connection(connection)
+  let confirmed = process.receive(notices, 2000)
+  let exit =
+    process.new_selector()
+    |> process.select_specific_monitor(monitor, fn(down) { down.reason })
+    |> process.selector_receive(2000)
+  http.stop(listener)
+  should.equal(written, <<>>)
+  confirmed |> should.equal(Ok(DownstreamCancelConfirmed))
+  // The handler returned on its own; Relay did not kill it.
+  exit |> should.equal(Ok(process.Normal))
+}
+
+fn downstream_server() -> server.Server(process.Subject(DownstreamNotice)) {
+  let probe =
+    tool.define("downstream_probe", no_input(), no_input())
+    |> tool.handle_call(fn(call, _input) {
+      let notices = tool.context(call)
+      // The work started elsewhere: a process that takes 200 ms to stop
+      // once asked, then confirms.
+      let handshake = process.new_subject()
+      let _ =
+        process.spawn_unlinked(fn() {
+          let inbox = process.new_subject()
+          process.send(handshake, inbox)
+          case process.receive(inbox, 10_000) {
+            Ok(confirm) -> {
+              process.sleep(200)
+              process.send(confirm, Nil)
+            }
+            Error(Nil) -> Nil
+          }
+        })
+      let assert Ok(downstream) = process.receive(handshake, 1000)
+      process.send(notices, DownstreamStarted(process.self()))
+      case process.selector_receive(tool.cancelled(call), 10_000) {
+        Ok(Nil) -> {
+          let confirm = process.new_subject()
+          process.send(downstream, confirm)
+          case process.receive(confirm, 2000) {
+            Ok(Nil) -> process.send(notices, DownstreamCancelConfirmed)
+            Error(Nil) -> Nil
+          }
+        }
+        Error(Nil) -> Nil
+      }
+      Ok(tool.complete(Nil))
+    })
+  server.new([probe])
 }
 
 fn slow_server() -> server.Server(process.Subject(SlowNotice)) {

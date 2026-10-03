@@ -10,10 +10,15 @@
 //// `register_tool`, `unregister_tool` and `end_streams` change the live
 //// server. The stdio and HTTP transports run on this module.
 ////
-//// Each handler runs in its own unlinked process with a timeout. A
-//// cancelled or timed-out handler first sees its `relay/tool.cancelled`
-//// selector fire; Relay kills it after the cancellation grace period. A
-//// crash becomes the JSON-RPC internal error on its exchange only.
+//// Each handler runs in its own unlinked process with a timeout. Every
+//// cancellation (a peer disconnect, `notifications/cancelled`, the
+//// invocation timeout, `close`, `stop`, or the exit of the process that
+//// started the runtime) first fires the handler's `relay/tool.cancelled`
+//// selector, then gives it the cancellation grace period to stop work it
+//// started elsewhere and return; Relay kills it only when the grace ends.
+//// The runtime stays alive until every cancelled handler has returned or
+//// been killed. A crash becomes the JSON-RPC internal error on its exchange
+//// only.
 ////
 //// | Setting | Default | Setter |
 //// | --- | --- | --- |
@@ -253,11 +258,19 @@ pub opaque type Message(context) {
   WorkerTimeout(id: Int)
   KillAfterGrace(pid: Pid)
   WorkerDown(down: process.Down)
+  OwnerExited(exit: process.ExitMessage)
   ExpireTombstone(id: Int)
   Apply(input: reducer.Input(context))
   PeerClosedExchange(exchange: ExchangeId)
   Close
-  Stop(reply: Subject(Nil))
+  Stop(reply: Subject(StopReply))
+}
+
+// `Stop` answers `Draining` at once when handlers are still in their grace,
+// then `Stopped` when the last one has exited.
+type StopReply {
+  Draining(grace_ms: Int)
+  Stopped
 }
 
 /// A running runtime.
@@ -279,14 +292,23 @@ type Worker {
   )
 }
 
+// A cancelled handler in its grace: still monitored, killed by the timer.
+type Cancelling {
+  Cancelling(monitor: process.Monitor, kill: process.Timer)
+}
+
 type State(context) {
   State(
     config: Config,
     reducer: reducer.State(context),
     sink: fn(Output) -> Result(Nil, Nil),
     workers: Dict(Int, Worker),
-    // Handlers in their cancellation grace, killed by `stop`.
-    cancelling: List(Pid),
+    // Handlers in their cancellation grace. The runtime stops only once
+    // this is empty.
+    cancelling: Dict(Pid, Cancelling),
+    // Set by `stop` or the owner's exit: stop once `cancelling` is empty,
+    // answering these callers.
+    stopping: Option(List(Subject(StopReply))),
     tombstones: Dict(Int, Nil),
     tombstone_order: List(Int),
     live_exchanges: Int,
@@ -349,16 +371,21 @@ fn builder(
 ) {
   let builder =
     actor.new_with_initialiser(5000, fn(self) {
+      // The owner's exit closes the runtime like `stop`, so cancelled
+      // handlers keep their grace even when the owner does not wait.
+      process.trap_exits(True)
       let selector =
         process.new_selector()
         |> process.select(for: self)
         |> process.select_monitors(WorkerDown)
+        |> process.select_trapped_exits(OwnerExited)
       State(
         config: config,
         reducer: reducer.init(server),
         sink: sink,
         workers: dict.new(),
-        cancelling: [],
+        cancelling: dict.new(),
+        stopping: None,
         tombstones: dict.new(),
         tombstone_order: [],
         live_exchanges: 0,
@@ -429,19 +456,27 @@ pub fn end_streams(runtime: Runtime(context)) -> Nil {
 }
 
 /// Closes the connection: cancels every invocation and refuses new frames.
+/// Each cancelled handler keeps its grace period. Returns at once.
 pub fn close(runtime: Runtime(context)) -> Nil {
   let Runtime(subject) = runtime
   process.send(subject, Close)
 }
 
-/// Closes the connection, kills every handler and stops the actor. Waits at
-/// most 5 s.
+/// Closes the connection, then stops the actor once every cancelled handler
+/// has returned or been killed at the end of its grace period. Returns when
+/// the runtime has stopped, waiting at most the grace period plus 5 s. To
+/// stop without waiting, call `close` and then `stop` from another process.
 pub fn stop(runtime: Runtime(context)) -> Nil {
   let Runtime(subject) = runtime
   let reply = process.new_subject()
   process.send(subject, Stop(reply))
-  let _ = process.receive(reply, call_timeout)
-  Nil
+  case process.receive(reply, call_timeout) {
+    Ok(Draining(grace_ms)) -> {
+      let _ = process.receive(reply, grace_ms + call_timeout)
+      Nil
+    }
+    Ok(Stopped) | Error(Nil) -> Nil
+  }
 }
 
 // --- actor -------------------------------------------------------------------
@@ -484,11 +519,17 @@ fn handle_message(
           actor.continue(apply(state, reducer.TimedOut(worker.invocation)))
         }
       }
-    KillAfterGrace(pid) -> {
-      process.kill(pid)
-      let cancelling = list.filter(state.cancelling, fn(p) { p != pid })
-      actor.continue(State(..state, cancelling: cancelling))
-    }
+    KillAfterGrace(pid) ->
+      case dict.get(state.cancelling, pid) {
+        // The handler already returned.
+        Error(Nil) -> actor.continue(state)
+        Ok(cancelling) -> {
+          process.kill(pid)
+          let _ = process.demonitor_process(cancelling.monitor)
+          State(..state, cancelling: dict.delete(state.cancelling, pid))
+          |> continue_or_stop
+        }
+      }
     WorkerDown(process.ProcessDown(monitor: _, pid: pid, reason: reason)) ->
       case find_worker_by_pid(state.workers, pid), reason {
         // A worker that exits normally has already sent its result.
@@ -503,9 +544,23 @@ fn handle_message(
           let state = remove_worker(state, id, worker)
           actor.continue(apply(state, reducer.Crashed(worker.invocation)))
         }
-        Error(Nil), _ -> actor.continue(state)
+        // A cancelled handler returned, or exited, within its grace.
+        Error(Nil), _ ->
+          case dict.get(state.cancelling, pid) {
+            Error(Nil) -> actor.continue(state)
+            Ok(cancelling) -> {
+              let _ = process.cancel_timer(cancelling.kill)
+              State(..state, cancelling: dict.delete(state.cancelling, pid))
+              |> continue_or_stop
+            }
+          }
       }
     WorkerDown(_) -> actor.continue(state)
+    // Handlers are unlinked, so a trapped exit comes from the process that
+    // started the runtime, or its supervisor.
+    OwnerExited(process.ExitMessage(pid: _, reason: process.Normal)) ->
+      actor.continue(state)
+    OwnerExited(_) -> begin_stop(state, None)
     ExpireTombstone(id) ->
       actor.continue(
         State(
@@ -518,14 +573,44 @@ fn handle_message(
     PeerClosedExchange(exchange) ->
       actor.continue(apply(state, reducer.ExchangeClosed(exchange)))
     Close -> actor.continue(close_all(state))
-    Stop(reply) -> {
-      // close_all moves every worker into its cancellation grace; the grace
-      // timers die with this actor, so kill every handler still running.
-      let state = close_all(state)
-      list.each(state.cancelling, process.kill)
-      process.send(reply, Nil)
+    Stop(reply) -> begin_stop(state, Some(reply))
+  }
+}
+
+// Moves every worker into its cancellation grace and stops once the last
+// cancelled handler has exited.
+fn begin_stop(
+  state: State(context),
+  reply: Option(Subject(StopReply)),
+) -> actor.Next(State(context), Message(context)) {
+  let state = close_all(state)
+  let replies = option.unwrap(state.stopping, [])
+  let replies = case reply {
+    Some(reply) -> {
+      case dict.is_empty(state.cancelling) {
+        True -> Nil
+        False ->
+          process.send(
+            reply,
+            Draining(duration.to_milliseconds(state.config.cancellation_grace)),
+          )
+      }
+      [reply, ..replies]
+    }
+    None -> replies
+  }
+  continue_or_stop(State(..state, stopping: Some(replies)))
+}
+
+fn continue_or_stop(
+  state: State(context),
+) -> actor.Next(State(context), Message(context)) {
+  case state.stopping, dict.is_empty(state.cancelling) {
+    Some(replies), True -> {
+      list.each(replies, process.send(_, Stopped))
       actor.stop()
     }
+    _, _ -> actor.continue(state)
   }
 }
 
@@ -783,26 +868,34 @@ fn remove_worker(
   remember(State(..state, workers: dict.delete(state.workers, id)), id)
 }
 
-// Signals the handler, then kills it after the grace period.
+// Signals the handler, then kills it after the grace period unless it
+// returns first. Its monitor stays, so the runtime sees it exit.
 fn cancel_worker(
   state: State(context),
   id: Int,
   worker: Worker,
 ) -> State(context) {
   reducer.signal_cancelled(worker.pid, worker.invocation)
+  let _ = process.cancel_timer(worker.timer)
+  let state =
+    remember(State(..state, workers: dict.delete(state.workers, id)), id)
   let grace = duration.to_milliseconds(state.config.cancellation_grace)
   case grace <= 0 {
-    True -> process.kill(worker.pid)
+    True -> {
+      process.kill(worker.pid)
+      let _ = process.demonitor_process(worker.monitor)
+      state
+    }
     False -> {
-      let _ = process.send_after(state.self, grace, KillAfterGrace(worker.pid))
-      Nil
+      let kill =
+        process.send_after(state.self, grace, KillAfterGrace(worker.pid))
+      let cancelling = Cancelling(monitor: worker.monitor, kill: kill)
+      State(
+        ..state,
+        cancelling: dict.insert(state.cancelling, worker.pid, cancelling),
+      )
     }
   }
-  remove_worker(
-    State(..state, cancelling: [worker.pid, ..state.cancelling]),
-    id,
-    worker,
-  )
 }
 
 fn remember(state: State(context), id: Int) -> State(context) {

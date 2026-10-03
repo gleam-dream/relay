@@ -35,6 +35,7 @@ type SinkGateMessage {
 type Probe {
   HandlerStarted(pid: Pid)
   HandlerSawCancel
+  HandlerCleanedUp
 }
 
 @external(erlang, "erlang", "self")
@@ -127,8 +128,27 @@ fn stubborn_tool() -> tool.Tool(Subject(Probe)) {
   })
 }
 
+/// A handler that, once cancelled, spends 100 ms stopping work it started
+/// elsewhere, reports it, and returns.
+fn cooperative_tool() -> tool.Tool(Subject(Probe)) {
+  tool.define("cooperative", codec.success(Nil), codec.success(Nil))
+  |> tool.handle_call(fn(call, _input) {
+    let probe = tool.context(call)
+    process.send(probe, HandlerStarted(process.self()))
+    case process.selector_receive(tool.cancelled(call), 10_000) {
+      Ok(Nil) -> {
+        process.send(probe, HandlerSawCancel)
+        process.sleep(100)
+        process.send(probe, HandlerCleanedUp)
+      }
+      Error(Nil) -> Nil
+    }
+    Ok(tool.complete(Nil))
+  })
+}
+
 fn probe_server() -> server.Server(Subject(Probe)) {
-  server.new([stubborn_tool()])
+  server.new([stubborn_tool(), cooperative_tool()])
 }
 
 // --- frames ------------------------------------------------------------------
@@ -666,6 +686,79 @@ pub fn exchange_closed_fires_cancelled_selector_then_kills_after_grace_test() {
   expect_silence(outputs, 20)
 
   runtime.stop(rt)
+}
+
+/// `stop` cancels every handler and waits for it to return within its grace
+/// before the runtime stops; it kills only a handler that outlives it.
+pub fn stop_gives_cancelled_handlers_their_grace_test() {
+  let probe = process.new_subject()
+  let config = runtime.config() |> runtime.with_cancellation_grace(ms(2000))
+  let #(rt, _outputs) = start_collecting(probe_server(), config)
+  let assert Ok(Nil) =
+    runtime.send_frame(
+      rt,
+      reducer.new_exchange_id(),
+      probe,
+      call_frame("cooperative-1", "cooperative", json.object([])),
+      None,
+    )
+  let assert Ok(HandlerStarted(cooperative)) = process.receive(probe, 1000)
+  let assert Ok(Nil) =
+    runtime.send_frame(
+      rt,
+      reducer.new_exchange_id(),
+      probe,
+      call_frame("stubborn-stop", "stubborn", json.object([])),
+      None,
+    )
+  let assert Ok(HandlerStarted(stubborn)) = process.receive(probe, 1000)
+  let cooperative_down = process.monitor(cooperative)
+  let stubborn_down = process.monitor(stubborn)
+  let stopped_at = monotonic_ms()
+  runtime.stop(rt)
+  let waited = monotonic_ms() - stopped_at
+
+  // The cooperative handler cleaned up and returned on its own; the
+  // stubborn one was killed when the grace ended, and `stop` waited for it.
+  wait_down(cooperative_down, 100) |> should.equal(process.Normal)
+  wait_down(stubborn_down, 100) |> should.equal(process.Killed)
+  { waited >= 1900 && waited < 4000 } |> should.be_true
+  let reports =
+    list.filter_map([1, 2, 3, 4], fn(_) { process.receive(probe, 100) })
+  list.contains(reports, HandlerCleanedUp) |> should.be_true
+}
+
+/// A runtime whose owner exits abnormally closes like `stop`: its cancelled
+/// handlers keep their grace.
+pub fn owner_exit_gives_cancelled_handlers_their_grace_test() {
+  let probe = process.new_subject()
+  let started = process.new_subject()
+  let owner =
+    process.spawn_unlinked(fn() {
+      let #(rt, _outputs) =
+        start_collecting(
+          probe_server(),
+          runtime.config() |> runtime.with_cancellation_grace(ms(2000)),
+        )
+      let assert Ok(Nil) =
+        runtime.send_frame(
+          rt,
+          reducer.new_exchange_id(),
+          probe,
+          call_frame("cooperative-2", "cooperative", json.object([])),
+          None,
+        )
+      process.send(started, Nil)
+      process.sleep(10_000)
+    })
+  let assert Ok(Nil) = process.receive(started, 1000)
+  let assert Ok(HandlerStarted(handler)) = process.receive(probe, 1000)
+  let monitor = process.monitor(handler)
+  process.send_abnormal_exit(owner, "owner crashed")
+
+  let assert Ok(HandlerSawCancel) = process.receive(probe, 1000)
+  let assert Ok(HandlerCleanedUp) = process.receive(probe, 1000)
+  wait_down(monitor, 1000) |> should.equal(process.Normal)
 }
 
 pub fn zero_cancellation_grace_kills_handler_at_once_test() {
