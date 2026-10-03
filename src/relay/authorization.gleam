@@ -3,18 +3,18 @@
 //// challenges and RFC 9728 protected-resource metadata.
 ////
 //// A `Verifier` is a function the application supplies: it receives the
-//// `BearerToken` and returns an `Attestation` of the principal, the
-//// audiences and the scopes, or a `VerificationError`. Relay never parses or
+//// `BearerToken` and the request's correlation and returns an
+//// `Attestation` of the principal, the audiences and the scopes, or a
+//// `VerificationError`. Relay never parses or
 //// checks a token itself; the verifier owns signatures, expiry, issuers and
 //// any introspection call. `admit` then accepts the attestation only when it
 //// names exactly the protected resource as its one audience and carries
 //// every required scope, and returns a `Grant`.
 ////
-//// A verifier built with `correlated_verifier` also receives the request's
-//// `sinal/correlation`, the same value the request's telemetry and its tool
-//// handler see, so an introspection call can carry it. The correlation may
-//// come from the client and is never evidence of identity: decide only on
-//// the token.
+//// A verifier also receives the request's `sinal/correlation`, the same
+//// value the request's telemetry and its tool handler see, so an
+//// introspection call can carry it. The correlation may come from the
+//// client and is never evidence of identity: decide only on the token.
 ////
 //// `relay/http.new_protected` wires this module into the HTTP endpoint: it
 //// reads the `Authorization` header, answers a refusal with the `challenge`
@@ -42,7 +42,7 @@
 //// pub fn verifier(
 ////   validate: fn(String) -> Result(Claims, Nil),
 //// ) -> authorization.Verifier(Claims) {
-////   use token <- authorization.verifier("jwt")
+////   use token, _correlation <- authorization.verifier("jwt")
 ////   validate(authorization.token_value(token))
 ////   |> result.map(fn(claims) {
 ////     authorization.attestation(claims, claims.audiences, claims.scopes)
@@ -249,26 +249,13 @@ pub opaque type Verifier(principal) {
   )
 }
 
-/// A verifier from the application's validation function. `name`, such as
-/// `"jwt"` or `"introspection"`, appears in telemetry.
+/// A verifier from the application's validation function, which receives
+/// the token and the request's correlation. `name`, such as `"jwt"` or
+/// `"introspection"`, appears in telemetry. The correlation is the one the
+/// request's events and its tool handler carry; pass it to a call the
+/// verifier makes, such as token introspection. It may come from the
+/// client, so it never decides admission.
 pub fn verifier(
-  name: String,
-  verify: fn(BearerToken) -> Result(Attestation(principal), VerificationError),
-) -> Verifier(principal) {
-  Verifier(name, fn(token, _correlation) { verify(token) })
-}
-
-/// A verifier whose validation function also receives the request's
-/// correlation, to pass to a call it makes, such as token introspection:
-///
-/// ```gleam
-/// use token, correlation <- authorization.correlated_verifier("introspection")
-/// introspect(token, correlation)
-/// ```
-///
-/// The correlation is the one the request's events and its tool handler
-/// carry. It may come from the client, so it never decides admission.
-pub fn correlated_verifier(
   name: String,
   verify: fn(BearerToken, Correlation) ->
     Result(Attestation(principal), VerificationError),
@@ -341,21 +328,9 @@ pub fn parse_authorization(
 
 /// Verifies the token and admits the request when the attestation names
 /// exactly the protected resource as its only audience and carries every
-/// required scope. A `correlated_verifier` receives a fresh correlation;
-/// a custom transport that has the request's uses
-/// `admit_with_correlation`.
+/// required scope. The verifier receives `correlation`, the request's;
+/// `relay/http.new_protected` passes it.
 pub fn admit(
-  verifier: Verifier(principal),
-  token: BearerToken,
-  protection: Protection,
-) -> Result(Grant(principal), AdmissionError) {
-  admit_with_correlation(verifier, token, protection, correlation.unique())
-}
-
-/// `admit` for a request with this correlation, which a
-/// `correlated_verifier` receives; `relay/http.new_protected` passes the
-/// request's.
-pub fn admit_with_correlation(
   verifier: Verifier(principal),
   token: BearerToken,
   protection: Protection,

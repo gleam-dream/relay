@@ -976,6 +976,7 @@ pub fn perform(
       input_responses: invocation.input_responses,
       invocation_id: invocation_id_to_int(invocation.id),
       request_id: invocation.request_id,
+      idempotency_key: invocation.metadata.idempotency_key,
       correlation: invocation.correlation,
       client_info: option.map(invocation.metadata.client_info, fn(info) {
         #(info.name, info.version)

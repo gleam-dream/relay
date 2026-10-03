@@ -200,12 +200,7 @@ pub fn new_protected(
     }
     let admitted =
       result.try(token, fn(token) {
-        authorization.admit_with_correlation(
-          verifier,
-          token,
-          protection,
-          correlation,
-        )
+        authorization.admit(verifier, token, protection, correlation)
       })
     emit.authorization_decided(
       authorization.verifier_name(verifier),
@@ -374,7 +369,7 @@ pub fn with_max_json_depth(
 /// header (as Relay's client does for `relay/client.with_correlation`),
 /// else a fresh `correlation.unique()`. A sent value counts only when it is
 /// 1 to 128 visible ASCII characters. The request's telemetry, its
-/// verifier (`authorization.correlated_verifier`) and its handler
+/// verifier (`relay/authorization.verifier`) and its handler
 /// (`relay/tool.correlation`) all carry the one value. It is client input:
 /// Relay never uses it to authorize, and neither should the builder.
 pub fn with_correlation(

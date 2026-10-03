@@ -1,4 +1,5 @@
-//// How a correlation crosses the wire between a Relay client and server.
+//// How a correlation and an idempotency key cross the wire between a Relay
+//// client and server.
 ////
 //// MCP `2026-07-28` defines no correlation or trace field, so Relay uses
 //// two carriers of its own:
@@ -9,11 +10,13 @@
 ////   before it reads the body, so the authorization decision and the
 ////   verifier see the same value as the invocation.
 ////
-//// A carried value is untrusted input: it is accepted only when
-//// `sinal/correlation.from_string` accepts it (1 to 128 bytes) and every
-//// byte is visible ASCII (`!` to `~`), so it cannot inject control
-//// characters, spaces or line breaks into logs. Anything else is ignored
-//// and the receiver uses a fresh correlation.
+//// A carried value is untrusted input: it is accepted only when it has 1
+//// to 128 bytes, all visible ASCII (`!` to `~`), so it cannot inject
+//// control characters, spaces or line breaks into logs. A correlation that
+//// fails is ignored and the receiver uses a fresh one; an idempotency key
+//// that fails refuses the request, because dropping it would silently turn
+//// a retry into new work. The idempotency key travels in `_meta` under
+//// `io.github.gleam-dream/idempotency-key`.
 
 import gleam/bit_array
 import gleam/dynamic/decode
@@ -28,9 +31,22 @@ pub const header = "x-correlation-id"
 /// The request `_meta` key that carries a correlation.
 pub const meta_key = "io.github.gleam-dream/correlation"
 
-/// Accepts a carried value, or ignores it.
+/// The request `_meta` key that carries an idempotency key.
+pub const idempotency_meta_key = "io.github.gleam-dream/idempotency-key"
+
+/// The longest carried value, in bytes.
+pub const max_bytes = 128
+
+/// Whether a value may be carried: 1 to 128 visible ASCII bytes.
+pub fn valid(raw: String) -> Bool {
+  let bytes = bit_array.from_string(raw)
+  let size = bit_array.byte_size(bytes)
+  size >= 1 && size <= max_bytes && visible_ascii(bytes)
+}
+
+/// Accepts a carried correlation, or ignores it.
 pub fn parse(raw: String) -> Option(Correlation) {
-  case visible_ascii(bit_array.from_string(raw)) {
+  case valid(raw) {
     False -> None
     True -> correlation.from_string(raw) |> option.from_result
   }

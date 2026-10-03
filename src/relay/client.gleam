@@ -18,7 +18,7 @@
 //// is the `ToolFailed` result.
 ////
 //// Per-call controls are views on the client: `with_deadline`,
-//// `with_cancellation`, `with_correlation` and `with_request_id` return a
+//// `with_cancellation`, `with_correlation` and `with_idempotency_key` return a
 //// new handle over the same connection, and every operation through it
 //// honours them. In MCP `2026-07-28` closing the connection cancels a
 //// request, so a deadline or a cancellation that ends an HTTP call closes
@@ -628,7 +628,7 @@ pub opaque type Client {
     deadline: Option(Deadline),
     cancellation: Option(Token),
     correlation: Option(Correlation),
-    request_id: Option(String),
+    idempotency_key: Option(String),
   )
 }
 
@@ -713,24 +713,32 @@ pub fn with_correlation(client: Client, correlation: Correlation) -> Client {
   Client(..client, correlation: Some(correlation))
 }
 
-/// A view whose requests use `id` as their JSON-RPC request id instead of a
-/// fresh one, so a server can recognise a retry: the handler reads it with
-/// `relay/tool.request_id` as `StringId(id)`.
+/// A view whose requests carry `key` as their idempotency key, in `_meta`
+/// under `io.github.gleam-dream/idempotency-key`; the handler reads it with
+/// `relay/tool.idempotency_key`. Sending the same key again is your promise
+/// that the request is the same one, so a server can answer a retry
+/// without doing the work twice.
 ///
-/// Use one view for one logical operation and its retries, and choose an id
-/// that is unique per logical operation, such as an order id. Every
-/// operation through the view sends the same id, so a second, different
-/// call through it looks like a retry of the first. MCP `2026-07-28` has no
-/// session, so the server can scope the id only by what it authenticated
-/// itself; see `relay/tool.request_id`.
-pub fn with_request_id(client: Client, id: String) -> Client {
-  Client(..client, request_id: Some(id))
+/// Use one view for one logical request and its retries, with a key unique
+/// to that request, such as an order id: every request through the view
+/// carries the key. A key must be 1 to 128 visible ASCII characters (`!` to
+/// `~`); otherwise each request fails with `InvalidArguments` before it is
+/// sent.
+pub fn with_idempotency_key(client: Client, key: String) -> Client {
+  Client(..client, idempotency_key: Some(key))
 }
 
-fn request_id(client: Client) -> String {
-  case client.request_id {
-    Some(id) -> id
-    None -> new_id()
+fn check_idempotency_key(client: Client) -> Result(Nil, Error) {
+  case client.idempotency_key {
+    None -> Ok(Nil)
+    Some(key) ->
+      case carrier.valid(key) {
+        True -> Ok(Nil)
+        False ->
+          Error(InvalidArguments(
+            "the idempotency key must be 1 to 128 visible ASCII characters",
+          ))
+      }
   }
 }
 
@@ -1310,10 +1318,16 @@ fn envelope(
         "io.modelcontextprotocol/clientCapabilities",
         input_capabilities(client.config.input_methods),
       ),
-      ..case option.then(client.correlation, carrier.sendable) {
-        Some(text) -> [#(carrier.meta_key, json.string(text))]
-        None -> []
-      }
+      ..list.append(
+        case option.then(client.correlation, carrier.sendable) {
+          Some(text) -> [#(carrier.meta_key, json.string(text))]
+          None -> []
+        },
+        case client.idempotency_key {
+          Some(key) -> [#(carrier.idempotency_meta_key, json.string(key))]
+          None -> []
+        },
+      )
     ])
   json.object([
     #("jsonrpc", json.string("2.0")),
@@ -1335,7 +1349,8 @@ fn request(
   name: Option(String),
   params: List(#(String, json.Json)),
 ) -> Result(Response, Error) {
-  let id = request_id(client)
+  use Nil <- result.try(check_idempotency_key(client))
+  let id = new_id()
   let started = monotonic_ms()
   let outcome =
     client.peer.send(
@@ -2239,7 +2254,8 @@ pub fn listen(
   client: Client,
   notifications: List(Notification),
 ) -> Result(Subscription, Error) {
-  let id = request_id(client)
+  use Nil <- result.try(check_idempotency_key(client))
+  let id = new_id()
   let body =
     envelope(client, id, "subscriptions/listen", [
       #("notifications", v2026.filter_to_json(subs.filter_of(notifications))),

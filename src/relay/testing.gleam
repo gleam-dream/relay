@@ -136,7 +136,7 @@ pub fn body_text(response: Response(BytesTree)) -> String {
 pub fn verifier(
   tokens: List(#(String, Attestation(principal))),
 ) -> Verifier(principal) {
-  authorization.verifier("relay-testing", fn(token) {
+  authorization.verifier("relay-testing", fn(token, _correlation) {
     list.key_find(tokens, authorization.token_value(token))
     |> result.replace_error(authorization.BearerRejected)
   })
@@ -145,7 +145,7 @@ pub fn verifier(
 /// A verifier that can never decide, as when the key set or the
 /// introspection endpoint is down.
 pub fn unavailable_verifier() -> Verifier(principal) {
-  authorization.verifier("relay-testing", fn(_) {
+  authorization.verifier("relay-testing", fn(_, _) {
     Error(authorization.VerifierUnavailable)
   })
 }

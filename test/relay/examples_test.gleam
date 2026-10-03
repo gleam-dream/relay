@@ -123,7 +123,7 @@ fn protect(
     authorization.protection(resource, [reports])
     |> authorization.with_authorization_servers(["https://login.example.com"])
   let verifier = {
-    use token <- authorization.verifier("jwt")
+    use token, _correlation <- authorization.verifier("jwt")
     validate(authorization.token_value(token))
     |> result.map(fn(c) { authorization.attestation(c, c.audiences, c.scopes) })
     |> result.replace_error(authorization.BearerRejected)
@@ -221,11 +221,11 @@ fn introspecting_verifier(
   introspect: fn(authorization.BearerToken, Correlation) ->
     Result(authorization.Attestation(String), authorization.VerificationError),
 ) -> authorization.Verifier(String) {
-  use token, correlation <- authorization.correlated_verifier("introspection")
+  use token, correlation <- authorization.verifier("introspection")
   introspect(token, correlation)
 }
 
-pub fn readme_correlated_verifier_test() {
+pub fn readme_introspection_verifier_test() {
   let verifier =
     introspecting_verifier(fn(_token, _correlation) {
       Error(authorization.IssuedForAnotherResource)
@@ -234,7 +234,12 @@ pub fn readme_correlated_verifier_test() {
   let assert Ok(resource) =
     authorization.protected_resource("https://mcp.example.com/mcp")
   let assert Error(authorization.VerificationFailed(error)) =
-    authorization.admit(verifier, token, authorization.protection(resource, []))
+    authorization.admit(
+      verifier,
+      token,
+      authorization.protection(resource, []),
+      correlation.unique(),
+    )
   let assert authorization.InvalidToken = authorization.verification_kind(error)
 }
 

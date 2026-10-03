@@ -42,8 +42,17 @@
 //// ## Ids and retries
 ////
 //// MCP `2026-07-28` has no session and no idempotency key, so nothing in
-//// the protocol identifies a retried call. A handler has two ids:
+//// the protocol identifies a retried call. A handler has three ids:
 ////
+//// - `idempotency_key(call)` is the key the client chose for one logical
+////   request (`relay/client.with_idempotency_key`), carried in `_meta`
+////   under `io.github.gleam-dream/idempotency-key`. A retry that carries
+////   the same key is the client's promise that it is the same request.
+////   Relay accepts 1 to 128 visible ASCII characters and refuses a request
+////   with any other value as invalid params. The key is not authenticated:
+////   key idempotent work by the principal the server authenticated (such
+////   as the `relay/authorization.Grant`'s) together with the key, so one
+////   client cannot replay or block another's work.
 //// - `invocation_id(call)` is Relay's own: unique among the invocations
 ////   this node has run since it started, and new for every request,
 ////   retries included. It joins the call's telemetry.
@@ -51,14 +60,11 @@
 ////   it. The client chooses it, and the protocol only requires that it
 ////   differ from that client's other requests in flight. It may repeat
 ////   across clients, and a retry carries the same id only when the client
-////   reuses it on purpose. Relay's client sends a fresh id per request
-////   unless the caller sets one with `relay/client.with_request_id`.
+////   reuses it on purpose. Relay's client sends a fresh id per request.
 ////
-//// To recognise a retry, key idempotent work by the request id together
-//// with what the server authenticated itself, such as the principal of
-//// the `relay/authorization.Grant`, and accept the key only from clients
-//// that promise to reuse ids on retry. Never treat a request id or a
-//// correlation as proof of who sent the request.
+//// Recognise a retry by the idempotency key, not the request id, and never
+//// treat any of these values or the correlation as proof of who sent the
+//// request.
 
 import gleam/dict.{type Dict}
 import gleam/erlang/process
@@ -88,7 +94,8 @@ pub type Tool(context) =
 
 /// One invocation as a `handle_call` handler sees it. Read it with
 /// `context`, `input_responses`, `report_progress`, `cancelled`,
-/// `invocation_id`, `request_id`, `correlation` and `client_info`.
+/// `invocation_id`, `request_id`, `idempotency_key`, `correlation` and
+/// `client_info`.
 pub type Call(context) =
   core.Call(context)
 
@@ -690,12 +697,20 @@ pub type RequestId {
 /// The JSON-RPC `id` of this request, exactly as the client sent it. It is
 /// chosen by the client and is not authenticated: it may repeat across
 /// clients, and a retry carries the same id only when the client reuses it.
-/// See the module doc for keying idempotent work by it.
+/// To recognise a retry, use `idempotency_key` instead.
 pub fn request_id(call: Call(context)) -> RequestId {
   case call.request_id {
     jsonrpc.RequestString(id) -> StringId(id)
     jsonrpc.RequestInteger(id) -> IntegerId(id)
   }
+}
+
+/// The idempotency key the client sent for this request, if any: 1 to 128
+/// visible ASCII characters. A retry with the same key is the client's
+/// promise that it is the same request. It is not authenticated, so key
+/// idempotent work by the authenticated principal and this key together.
+pub fn idempotency_key(call: Call(context)) -> Option(String) {
+  call.idempotency_key
 }
 
 /// This request's correlation: the transport's (`relay/http.with_correlation`),

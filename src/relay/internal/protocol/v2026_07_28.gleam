@@ -12,6 +12,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import json/blueprint/value.{type Value}
 import relay/content.{type ContentBlock, type ResourceContents}
+import relay/internal/carrier
 import relay/internal/core
 import relay/internal/jsonrpc.{
   type ProgressToken, type RequestId, type RpcError, ProgressInteger,
@@ -34,6 +35,7 @@ pub type RequestMetadata {
     client_info: Option(ClientInfo),
     progress_token: Option(ProgressToken),
     log_level: Option(LogLevel),
+    idempotency_key: Option(String),
   )
 }
 
@@ -785,12 +787,16 @@ fn parse_metadata(params_dyn: Dynamic) -> Result(RequestMetadata, RpcError) {
                           use log_level <- result.try(parse_log_level_from_meta(
                             meta_dict,
                           ))
+                          use idempotency_key <- result.try(
+                            parse_idempotency_key_from_meta(meta_dict),
+                          )
                           Ok(RequestMetadata(
                             protocol_version: ver,
                             client_capabilities: caps_dyn,
                             client_info: client_info,
                             progress_token: progress_token,
                             log_level: log_level,
+                            idempotency_key: idempotency_key,
                           ))
                         }
                       }
@@ -799,6 +805,25 @@ fn parse_metadata(params_dyn: Dynamic) -> Result(RequestMetadata, RpcError) {
           }
       }
     }
+  }
+}
+
+// An idempotency key that Relay cannot accept refuses the request: ignoring
+// it would turn the client's retry into new work.
+fn parse_idempotency_key_from_meta(
+  meta_dict: Dict(String, Dynamic),
+) -> Result(Option(String), RpcError) {
+  case dict.get(meta_dict, carrier.idempotency_meta_key) {
+    Error(_) -> Ok(None)
+    Ok(key_dyn) ->
+      case decode.run(key_dyn, decode.string) {
+        Ok(key) ->
+          case carrier.valid(key) {
+            True -> Ok(Some(key))
+            False -> Error(jsonrpc.invalid_params())
+          }
+        Error(_) -> Error(jsonrpc.invalid_params())
+      }
   }
 }
 

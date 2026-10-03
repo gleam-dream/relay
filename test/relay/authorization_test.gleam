@@ -40,7 +40,9 @@ fn token(raw: String) -> authorization.BearerToken {
 fn fixed_verifier(
   attestation: authorization.Attestation(String),
 ) -> authorization.Verifier(String) {
-  authorization.verifier("test-verifier", fn(_token) { Ok(attestation) })
+  authorization.verifier("test-verifier", fn(_token, _correlation) {
+    Ok(attestation)
+  })
 }
 
 fn admit(
@@ -48,7 +50,7 @@ fn admit(
   token: authorization.BearerToken,
   protection: authorization.Protection,
 ) -> Result(authorization.Grant(principal), authorization.AdmissionError) {
-  authorization.admit(verifier, token, protection)
+  authorization.admit(verifier, token, protection, correlation.unique())
 }
 
 // --- admission ----------------------------------------------------------------
@@ -78,7 +80,9 @@ pub fn rejects_verifier_failure_without_grant_test() {
   ]
   |> list.each(fn(failure) {
     let verifier =
-      authorization.verifier("test-verifier", fn(_token) { Error(failure) })
+      authorization.verifier("test-verifier", fn(_token, _correlation) {
+        Error(failure)
+      })
     admit(verifier, token("expired"), protection)
     |> should.equal(Error(authorization.VerificationFailed(failure)))
   })
@@ -531,7 +535,7 @@ pub fn tool_access_follows_the_principal_in_the_context_test() {
 pub fn issued_for_another_resource_gets_the_resource_challenge_test() {
   let protection = protection()
   let refusing =
-    authorization.verifier("audience-checking", fn(_token) {
+    authorization.verifier("audience-checking", fn(_token, _correlation) {
       Error(authorization.IssuedForAnotherResource)
     })
   admit(refusing, token("foreign"), protection)
@@ -589,16 +593,16 @@ pub fn verification_errors_have_a_stable_kind_test() {
   |> should.equal("the access token was issued for another resource")
 }
 
-pub fn admit_hands_the_correlation_to_a_correlated_verifier_test() {
+pub fn admit_hands_the_correlation_to_the_verifier_test() {
   let seen = process.new_subject()
   let verifier =
-    authorization.correlated_verifier("correlated", fn(_token, correlation) {
+    authorization.verifier("correlated", fn(_token, correlation) {
       process.send(seen, correlation)
       Ok(authorization.attestation("principal", [resource_raw], []))
     })
   let correlation = correlation.from_key("admission-17")
   let assert Ok(_) =
-    authorization.admit_with_correlation(
+    authorization.admit(
       verifier,
       token("t"),
       authorization.protection(resource(), []),
@@ -621,7 +625,7 @@ fn correlation_tool() -> tool.Tool(String) {
 pub fn verifier_decision_and_handler_share_the_request_correlation_test() {
   let seen = process.new_subject()
   let verifier =
-    authorization.correlated_verifier("correlated", fn(token, correlation) {
+    authorization.verifier("correlated", fn(token, correlation) {
       process.send(seen, correlation)
       list.key_find(tokens(), authorization.token_value(token))
       |> result.replace_error(authorization.BearerRejected)

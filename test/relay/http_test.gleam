@@ -1106,13 +1106,24 @@ pub fn mounted_handler_sees_registered_tools_test() {
 // --- wave 5: correlation and request ids across the wire -----------------------
 
 type Seen {
-  Seen(correlation: correlation.Correlation, request_id: tool.RequestId)
+  Seen(
+    correlation: correlation.Correlation,
+    request_id: tool.RequestId,
+    idempotency_key: option.Option(String),
+  )
 }
 
 fn seen_tool(seen: process.Subject(Seen)) -> tool.Tool(context) {
   tool.define("whoami", no_input(), codec.string())
   |> tool.handle_call(fn(call, _input) {
-    process.send(seen, Seen(tool.correlation(call), tool.request_id(call)))
+    process.send(
+      seen,
+      Seen(
+        tool.correlation(call),
+        tool.request_id(call),
+        tool.idempotency_key(call),
+      ),
+    )
     Ok(tool.complete(correlation.to_string(tool.correlation(call))))
   })
 }
@@ -1163,7 +1174,7 @@ pub fn client_correlation_names_the_server_side_of_the_call_test() {
 
   let assert Ok(client.Succeeded("question-41", _)) =
     client.call(client.with_correlation(peer, tag), whoami(), Nil)
-  let assert Ok(Seen(correlation: found, request_id: tool.StringId(id))) =
+  let assert Ok(Seen(correlation: found, request_id: tool.StringId(id), ..)) =
     process.receive(seen, 1000)
   found |> should.equal(tag)
   string.starts_with(id, "relay-") |> should.be_true
@@ -1190,60 +1201,109 @@ pub fn client_correlation_names_the_server_side_of_the_call_test() {
   })
 }
 
-/// A client view's request id reaches the handler as sent, so a retry
-/// through the same view is recognisable.
-pub fn request_id_view_reaches_the_handler_test() {
+/// Wave 5: a client view's idempotency key reaches the handler, so a retry
+/// through the same view is recognisable; the JSON-RPC id stays fresh.
+pub fn idempotency_key_view_reaches_the_handler_test() {
   let seen = process.new_subject()
   let listener = http.new(server.new([seen_tool(seen)])) |> started
   let peer = connect(listener)
-  let retrying = client.with_request_id(peer, "order-1001")
+  let retrying = client.with_idempotency_key(peer, "order-1001")
 
   let assert Ok(client.Succeeded(_, _)) = client.call(retrying, whoami(), Nil)
   let assert Ok(client.Succeeded(_, _)) = client.call(retrying, whoami(), Nil)
-  let assert Ok(Seen(request_id: first, ..)) = process.receive(seen, 1000)
-  let assert Ok(Seen(request_id: second, ..)) = process.receive(seen, 1000)
-  first |> should.equal(tool.StringId("order-1001"))
-  second |> should.equal(first)
+  let assert Ok(first) = process.receive(seen, 1000)
+  let assert Ok(second) = process.receive(seen, 1000)
+  first.idempotency_key |> should.equal(Some("order-1001"))
+  second.idempotency_key |> should.equal(Some("order-1001"))
+  let assert True = first.request_id != second.request_id
 
-  // Without the view each request gets a fresh id.
   let assert Ok(client.Succeeded(_, _)) = client.call(peer, whoami(), Nil)
-  let assert Ok(client.Succeeded(_, _)) = client.call(peer, whoami(), Nil)
-  let assert Ok(Seen(request_id: a, ..)) = process.receive(seen, 1000)
-  let assert Ok(Seen(request_id: b, ..)) = process.receive(seen, 1000)
-  let assert True = a != b
+  let assert Ok(plain) = process.receive(seen, 1000)
+  plain.idempotency_key |> should.equal(None)
+
+  // A key Relay cannot carry fails before it is sent.
+  let assert Error(client.InvalidArguments(_)) =
+    client.call(client.with_idempotency_key(peer, "two words"), whoami(), Nil)
+  let assert Error(client.InvalidArguments(_)) =
+    client.call(
+      client.with_idempotency_key(peer, string.repeat("k", 129)),
+      whoami(),
+      Nil,
+    )
+  process.receive(seen, 100) |> should.equal(Error(Nil))
   client.close(peer)
   http.stop(listener)
+}
+
+fn call_with_meta(extra: List(#(String, json.Json))) -> BitArray {
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("id", json.int(5)),
+    #("method", json.string("tools/call")),
+    #(
+      "params",
+      json.object([
+        #(
+          "_meta",
+          json.object([
+            #(
+              "io.modelcontextprotocol/protocolVersion",
+              json.string("2026-07-28"),
+            ),
+            #("io.modelcontextprotocol/clientCapabilities", json.object([])),
+            ..extra
+          ]),
+        ),
+        #("name", json.string("whoami")),
+        #("arguments", json.object([])),
+      ]),
+    ),
+  ])
+  |> json.to_string
+  |> bit_array.from_string
+}
+
+/// An idempotency key the server cannot accept refuses the request as
+/// invalid params instead of being dropped, so a retry never silently
+/// becomes new work.
+pub fn invalid_idempotency_key_refuses_the_request_test() {
+  let seen = process.new_subject()
+  let handler = http.new(server.new([seen_tool(seen)])) |> mounted
+  let key = "io.github.gleam-dream/idempotency-key"
+  [
+    json.string(""),
+    json.string(string.repeat("k", 129)),
+    json.string("two words"),
+    json.int(7),
+  ]
+  |> list.each(fn(invalid) {
+    let response =
+      http.handle(
+        handler,
+        request.set_body(whoami_request(), call_with_meta([#(key, invalid)])),
+      )
+    string.contains(testing.body_text(response), "-32602") |> should.be_true
+  })
+  process.receive(seen, 100) |> should.equal(Error(Nil))
+
+  let accepted =
+    http.handle(
+      handler,
+      request.set_body(
+        whoami_request(),
+        call_with_meta([#(key, json.string(string.repeat("k", 128)))]),
+      ),
+    )
+  accepted.status |> should.equal(200)
+  let assert Ok(found) = process.receive(seen, 1000)
+  found.idempotency_key |> should.equal(Some(string.repeat("k", 128)))
 }
 
 pub fn integer_request_ids_reach_the_handler_as_integers_test() {
   let seen = process.new_subject()
   let handler = http.new(server.new([seen_tool(seen)])) |> mounted
-  let body =
-    json.object([
-      #("jsonrpc", json.string("2.0")),
-      #("id", json.int(5)),
-      #("method", json.string("tools/call")),
-      #(
-        "params",
-        json.object([
-          #(
-            "_meta",
-            json.object([
-              #(
-                "io.modelcontextprotocol/protocolVersion",
-                json.string("2026-07-28"),
-              ),
-              #("io.modelcontextprotocol/clientCapabilities", json.object([])),
-            ]),
-          ),
-          #("name", json.string("whoami")),
-          #("arguments", json.object([])),
-        ]),
-      ),
-    ])
-    |> json.to_string
-    |> bit_array.from_string
-  let response = http.handle(handler, request.set_body(whoami_request(), body))
+  let response =
+    http.handle(handler, request.set_body(whoami_request(), call_with_meta([])))
   response.status |> should.equal(200)
   let assert Ok(Seen(request_id: id, ..)) = process.receive(seen, 1000)
   id |> should.equal(tool.IntegerId(5))

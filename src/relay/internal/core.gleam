@@ -79,6 +79,7 @@ pub type Call(context) {
     input_responses: List(#(String, Value)),
     invocation_id: Int,
     request_id: jsonrpc.RequestId,
+    idempotency_key: Option(String),
     correlation: Correlation,
     client_info: Option(#(String, String)),
     progress: fn(Float, Option(Float), Option(String)) -> Nil,
