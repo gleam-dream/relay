@@ -1,50 +1,73 @@
+//// The client side of the stdio transport: one child process, one request
+//// at a time, newline framing, and listen streams read from the same pipe.
+////
+//// The command is held in a closure, so `string.inspect` and crash reports
+//// print a function reference instead of the executable and its arguments.
+
 import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
-import gleam/dynamic/decode as dyn_decode
+import gleam/dynamic/decode
 import gleam/erlang/process.{type Pid, type Subject}
-import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/result
-import gleam/string
-import relay/transport/stdio.{
-  type Framer, type FramerResult, Frame, FrameOversized, InvalidTrailingBytes,
-  feed_framer, new_framer,
+import relay/internal/stdio_frames.{
+  type Framer, Frame, FrameOversized, InvalidTrailingBytes, feed_framer,
+  new_framer,
 }
 
 const max_buffered_frames = 256
 
-/// Configuration for a local stdio client. The executable is launched directly
-/// with `args`; it is never interpreted by a shell.
-pub type Config {
-  Config(
-    executable: String,
-    args: List(String),
-    timeout_ms: Int,
-    max_frame_bytes: Int,
-  )
+/// Why a request failed.
+pub type Failure {
+  /// No child is running: it never started or it exited earlier.
+  NotRunning
+  /// Too many calls are already waiting for the child.
+  Busy(limit: Int)
+  TimedOut
+  /// The child exited while the request was in flight.
+  Exited
+  /// The client was closed while the request was in flight.
+  ClientClosed
+  /// The caller cancelled the request; the child was told.
+  Cancelled
+  TooLarge(limit: Int)
+  Malformed(detail: String)
 }
 
 pub opaque type Client {
-  Client(subject: Subject(ClientMessage))
+  Client(subject: Subject(Message))
 }
 
-type ClientMessage {
-  OpenPort(String, List(String), Subject(Result(Pid, String)))
-  Request(BitArray, String, Int, Subject(Result(BitArray, RequestFailure)))
-  Subscribe(BitArray, String, Int, Subject(Result(BitArray, String)))
-  NextNotification(String, Int, Subject(Result(BitArray, String)))
-  CancelSubscription(String, Subject(Nil))
+type Message {
+  OpenPort(
+    command: fn() -> #(String, List(String)),
+    reply: Subject(Result(Nil, Nil)),
+  )
+  Request(
+    bytes: BitArray,
+    id: String,
+    timeout_ms: Int,
+    max_pending: Int,
+    reply: Subject(Result(BitArray, Failure)),
+  )
+  CancelInFlight(id: String)
+  Subscribe(
+    bytes: BitArray,
+    id: String,
+    timeout_ms: Int,
+    reply: Subject(Result(BitArray, Failure)),
+  )
+  NextNotification(
+    id: String,
+    timeout_ms: Int,
+    reply: Subject(Result(Option(BitArray), Failure)),
+  )
+  CancelSubscription(id: String, reply: Subject(Nil))
   ClientPortMessage(PortMessage)
-  CloseClient(Subject(Nil))
-}
-
-pub type RequestFailure {
-  Closed
-  Cancelled
-  Failed(String)
+  CloseClient(reply: Subject(Nil))
 }
 
 type PortMessage {
@@ -52,159 +75,189 @@ type PortMessage {
   PortExit(Int)
 }
 
-type ClientState {
-  ClientState(
-    port_owner: Option(Pid),
+type State {
+  State(
+    port: Option(Pid),
     framer: Framer,
     frames: List(BitArray),
     notifications: List(BitArray),
     closed_subscriptions: List(String),
-    subject: Subject(ClientMessage),
+    subject: Subject(Message),
     max_frame_bytes: Int,
   )
 }
 
-type AwaitError {
-  AwaitError(
-    reason: String,
-    state: ClientState,
-    queued: List(ClientMessage),
-    close_requested: Bool,
-    preserve_state: Bool,
-  )
-}
-
-type CloseResult {
-  CloseAcknowledged
-  CloseOwnerDown(process.Down)
-}
-
 @external(erlang, "relay_ffi", "start_stdio_client_port")
-fn ffi_start_stdio_client_port(
+fn start_port(
   executable: String,
   args: List(String),
-  subject: Subject(ClientMessage),
+  subject: Subject(Message),
 ) -> Result(Pid, String)
 
 @external(erlang, "relay_ffi", "send_stdio_client_command")
-fn ffi_send_stdio_client_command(port_owner: Pid, bytes: BitArray) -> Nil
+fn send_command(port: Pid, bytes: BitArray) -> Nil
 
 @external(erlang, "relay_ffi", "close_stdio_client_port")
-fn ffi_close_stdio_client_port(port_owner: Pid) -> Nil
+fn close_port_owner(port: Pid) -> Nil
 
 @external(erlang, "relay_ffi", "monotonic_time_ms")
-fn ffi_monotonic_time_ms() -> Int
+fn monotonic_ms() -> Int
 
-/// Starts an owned local child process using an executable and argument list.
-pub fn connect(config: Config) -> Result(Client, String) {
-  case
-    config.executable != ""
-    && config.timeout_ms > 0
-    && config.max_frame_bytes > 0
-  {
-    False -> Error("stdio client configuration is invalid")
-    True ->
-      case start_actor(config.max_frame_bytes) {
-        Error(error) -> Error(string.inspect(error))
-        Ok(client) -> {
-          let Client(subject) = client
-          case
-            process.call(
-              subject,
-              waiting: config.timeout_ms,
-              sending: fn(reply) {
-                OpenPort(config.executable, config.args, reply)
-              },
-            )
-          {
-            Ok(_) -> Ok(client)
-            Error(reason) -> {
-              close(client)
-              Error(reason)
-            }
+@external(erlang, "relay_ffi", "mailbox_size")
+fn mailbox_size(pid: Pid) -> Int
+
+/// Starts the child. `command` returns the executable and its arguments;
+/// the executable is launched directly, never through a shell.
+pub fn connect(
+  command: fn() -> #(String, List(String)),
+  timeout_ms: Int,
+  max_frame_bytes: Int,
+) -> Result(Client, Nil) {
+  let started =
+    actor.new_with_initialiser(5000, fn(subject) {
+      State(
+        port: None,
+        framer: new_framer(max_frame_bytes),
+        frames: [],
+        notifications: [],
+        closed_subscriptions: [],
+        subject: subject,
+        max_frame_bytes: max_frame_bytes,
+      )
+      |> actor.initialised
+      |> actor.returning(subject)
+      |> Ok
+    })
+    |> actor.on_message(handle_message)
+    |> actor.start
+  case started {
+    Error(_) -> Error(Nil)
+    Ok(started) -> {
+      let client = Client(started.data)
+      let reply = process.new_subject()
+      process.send(started.data, OpenPort(command, reply))
+      case process.receive(reply, timeout_ms + 1000) {
+        Ok(Ok(Nil)) -> Ok(client)
+        _ -> {
+          close(client)
+          Error(Nil)
+        }
+      }
+    }
+  }
+}
+
+/// Writes one frame and waits for its response. `cancelled` is polled while
+/// waiting; when it turns true the child receives `notifications/cancelled`.
+pub fn request(
+  client: Client,
+  bytes: BitArray,
+  id: String,
+  timeout_ms: Int,
+  max_bytes: Int,
+  max_pending: Int,
+  cancelled: fn() -> Bool,
+) -> Result(BitArray, Failure) {
+  let Client(subject) = client
+  let busy = case process.subject_owner(subject) {
+    Ok(owner) -> mailbox_size(owner) >= max_pending
+    Error(Nil) -> False
+  }
+  case busy, cancelled() {
+    True, _ -> Error(Busy(max_pending))
+    _, True -> Error(Cancelled)
+    False, False -> {
+      let reply = process.new_subject()
+      process.send(subject, Request(bytes, id, timeout_ms, max_pending, reply))
+      let deadline = monotonic_ms() + timeout_ms + 1000
+      await_reply(subject, reply, id, deadline, cancelled)
+      |> result.try(within(_, max_bytes))
+    }
+  }
+}
+
+const poll_ms = 50
+
+fn await_reply(
+  subject: Subject(Message),
+  reply: Subject(Result(BitArray, Failure)),
+  id: String,
+  deadline: Int,
+  cancelled: fn() -> Bool,
+) -> Result(BitArray, Failure) {
+  case process.receive(reply, poll_ms) {
+    Ok(result) -> result
+    Error(Nil) ->
+      case cancelled(), monotonic_ms() > deadline {
+        True, _ -> {
+          process.send(subject, CancelInFlight(id))
+          case process.receive(reply, 1000) {
+            Ok(Ok(frame)) -> Ok(frame)
+            _ -> Error(Cancelled)
           }
         }
+        False, True -> Error(TimedOut)
+        False, False -> await_reply(subject, reply, id, deadline, cancelled)
       }
   }
 }
 
-/// Writes one newline-delimited JSON-RPC frame and waits for one bounded reply.
-pub fn request(
-  client: Client,
-  request: BitArray,
-  expected_id: String,
-  timeout_ms: Int,
-  max_response_bytes: Int,
-) -> Result(BitArray, String) {
-  request_typed(client, request, expected_id, timeout_ms, max_response_bytes)
-  |> result.map_error(fn(failure) {
-    case failure {
-      Closed -> "stdio client is closed"
-      Cancelled -> "stdio client closed"
-      Failed(reason) -> reason
-    }
-  })
+fn within(frame: BitArray, max_bytes: Int) -> Result(BitArray, Failure) {
+  case bit_array.byte_size(frame) > max_bytes {
+    True -> Error(TooLarge(max_bytes))
+    False -> Ok(frame)
+  }
 }
 
-/// Reports closure and explicit close during a request without reading messages.
-pub fn request_typed(
-  client: Client,
-  request: BitArray,
-  expected_id: String,
-  timeout_ms: Int,
-  max_response_bytes: Int,
-) -> Result(BitArray, RequestFailure) {
-  let Client(subject) = client
-  process.call(subject, waiting: timeout_ms + 1000, sending: fn(reply) {
-    Request(request, expected_id, timeout_ms, reply)
-  })
-  |> result_limit_typed(max_response_bytes)
-}
-
-/// Opens a long-lived subscriptions/listen exchange and returns its
-/// acknowledgement notification. The exchange remains owned by this client;
-/// subsequent notifications can be read with `next_notification`.
+/// Opens a `subscriptions/listen` exchange and returns its acknowledgement.
 pub fn subscribe(
   client: Client,
-  request: BitArray,
-  expected_id: String,
+  bytes: BitArray,
+  id: String,
   timeout_ms: Int,
-  max_response_bytes: Int,
-) -> Result(BitArray, String) {
+  max_bytes: Int,
+) -> Result(BitArray, Failure) {
   let Client(subject) = client
-  process.call(subject, waiting: timeout_ms + 1000, sending: fn(reply) {
-    Subscribe(request, expected_id, timeout_ms, reply)
-  })
-  |> result_limit(max_response_bytes)
+  let reply = process.new_subject()
+  process.send(subject, Subscribe(bytes, id, timeout_ms, reply))
+  case process.receive(reply, timeout_ms + 1000) {
+    Ok(result) -> result.try(result, within(_, max_bytes))
+    Error(Nil) -> Error(TimedOut)
+  }
 }
 
-/// Waits for the next notification belonging to one subscription.
+/// The next notification of one listen exchange, or `None` when none
+/// arrived within the wait.
 pub fn next_notification(
   client: Client,
-  expected_id: String,
+  id: String,
   timeout_ms: Int,
-  max_response_bytes: Int,
-) -> Result(BitArray, String) {
+  max_bytes: Int,
+) -> Result(Option(BitArray), Failure) {
   let Client(subject) = client
-  process.call(subject, waiting: timeout_ms + 1000, sending: fn(reply) {
-    NextNotification(expected_id, timeout_ms, reply)
-  })
-  |> result_limit(max_response_bytes)
+  let reply = process.new_subject()
+  process.send(subject, NextNotification(id, timeout_ms, reply))
+  case process.receive(reply, timeout_ms + 1000) {
+    Ok(Ok(Some(frame))) -> within(frame, max_bytes) |> result.map(Some)
+    Ok(other) -> other
+    Error(Nil) -> Ok(None)
+  }
 }
 
-/// Cancels one long-lived subscription while keeping the child process alive.
-pub fn cancel_subscription(client: Client, expected_id: String) -> Nil {
+/// Ends one listen exchange; the child stays running.
+pub fn cancel_subscription(client: Client, id: String) -> Nil {
   let Client(subject) = client
-  process.call(subject, waiting: 1000, sending: fn(reply) {
-    CancelSubscription(expected_id, reply)
-  })
+  let reply = process.new_subject()
+  process.send(subject, CancelSubscription(id, reply))
+  let _ = process.receive(reply, 1000)
+  Nil
 }
 
-/// Closes the child and terminates its owning process.
+/// Closes the child and stops the client.
 pub fn close(client: Client) -> Nil {
   let Client(subject) = client
   case process.subject_owner(subject) {
-    Error(_) -> Nil
+    Error(Nil) -> Nil
     Ok(owner) ->
       case process.is_alive(owner) {
         False -> Nil
@@ -214,576 +267,371 @@ pub fn close(client: Client) -> Nil {
           process.send(subject, CloseClient(reply))
           let _ =
             process.new_selector()
-            |> process.select_map(for: reply, mapping: fn(_) {
-              CloseAcknowledged
-            })
-            |> process.select_specific_monitor(monitor, CloseOwnerDown)
+            |> process.select_map(reply, fn(_) { Nil })
+            |> process.select_specific_monitor(monitor, fn(_) { Nil })
             |> process.selector_receive(within: 1000)
-          process.demonitor_process(monitor)
+          let _ = process.demonitor_process(monitor)
           Nil
         }
       }
   }
 }
 
-fn result_limit(
-  result: Result(BitArray, String),
-  max_response_bytes: Int,
-) -> Result(BitArray, String) {
-  case result {
-    Error(reason) -> Error(reason)
-    Ok(frame) ->
-      case bit_array.byte_size(frame) > max_response_bytes {
-        True -> Error("stdio client response exceeds its configured byte limit")
-        False -> Ok(frame)
-      }
-  }
+// --- actor -------------------------------------------------------------------
+
+type Await {
+  Answered(frame: BitArray, state: State, queued: List(Message))
+  Failed(failure: Failure, state: State, queued: List(Message))
+  CloseRequested(failure: Failure, state: State, queued: List(Message))
 }
 
-fn result_limit_typed(
-  result: Result(BitArray, RequestFailure),
-  max_response_bytes: Int,
-) -> Result(BitArray, RequestFailure) {
-  case result {
-    Error(reason) -> Error(reason)
-    Ok(frame) ->
-      case bit_array.byte_size(frame) > max_response_bytes {
-        True ->
-          Error(Failed(
-            "stdio client response exceeds its configured byte limit",
-          ))
-        False -> Ok(frame)
-      }
-  }
-}
-
-fn start_actor(max_frame_bytes: Int) -> Result(Client, actor.StartError) {
-  let builder =
-    actor.new_with_initialiser(5000, fn(subject) {
-      actor.initialised(ClientState(
-        port_owner: None,
-        framer: new_framer(max_frame_bytes),
-        frames: [],
-        notifications: [],
-        closed_subscriptions: [],
-        subject: subject,
-        max_frame_bytes: max_frame_bytes,
-      ))
-      |> actor.returning(subject)
-      |> Ok
-    })
-    |> actor.on_message(handle_client_message)
-  case actor.start(builder) {
-    Error(error) -> Error(error)
-    Ok(started) -> Ok(Client(started.data))
-  }
-}
-
-fn handle_client_message(
-  state: ClientState,
-  message: ClientMessage,
-) -> actor.Next(ClientState, ClientMessage) {
+fn handle_message(
+  state: State,
+  message: Message,
+) -> actor.Next(State, Message) {
   case message {
-    OpenPort(executable, args, reply) ->
-      case ffi_start_stdio_client_port(executable, args, state.subject) {
-        Error(reason) -> {
-          process.send(reply, Error(reason))
+    OpenPort(command, reply) -> {
+      let #(executable, args) = command()
+      case start_port(executable, args, state.subject) {
+        Error(_) -> {
+          process.send(reply, Error(Nil))
           actor.continue(state)
         }
-        Ok(port_owner) -> {
-          process.send(reply, Ok(port_owner))
-          actor.continue(ClientState(..state, port_owner: Some(port_owner)))
-        }
-      }
-    Request(bytes, expected_id, timeout_ms, reply) ->
-      case state.port_owner {
-        None -> {
-          process.send(reply, Error(Closed))
-          actor.continue(state)
-        }
-        Some(port_owner) -> {
-          ffi_send_stdio_client_command(
-            port_owner,
-            bit_array.append(bytes, bit_array.from_string("\n")),
-          )
-          let deadline = ffi_monotonic_time_ms() + timeout_ms
-          case await_response(state, deadline, expected_id, []) {
-            Error(AwaitError(reason, failed_state, queued, close_requested, _)) -> {
-              ffi_close_stdio_client_port(port_owner)
-              let failure = case close_requested, failed_state.port_owner {
-                True, _ -> Cancelled
-                False, None -> Closed
-                False, Some(_) -> Failed(reason)
-              }
-              process.send(reply, Error(failure))
-              case close_requested {
-                True -> {
-                  reject_queued_calls(queued, reason)
-                  actor.stop()
-                }
-                False -> {
-                  list.each(list.reverse(queued), fn(next) {
-                    process.send(state.subject, next)
-                  })
-                  actor.continue(
-                    ClientState(
-                      ..state,
-                      port_owner: None,
-                      framer: new_framer(state.max_frame_bytes),
-                      frames: [],
-                      notifications: [],
-                    ),
-                  )
-                }
-              }
-            }
-            Ok(#(frame, next_state, queued)) -> {
-              process.send(reply, Ok(frame))
-              list.each(list.reverse(queued), fn(next) {
-                process.send(state.subject, next)
-              })
-              actor.continue(next_state)
-            }
-          }
-        }
-      }
-    Subscribe(bytes, expected_id, timeout_ms, reply) ->
-      case state.port_owner {
-        None -> {
-          process.send(reply, Error("stdio client is closed"))
-          actor.continue(state)
-        }
-        Some(port_owner) -> {
-          ffi_send_stdio_client_command(
-            port_owner,
-            bit_array.append(bytes, bit_array.from_string("\n")),
-          )
-          let deadline = ffi_monotonic_time_ms() + timeout_ms
-          case await_notification(state, deadline, expected_id, [], False) {
-            Error(AwaitError(reason, _failed_state, queued, close_requested, _)) -> {
-              ffi_close_stdio_client_port(port_owner)
-              process.send(reply, Error(reason))
-              case close_requested {
-                True -> {
-                  reject_queued_calls(queued, reason)
-                  actor.stop()
-                }
-                False -> {
-                  list.each(list.reverse(queued), fn(next) {
-                    process.send(state.subject, next)
-                  })
-                  actor.continue(
-                    ClientState(
-                      ..state,
-                      port_owner: None,
-                      framer: new_framer(state.max_frame_bytes),
-                      frames: [],
-                      notifications: [],
-                    ),
-                  )
-                }
-              }
-            }
-            Ok(#(frame, next_state, queued)) -> {
-              process.send(reply, Ok(frame))
-              list.each(list.reverse(queued), fn(next) {
-                process.send(state.subject, next)
-              })
-              actor.continue(next_state)
-            }
-          }
-        }
-      }
-    NextNotification(expected_id, timeout_ms, reply) -> {
-      case list.contains(state.closed_subscriptions, expected_id) {
-        True -> {
-          process.send(reply, Error("stdio subscription is closed"))
-          actor.continue(state)
-        }
-        False -> {
-          let deadline = ffi_monotonic_time_ms() + timeout_ms
-          case await_notification(state, deadline, expected_id, [], True) {
-            Error(AwaitError(
-              reason,
-              failed_state,
-              queued,
-              close_requested,
-              preserve_state,
-            )) -> {
-              process.send(reply, Error(reason))
-              case close_requested {
-                True -> {
-                  reject_queued_calls(queued, reason)
-                  actor.stop()
-                }
-                False -> {
-                  case preserve_state {
-                    True -> Nil
-                    False -> close_port(failed_state.port_owner)
-                  }
-                  list.each(list.reverse(queued), fn(next) {
-                    process.send(state.subject, next)
-                  })
-                  actor.continue(case preserve_state {
-                    True -> failed_state
-                    False -> reset_state(failed_state)
-                  })
-                }
-              }
-            }
-            Ok(#(frame, next_state, queued)) -> {
-              process.send(reply, Ok(frame))
-              list.each(list.reverse(queued), fn(next) {
-                process.send(state.subject, next)
-              })
-              actor.continue(next_state)
-            }
-          }
+        Ok(port) -> {
+          process.send(reply, Ok(Nil))
+          actor.continue(State(..state, port: Some(port)))
         }
       }
     }
-    CancelSubscription(expected_id, reply) -> {
-      case list.contains(state.closed_subscriptions, expected_id) {
+    Request(bytes, id, timeout_ms, _, reply) ->
+      case state.port {
+        None -> {
+          process.send(reply, Error(NotRunning))
+          actor.continue(state)
+        }
+        Some(port) -> {
+          send_command(port, bit_array.append(bytes, <<"\n">>))
+          let deadline = monotonic_ms() + timeout_ms
+          settle(
+            state,
+            await_response(state, deadline, id, []),
+            reply_to(reply),
+          )
+        }
+      }
+    Subscribe(bytes, id, timeout_ms, reply) ->
+      case state.port {
+        None -> {
+          process.send(reply, Error(NotRunning))
+          actor.continue(state)
+        }
+        Some(port) -> {
+          send_command(port, bit_array.append(bytes, <<"\n">>))
+          let deadline = monotonic_ms() + timeout_ms
+          settle(
+            state,
+            await_notification(state, deadline, id, []),
+            reply_to(reply),
+          )
+        }
+      }
+    NextNotification(id, timeout_ms, reply) ->
+      case list.contains(state.closed_subscriptions, id) {
         True -> {
-          process.send(reply, Nil)
+          process.send(reply, Error(NotRunning))
           actor.continue(state)
         }
         False -> {
-          case state.port_owner {
-            None -> Nil
-            Some(port_owner) ->
-              ffi_send_stdio_client_command(
-                port_owner,
-                cancellation_frame(expected_id),
+          let deadline = monotonic_ms() + timeout_ms
+          case await_notification(state, deadline, id, []) {
+            Answered(frame, next, queued) -> {
+              process.send(reply, Ok(Some(frame)))
+              requeue(next, queued)
+            }
+            Failed(TimedOut, next, queued) -> {
+              process.send(reply, Ok(None))
+              requeue(next, queued)
+            }
+            other ->
+              settle(
+                state,
+                other,
+                #(
+                  fn(frame) { process.send(reply, Ok(Some(frame))) },
+                  fn(failure) { process.send(reply, Error(failure)) },
+                ),
               )
           }
-          process.send(reply, Nil)
-          actor.continue(
-            ClientState(
-              ..state,
-              frames: discard_subscription_frames(state.frames, expected_id),
-              notifications: discard_notifications(
-                state.notifications,
-                expected_id,
-              ),
-              closed_subscriptions: [expected_id, ..state.closed_subscriptions],
-            ),
-          )
         }
       }
+    CancelSubscription(id, reply) -> {
+      case state.port, list.contains(state.closed_subscriptions, id) {
+        Some(port), False -> send_command(port, cancellation_frame(id))
+        _, _ -> Nil
+      }
+      process.send(reply, Nil)
+      actor.continue(
+        State(
+          ..state,
+          frames: list.filter(state.frames, fn(frame) { !belongs_to(frame, id) }),
+          notifications: list.filter(state.notifications, fn(frame) {
+            !belongs_to(frame, id)
+          }),
+          closed_subscriptions: [id, ..state.closed_subscriptions],
+        ),
+      )
     }
+    // A cancellation that arrives after its response was sent.
+    CancelInFlight(_) -> actor.continue(state)
     ClientPortMessage(PortData(chunk)) ->
-      case collect_frames(state.framer, chunk, state.max_frame_bytes) {
-        Error(_) -> {
-          case state.port_owner {
-            Some(port_owner) -> ffi_close_stdio_client_port(port_owner)
-            None -> Nil
-          }
-          actor.continue(
-            ClientState(
-              ..state,
-              port_owner: None,
-              framer: new_framer(state.max_frame_bytes),
-              frames: [],
-              notifications: [],
-            ),
-          )
-        }
-        Ok(#(framer, frames)) ->
-          case append_frames(state, framer, frames) {
-            Error(_) -> {
-              close_port(state.port_owner)
-              actor.continue(reset_state(state))
-            }
-            Ok(next_state) -> actor.continue(next_state)
-          }
+      case collect(state, chunk) {
+        Ok(state) -> actor.continue(state)
+        Error(_) -> actor.continue(reset(state))
       }
-    ClientPortMessage(PortExit(_status)) -> {
-      close_port(state.port_owner)
-      actor.continue(reset_state(state))
-    }
+    ClientPortMessage(PortExit(_)) ->
+      actor.continue(reset(State(..state, port: None)))
     CloseClient(reply) -> {
-      case state.port_owner {
-        Some(port_owner) -> ffi_close_stdio_client_port(port_owner)
-        None -> Nil
-      }
+      close_port(state.port)
       process.send(reply, Nil)
       actor.stop()
     }
   }
 }
 
-fn await_response(
-  state: ClientState,
-  deadline: Int,
-  expected_id: String,
-  queued: List(ClientMessage),
-) -> Result(#(BitArray, ClientState, List(ClientMessage)), AwaitError) {
-  case state.frames {
-    [frame, ..remaining] ->
-      case is_matching_response(frame, expected_id) {
-        Error(reason) -> Error(AwaitError(reason, state, queued, False, False))
-        Ok(True) ->
-          Ok(#(frame, ClientState(..state, frames: remaining), queued))
-        Ok(False) ->
-          case is_notification_frame(frame) {
-            True ->
-              case
-                enqueue_notification(
-                  ClientState(..state, frames: remaining),
-                  frame,
-                )
-              {
-                Error(reason) ->
-                  Error(AwaitError(reason, state, queued, False, False))
-                Ok(next_state) ->
-                  await_response(next_state, deadline, expected_id, queued)
-              }
-            False ->
-              await_response(
-                ClientState(..state, frames: remaining),
-                deadline,
-                expected_id,
-                queued,
-              )
-          }
-      }
-    [] -> {
-      let remaining_ms = deadline - ffi_monotonic_time_ms()
-      case remaining_ms <= 0 {
-        True ->
-          Error(AwaitError(
-            "stdio response timed out",
-            state,
-            queued,
-            False,
-            False,
-          ))
-        False ->
-          case process.receive(state.subject, remaining_ms) {
-            Error(_) ->
-              Error(AwaitError(
-                "stdio response timed out",
-                state,
-                queued,
-                False,
-                False,
-              ))
-            Ok(ClientPortMessage(PortData(chunk))) ->
-              case collect_frames(state.framer, chunk, state.max_frame_bytes) {
-                Error(reason) ->
-                  Error(AwaitError(reason, state, queued, False, False))
-                Ok(#(framer, frames)) ->
-                  case append_frames(state, framer, frames) {
-                    Error(reason) ->
-                      Error(AwaitError(reason, state, queued, False, False))
-                    Ok(next_state) ->
-                      await_response(next_state, deadline, expected_id, queued)
-                  }
-              }
-            Ok(ClientPortMessage(PortExit(status))) ->
-              Error(AwaitError(
-                "stdio child exited with status " <> int.to_string(status),
-                ClientState(..state, port_owner: None),
-                queued,
-                False,
-                False,
-              ))
-            Ok(CloseClient(reply)) -> {
-              case state.port_owner {
-                Some(port_owner) -> ffi_close_stdio_client_port(port_owner)
-                None -> Nil
-              }
-              process.send(reply, Nil)
-              Error(AwaitError(
-                "stdio client closed",
-                state,
-                queued,
-                True,
-                False,
-              ))
-            }
-            Ok(other) ->
-              await_response(state, deadline, expected_id, [other, ..queued])
-          }
-      }
+fn reply_to(
+  reply: Subject(Result(BitArray, Failure)),
+) -> #(fn(BitArray) -> Nil, fn(Failure) -> Nil) {
+  #(fn(frame) { process.send(reply, Ok(frame)) }, fn(failure) {
+    process.send(reply, Error(failure))
+  })
+}
+
+fn settle(
+  state: State,
+  outcome: Await,
+  reply: #(fn(BitArray) -> Nil, fn(Failure) -> Nil),
+) -> actor.Next(State, Message) {
+  let #(answer, fail) = reply
+  case outcome {
+    Answered(frame, next, queued) -> {
+      answer(frame)
+      requeue(next, queued)
+    }
+    Failed(Cancelled, next, queued) -> {
+      fail(Cancelled)
+      requeue(next, queued)
+    }
+    Failed(failure, failed, queued) -> {
+      close_port(failed.port)
+      fail(failure)
+      requeue(reset(State(..state, port: None)), queued)
+    }
+    CloseRequested(failure, _, queued) -> {
+      close_port(state.port)
+      fail(failure)
+      reject_queued(queued)
+      actor.stop()
     }
   }
 }
 
-fn await_notification(
-  state: ClientState,
-  deadline: Int,
-  expected_id: String,
-  queued: List(ClientMessage),
-  preserve_state: Bool,
-) -> Result(#(BitArray, ClientState, List(ClientMessage)), AwaitError) {
-  case take_notification(state.notifications, expected_id) {
-    Ok(#(frame, remaining)) ->
-      Ok(#(frame, ClientState(..state, notifications: remaining), queued))
-    Error(Nil) -> {
-      case state.frames {
-        [frame, ..remaining] ->
-          case notification_matches(frame, expected_id) {
-            Error(reason) ->
-              Error(AwaitError(reason, state, queued, False, False))
-            Ok(True) ->
-              Ok(#(frame, ClientState(..state, frames: remaining), queued))
-            Ok(False) ->
-              case
-                enqueue_notification(
-                  ClientState(..state, frames: remaining),
-                  frame,
-                )
-              {
-                Error(reason) ->
-                  Error(AwaitError(
-                    reason,
-                    ClientState(..state, frames: remaining),
-                    queued,
-                    False,
-                    False,
-                  ))
-                Ok(next_state) ->
-                  await_notification(
-                    next_state,
-                    deadline,
-                    expected_id,
-                    queued,
-                    preserve_state,
-                  )
-              }
-          }
-        [] -> {
-          let remaining_ms = deadline - ffi_monotonic_time_ms()
-          case remaining_ms <= 0 {
-            True ->
-              Error(AwaitError(
-                "stdio notification timed out",
-                state,
-                queued,
-                False,
-                preserve_state,
-              ))
-            False ->
-              case process.receive(state.subject, remaining_ms) {
-                Error(_) ->
-                  Error(AwaitError(
-                    "stdio notification timed out",
-                    state,
-                    queued,
-                    False,
-                    preserve_state,
-                  ))
-                Ok(ClientPortMessage(PortData(chunk))) ->
-                  case
-                    collect_frames(state.framer, chunk, state.max_frame_bytes)
-                  {
-                    Error(reason) ->
-                      Error(AwaitError(reason, state, queued, False, False))
-                    Ok(#(framer, frames)) ->
-                      case append_frames(state, framer, frames) {
-                        Error(reason) ->
-                          Error(AwaitError(reason, state, queued, False, False))
-                        Ok(next_state) ->
-                          await_notification(
-                            next_state,
-                            deadline,
-                            expected_id,
-                            queued,
-                            preserve_state,
-                          )
-                      }
-                  }
-                Ok(ClientPortMessage(PortExit(status))) ->
-                  Error(AwaitError(
-                    "stdio child exited with status " <> int.to_string(status),
-                    state,
-                    queued,
-                    False,
-                    False,
-                  ))
-                Ok(CloseClient(reply)) -> {
-                  case state.port_owner {
-                    Some(port_owner) -> ffi_close_stdio_client_port(port_owner)
-                    None -> Nil
-                  }
-                  process.send(reply, Nil)
-                  Error(AwaitError(
-                    "stdio client closed",
-                    state,
-                    queued,
-                    True,
-                    False,
-                  ))
-                }
-                Ok(other) ->
-                  await_notification(
-                    state,
-                    deadline,
-                    expected_id,
-                    [other, ..queued],
-                    preserve_state,
-                  )
-              }
-          }
-        }
-      }
+fn requeue(state: State, queued: List(Message)) -> actor.Next(State, Message) {
+  list.each(list.reverse(queued), fn(message) {
+    process.send(state.subject, message)
+  })
+  actor.continue(state)
+}
+
+fn reject_queued(queued: List(Message)) -> Nil {
+  list.each(queued, fn(message) {
+    case message {
+      OpenPort(_, reply) -> process.send(reply, Error(Nil))
+      Request(reply: reply, ..) -> process.send(reply, Error(ClientClosed))
+      Subscribe(reply: reply, ..) -> process.send(reply, Error(ClientClosed))
+      NextNotification(reply: reply, ..) ->
+        process.send(reply, Error(ClientClosed))
+      CancelSubscription(_, reply) -> process.send(reply, Nil)
+      CloseClient(reply) -> process.send(reply, Nil)
+      CancelInFlight(_) | ClientPortMessage(_) -> Nil
     }
+  })
+}
+
+fn await_response(
+  state: State,
+  deadline: Int,
+  id: String,
+  queued: List(Message),
+) -> Await {
+  case state.frames {
+    [frame, ..rest] ->
+      case response_id(frame) {
+        Error(detail) -> Failed(Malformed(detail), state, queued)
+        Ok(Some(found)) if found == id ->
+          Answered(frame, State(..state, frames: rest), queued)
+        Ok(Some(_)) ->
+          Failed(
+            Malformed("the response id did not match the request"),
+            state,
+            queued,
+          )
+        Ok(None) ->
+          case enqueue_notification(State(..state, frames: rest), frame) {
+            Error(detail) -> Failed(Malformed(detail), state, queued)
+            Ok(next) -> await_response(next, deadline, id, queued)
+          }
+      }
+    [] ->
+      receive(
+        state,
+        deadline,
+        queued,
+        fn(next, queued) { await_response(next, deadline, id, queued) },
+        Some(id),
+      )
+  }
+}
+
+fn await_notification(
+  state: State,
+  deadline: Int,
+  id: String,
+  queued: List(Message),
+) -> Await {
+  case take_notification(state.notifications, id) {
+    Ok(#(frame, rest)) ->
+      Answered(frame, State(..state, notifications: rest), queued)
+    Error(Nil) ->
+      case state.frames {
+        [frame, ..rest] ->
+          case belongs_to(frame, id) {
+            True -> Answered(frame, State(..state, frames: rest), queued)
+            False ->
+              case enqueue_notification(State(..state, frames: rest), frame) {
+                Error(detail) -> Failed(Malformed(detail), state, queued)
+                Ok(next) -> await_notification(next, deadline, id, queued)
+              }
+          }
+        [] ->
+          receive(
+            state,
+            deadline,
+            queued,
+            fn(next, queued) { await_notification(next, deadline, id, queued) },
+            None,
+          )
+      }
+  }
+}
+
+// Waits for the next message while a request or stream waits. Messages for
+// other calls are queued and replayed afterwards.
+fn receive(
+  state: State,
+  deadline: Int,
+  queued: List(Message),
+  continue: fn(State, List(Message)) -> Await,
+  in_flight: Option(String),
+) -> Await {
+  let remaining = deadline - monotonic_ms()
+  case remaining <= 0 {
+    True -> Failed(TimedOut, state, queued)
+    False ->
+      case process.receive(state.subject, remaining) {
+        Error(Nil) -> Failed(TimedOut, state, queued)
+        Ok(ClientPortMessage(PortData(chunk))) ->
+          case collect(state, chunk) {
+            Error(detail) -> Failed(Malformed(detail), state, queued)
+            Ok(next) -> continue(next, queued)
+          }
+        Ok(ClientPortMessage(PortExit(_))) ->
+          Failed(Exited, State(..state, port: None), queued)
+        Ok(CloseClient(reply)) -> {
+          process.send(reply, Nil)
+          CloseRequested(ClientClosed, state, queued)
+        }
+        Ok(CancelInFlight(target)) ->
+          case in_flight {
+            Some(id) if id == target -> {
+              case state.port {
+                Some(port) -> send_command(port, cancellation_frame(id))
+                None -> Nil
+              }
+              Failed(Cancelled, state, queued)
+            }
+            _ -> receive(state, deadline, queued, continue, in_flight)
+          }
+        // A call that arrives while another is in flight waits in `queued`,
+        // out of the mailbox the caller's check reads: bound it here.
+        Ok(Request(max_pending: max_pending, reply: reply, ..) as request) ->
+          case waiting_requests(queued) >= max_pending {
+            True -> {
+              process.send(reply, Error(Busy(max_pending)))
+              receive(state, deadline, queued, continue, in_flight)
+            }
+            False ->
+              receive(state, deadline, [request, ..queued], continue, in_flight)
+          }
+        Ok(other) ->
+          receive(state, deadline, [other, ..queued], continue, in_flight)
+      }
+  }
+}
+
+fn waiting_requests(queued: List(Message)) -> Int {
+  list.count(queued, fn(message) {
+    case message {
+      Request(..) -> True
+      _ -> False
+    }
+  })
+}
+
+fn collect(state: State, chunk: BitArray) -> Result(State, String) {
+  let #(framer, results) = feed_framer(state.framer, chunk)
+  use frames <- result.try(
+    list.try_map(results, fn(found) {
+      case found {
+        Frame(frame) -> Ok(frame)
+        FrameOversized(..) -> Error("a response frame exceeds the byte limit")
+        InvalidTrailingBytes(_) ->
+          Error("a response ended with unterminated data")
+      }
+    }),
+  )
+  let combined = list.append(state.frames, frames)
+  case list.length(combined) > max_buffered_frames {
+    True -> Error("the frame buffer exceeded its bound")
+    False -> Ok(State(..state, framer: framer, frames: combined))
+  }
+}
+
+fn enqueue_notification(
+  state: State,
+  frame: BitArray,
+) -> Result(State, String) {
+  case list.length(state.notifications) >= max_buffered_frames {
+    True -> Error("the notification buffer exceeded its bound")
+    False ->
+      Ok(
+        State(..state, notifications: list.append(state.notifications, [frame])),
+      )
   }
 }
 
 fn take_notification(
   notifications: List(BitArray),
-  expected_id: String,
+  id: String,
 ) -> Result(#(BitArray, List(BitArray)), Nil) {
-  case notifications {
-    [] -> Error(Nil)
-    [frame, ..rest] ->
-      case notification_matches(frame, expected_id) {
-        Ok(True) -> Ok(#(frame, rest))
-        _ ->
-          case take_notification(rest, expected_id) {
-            Error(_) -> Error(Nil)
-            Ok(#(found, remaining)) ->
-              Ok(#(found, list.append([frame], remaining)))
-          }
-      }
+  case list.split_while(notifications, fn(frame) { !belongs_to(frame, id) }) {
+    #(_, []) -> Error(Nil)
+    #(before, [found, ..after]) -> Ok(#(found, list.append(before, after)))
   }
 }
 
-fn enqueue_notification(
-  state: ClientState,
-  frame: BitArray,
-) -> Result(ClientState, String) {
-  case list.length(state.notifications) >= max_buffered_frames {
-    True -> Error("stdio notification buffer exceeded its configured bound")
-    False ->
-      Ok(
-        ClientState(
-          ..state,
-          notifications: list.append(state.notifications, [frame]),
-        ),
-      )
-  }
-}
-
-fn append_frames(
-  state: ClientState,
-  framer: Framer,
-  frames: List(BitArray),
-) -> Result(ClientState, String) {
-  let combined = list.append(state.frames, frames)
-  case list.length(combined) > max_buffered_frames {
-    True -> Error("stdio frame buffer exceeded its configured bound")
-    False -> Ok(ClientState(..state, framer: framer, frames: combined))
-  }
-}
-
-fn reset_state(state: ClientState) -> ClientState {
-  ClientState(
+fn reset(state: State) -> State {
+  State(
     ..state,
-    port_owner: None,
     framer: new_framer(state.max_frame_bytes),
     frames: [],
     notifications: [],
@@ -791,200 +639,70 @@ fn reset_state(state: ClientState) -> ClientState {
   )
 }
 
-fn close_port(port_owner: Option(Pid)) -> Nil {
-  case port_owner {
+fn close_port(port: Option(Pid)) -> Nil {
+  case port {
+    Some(port) -> close_port_owner(port)
     None -> Nil
-    Some(owner) -> ffi_close_stdio_client_port(owner)
   }
 }
 
-fn cancellation_frame(expected_id: String) -> BitArray {
-  let bytes =
-    json.object([
-      #("jsonrpc", json.string("2.0")),
-      #("method", json.string("notifications/cancelled")),
-      #(
-        "params",
-        json.object([
-          #("requestId", json.string(expected_id)),
-          #("reason", json.string("subscription closed")),
-        ]),
-      ),
-    ])
-    |> json.to_string
-    |> bit_array.from_string
-  bit_array.append(bytes, bit_array.from_string("\n"))
+fn cancellation_frame(id: String) -> BitArray {
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("method", json.string("notifications/cancelled")),
+    #(
+      "params",
+      json.object([
+        #("requestId", json.string(id)),
+        #("reason", json.string("cancelled by the client")),
+      ]),
+    ),
+  ])
+  |> json.to_string
+  |> bit_array.from_string
+  |> bit_array.append(<<"\n">>)
 }
 
-fn discard_notifications(
-  notifications: List(BitArray),
-  expected_id: String,
-) -> List(BitArray) {
-  list.filter(notifications, fn(frame) {
-    case notification_matches(frame, expected_id) {
-      Ok(True) -> False
-      _ -> True
-    }
-  })
+fn parse(frame: BitArray) -> Result(Dynamic, String) {
+  use text <- result.try(
+    bit_array.to_string(frame) |> result.replace_error("a frame was not UTF-8"),
+  )
+  json.parse(text, decode.dynamic)
+  |> result.replace_error("a frame was not valid JSON")
 }
 
-fn discard_subscription_frames(
-  frames: List(BitArray),
-  expected_id: String,
-) -> List(BitArray) {
-  list.filter(frames, fn(frame) {
-    case notification_matches(frame, expected_id) {
-      Ok(True) -> False
-      _ -> True
-    }
-  })
+// `Some(id)` for a response, `None` for a notification.
+fn response_id(frame: BitArray) -> Result(Option(String), String) {
+  use value <- result.try(parse(frame))
+  case decode.run(value, decode.at(["jsonrpc"], decode.string)) {
+    Ok("2.0") ->
+      case decode.run(value, decode.at(["id"], decode.dynamic)) {
+        Ok(raw) ->
+          case decode.run(raw, decode.string) {
+            Ok(id) -> Ok(Some(id))
+            Error(_) -> Error("a response id was not a string")
+          }
+        Error(_) ->
+          case decode.run(value, decode.at(["method"], decode.string)) {
+            Ok(_) -> Ok(None)
+            Error(_) -> Error("the peer sent a frame without an id or method")
+          }
+      }
+    _ -> Error("the peer sent malformed JSON-RPC")
+  }
 }
 
-fn reject_queued_calls(queued: List(ClientMessage), reason: String) -> Nil {
-  list.each(queued, fn(message) {
-    case message {
-      OpenPort(_, _, reply) -> process.send(reply, Error(reason))
-      Request(_, _, _, reply) -> process.send(reply, Error(Cancelled))
-      Subscribe(_, _, _, reply) -> process.send(reply, Error(reason))
-      NextNotification(_, _, reply) -> process.send(reply, Error(reason))
-      CancelSubscription(_, reply) -> process.send(reply, Nil)
-      CloseClient(reply) -> process.send(reply, Nil)
-      ClientPortMessage(_) -> Nil
-    }
-  })
-}
-
-fn is_notification_frame(frame: BitArray) -> Bool {
-  case bit_array.to_string(frame) {
+fn belongs_to(frame: BitArray, id: String) -> Bool {
+  case parse(frame) {
     Error(_) -> False
-    Ok(raw) ->
-      case json.parse(raw, dyn_decode.dynamic) {
-        Error(_) -> False
-        Ok(value) ->
-          case
-            dyn_decode.run(value, dyn_decode.at(["method"], dyn_decode.string))
-          {
-            Ok(_) -> True
-            Error(_) -> False
-          }
-      }
-  }
-}
-
-fn notification_matches(
-  frame: BitArray,
-  expected_id: String,
-) -> Result(Bool, String) {
-  case bit_array.to_string(frame) {
-    Error(_) -> Error("stdio notification was not UTF-8")
-    Ok(raw) ->
-      case json.parse(raw, dyn_decode.dynamic) {
-        Error(_) -> Error("stdio notification was not valid JSON")
-        Ok(value) -> {
-          let method =
-            dyn_decode.run(value, dyn_decode.at(["method"], dyn_decode.string))
-          case method {
-            Error(_) -> Ok(False)
-            Ok(_) ->
-              case
-                dyn_decode.run(
-                  value,
-                  dyn_decode.at(
-                    [
-                      "params",
-                      "_meta",
-                      "io.modelcontextprotocol/subscriptionId",
-                    ],
-                    dyn_decode.string,
-                  ),
-                )
-              {
-                Ok(actual) if actual == expected_id -> Ok(True)
-                Ok(_) -> Ok(False)
-                Error(_) -> Ok(False)
-              }
-          }
-        }
-      }
-  }
-}
-
-fn is_matching_response(
-  frame: BitArray,
-  expected_id: String,
-) -> Result(Bool, String) {
-  case bit_array.to_string(frame) {
-    Error(_) -> Error("stdio response was not UTF-8")
-    Ok(raw) ->
-      case json.parse(raw, dyn_decode.dynamic) {
-        Error(_) -> Error("stdio response was not valid JSON")
-        Ok(response) -> {
-          let version =
-            dyn_decode.run(
-              response,
-              dyn_decode.at(["jsonrpc"], dyn_decode.string),
-            )
-          case version {
-            Error(_) -> Error("stdio peer sent malformed JSON-RPC")
-            Ok("2.0") -> classify_frame_id(response, expected_id)
-            Ok(_) -> Error("stdio peer used an unsupported JSON-RPC version")
-          }
-        }
-      }
-  }
-}
-
-fn classify_frame_id(
-  response: Dynamic,
-  expected_id: String,
-) -> Result(Bool, String) {
-  case dyn_decode.run(response, dyn_decode.at(["id"], dyn_decode.dynamic)) {
-    Ok(raw_id) ->
-      case dyn_decode.run(raw_id, dyn_decode.string) {
-        Ok(actual_id) if actual_id == expected_id -> Ok(True)
-        Ok(_) -> Error("stdio response ID did not match request")
-        Error(_) -> Error("stdio response ID was not a string")
-      }
-    Error(_) ->
-      case
-        dyn_decode.run(response, dyn_decode.at(["method"], dyn_decode.string))
-      {
-        Ok(_) -> Ok(False)
-        Error(_) -> Error("stdio peer sent a frame without a response ID")
-      }
-  }
-}
-
-fn collect_frames(
-  framer: Framer,
-  chunk: BitArray,
-  limit: Int,
-) -> Result(#(Framer, List(BitArray)), String) {
-  let #(next_framer, results) = feed_framer(framer, chunk)
-  case collect_frame_results(results, limit, []) {
-    Error(reason) -> Error(reason)
-    Ok(frames) -> Ok(#(next_framer, frames))
-  }
-}
-
-fn collect_frame_results(
-  results: List(FramerResult),
-  limit: Int,
-  frames: List(BitArray),
-) -> Result(List(BitArray), String) {
-  case results {
-    [] -> Ok(list.reverse(frames))
-    [Frame(frame), ..rest] ->
-      collect_frame_results(rest, limit, [frame, ..frames])
-    [FrameOversized(size, _), ..] ->
-      Error(
-        "stdio response frame exceeds the configured "
-        <> int.to_string(limit)
-        <> " byte limit ("
-        <> int.to_string(size)
-        <> " bytes)",
+    Ok(value) ->
+      decode.run(
+        value,
+        decode.at(
+          ["params", "_meta", "io.modelcontextprotocol/subscriptionId"],
+          decode.string,
+        ),
       )
-    [InvalidTrailingBytes(_), ..] ->
-      Error("stdio response ended with unterminated data")
+      == Ok(id)
   }
 }

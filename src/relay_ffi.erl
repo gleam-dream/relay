@@ -28,32 +28,20 @@
     sha256_hex/1,
     read_file/1,
     git_head/1,
-    send_sse_comment/2,
     watch_client_close/1,
-    set_sse_send_timeout/2,
+    set_send_timeout/2,
     decode_base64_strict/1,
     start_stdio_client_port/3,
     send_stdio_client_command/2,
-    close_stdio_client_port/1
+    close_stdio_client_port/1,
+    json_depth_within/2,
+    signal_cancelled/2
 ]).
 
-send_sse_comment(Connection, Timeout) ->
-    case set_sse_send_timeout(Connection, Timeout) of
-        {ok, nil} ->
-            {s_s_e_connection,
-             {connection, _Body, Socket, Transport, _Factory}} = Connection,
-            case glisten@transport:send(Transport, Socket, <<": keepalive\n\n">>) of
-                {ok, _} -> {ok, nil};
-                {error, _} -> {error, nil}
-            end;
-        {error, nil} -> {error, nil}
-    end.
-
-set_sse_send_timeout(
-    {s_s_e_connection, {connection, _Body, Socket, Transport, _Factory}},
-  Timeout
-) ->
-    Options = [{send_timeout, Timeout}, {send_timeout_close, false}],
+%% Sets the send timeout of a mist connection's socket, so a peer that stops
+%% reading cannot block a stream writer forever.
+set_send_timeout({connection, _Body, Socket, Transport, _Factory}, Timeout) ->
+    Options = [{send_timeout, Timeout}, {send_timeout_close, true}],
     Result = case Transport of
         tcp -> inet:setopts(Socket, Options);
         ssl -> ssl:setopts(Socket, Options)
@@ -61,7 +49,9 @@ set_sse_send_timeout(
     case Result of
         ok -> {ok, nil};
         {error, _} -> {error, nil}
-    end.
+    end;
+set_send_timeout(_, _) ->
+    {error, nil}.
 
 %% Arms one closure message ({tcp_closed, S}, {ssl_closed, S}, or an error
 %% tuple) for the connection process that runs a buffered HTTP handler. Data
@@ -501,3 +491,30 @@ close_stdio_client_port(Pid) ->
 
 printable(Bin) when is_binary(Bin) -> Bin;
 printable(Term) -> unicode:characters_to_binary(io_lib:format("~p", [Term])).
+
+%% Scans JSON text for object and array nesting deeper than Max, outside
+%% strings, before any parsing.
+json_depth_within(Bin, Max) when is_binary(Bin) ->
+    depth_scan(Bin, 0, Max, false).
+
+depth_scan(<<>>, _Depth, _Max, _InString) -> true;
+depth_scan(<<$\\, _, Rest/binary>>, Depth, Max, true) ->
+    depth_scan(Rest, Depth, Max, true);
+depth_scan(<<$", Rest/binary>>, Depth, Max, InString) ->
+    depth_scan(Rest, Depth, Max, not InString);
+depth_scan(<<_, Rest/binary>>, Depth, Max, true) ->
+    depth_scan(Rest, Depth, Max, true);
+depth_scan(<<C, Rest/binary>>, Depth, Max, false) when C =:= ${; C =:= $[ ->
+    case Depth + 1 > Max of
+        true -> false;
+        false -> depth_scan(Rest, Depth + 1, Max, false)
+    end;
+depth_scan(<<C, Rest/binary>>, Depth, Max, false) when C =:= $}; C =:= $] ->
+    depth_scan(Rest, Depth - 1, Max, false);
+depth_scan(<<_, Rest/binary>>, Depth, Max, false) ->
+    depth_scan(Rest, Depth, Max, false).
+
+%% Tells a running invocation's worker that it was cancelled.
+signal_cancelled(Pid, InvocationId) ->
+    Pid ! {relay_invocation_cancelled, InvocationId},
+    nil.

@@ -1,5 +1,7 @@
-# Wrong handler/codec pairing must produce a compile-time type mismatch.
+# Wrong handler/codec pairing must produce a compile-time type mismatch at
+# the handler: the definition's input codec decodes Int, the handler takes String.
 Type mismatch
+tool.handle(definition, fn(input: String)
 Expected type:
 Int
 Found type:

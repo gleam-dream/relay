@@ -1,19 +1,31 @@
 import gleam/bit_array
+import gleam/bytes_tree
 import gleam/erlang/process
+import gleam/http as gleam_http
+import gleam/http/request
+import gleam/http/response
+import gleam/int
 import gleam/json
 import gleam/list
+import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
-import gleeunit
+import gleam/time/duration
 import gleeunit/should
 import json/blueprint/codec
+import mist
+import relay/client
+import relay/content
+import relay/http
+import relay/resources
 import relay/server
+import relay/subscriptions
+import relay/telemetry
+import relay/testing
 import relay/tool
-import relay/transport/http
+import sinal
 
-pub fn main() -> Nil {
-  gleeunit.main()
-}
+// --- the raw HTTP client ------------------------------------------------------
 
 @external(erlang, "relay_http_ffi", "request")
 fn local_request(
@@ -39,8 +51,18 @@ fn send_and_hold(
   body: BitArray,
 ) -> Result(HeldConnection, String)
 
+@external(erlang, "relay_http_ffi", "read_until")
+fn read_until(
+  connection: HeldConnection,
+  needle: BitArray,
+  timeout_ms: Int,
+) -> Result(BitArray, String)
+
 @external(erlang, "relay_http_ffi", "abort_connection")
 fn abort_connection(connection: HeldConnection) -> BitArray
+
+@external(erlang, "relay_ffi", "stop_supervisor")
+fn stop_supervisor(pid: process.Pid) -> Nil
 
 type HeldConnection
 
@@ -53,6 +75,8 @@ type ProgressNotice {
   ProgressBurstStarted(process.Pid)
   ProgressBurstFinished
 }
+
+// --- shared helpers -----------------------------------------------------------
 
 fn envelope(
   method: String,
@@ -68,6 +92,16 @@ fn envelope_with_protocol(
   params: List(#(String, json.Json)),
   protocol_version: String,
 ) -> BitArray {
+  envelope_with_meta(method, with_id, params, protocol_version, [])
+}
+
+fn envelope_with_meta(
+  method: String,
+  with_id: Bool,
+  params: List(#(String, json.Json)),
+  protocol_version: String,
+  extra_meta: List(#(String, json.Json)),
+) -> BitArray {
   let metadata =
     json.object([
       #(
@@ -75,6 +109,7 @@ fn envelope_with_protocol(
         json.string(protocol_version),
       ),
       #("io.modelcontextprotocol/clientCapabilities", json.object([])),
+      ..extra_meta
     ])
   let request_fields = [
     #("jsonrpc", json.string("2.0")),
@@ -118,40 +153,130 @@ fn headers_with_name(
   [#("Mcp-Name", name), ..headers(method, accept)]
 }
 
-fn empty_server() -> server.Server(Nil) {
-  let assert Ok(registry) = tool.registry([])
-  server.server(registry)
+fn text(bytes: BitArray) -> String {
+  bit_array.to_string(bytes) |> result.unwrap("")
 }
 
+fn no_input() -> codec.Codec(Nil) {
+  codec.success(Nil)
+}
+
+fn text_input() -> codec.Codec(String) {
+  use text <- codec.field("text", codec.string(), get: fn(text) { text })
+  codec.success(text)
+}
+
+fn echo_definition() -> tool.Definition(String, String) {
+  tool.define("echo", text_input(), codec.string())
+}
+
+fn echo_tool() -> tool.Tool(context) {
+  tool.handle(echo_definition(), fn(text) { Ok(text) })
+}
+
+fn empty_server() -> server.Server(Nil) {
+  server.new([])
+}
+
+fn echo_server() -> server.Server(Nil) {
+  server.new([echo_tool()])
+}
+
+fn mounted(config: http.Config(context)) -> http.Handler(context) {
+  let assert Ok(handler) = http.handler(config)
+  handler
+}
+
+fn started(config: http.Config(context)) -> http.Handler(context) {
+  let assert Ok(listener) = http.start(config)
+  listener
+}
+
+fn connect(listener: http.Handler(context)) -> client.Client {
+  connect_port(http.port(listener))
+}
+
+fn connect_port(port: Int) -> client.Client {
+  let assert Ok(config) =
+    client.http("http://127.0.0.1:" <> int.to_string(port) <> "/")
+  let assert Ok(peer) = client.connect(config)
+  peer
+}
+
+fn echo_call(text: String) -> request.Request(BitArray) {
+  testing.request("tools/call", [
+    #("name", json.string("echo")),
+    #("arguments", json.object([#("text", json.string(text))])),
+  ])
+}
+
+fn listen_params() -> List(#(String, json.Json)) {
+  [#("notifications", json.object([#("toolsListChanged", json.bool(True))]))]
+}
+
+fn worker_exits_within(worker: process.Pid, attempts: Int) -> Bool {
+  case process.is_alive(worker) {
+    False -> True
+    True ->
+      case attempts <= 0 {
+        True -> False
+        False -> {
+          process.sleep(10)
+          worker_exits_within(worker, attempts - 1)
+        }
+      }
+  }
+}
+
+fn index_of(haystack: String, needle: String) -> Int {
+  case string.split_once(haystack, needle) {
+    Ok(#(before, _)) -> string.length(before)
+    Error(Nil) -> -1
+  }
+}
+
+fn observe_rejections() -> #(
+  process.Subject(telemetry.HttpRejectedMeta),
+  sinal.Attachment,
+) {
+  let rejected = process.new_subject()
+  let attachment =
+    sinal.observe(telemetry.http_rejected_event(), fn(_, meta) {
+      process.send(rejected, meta)
+    })
+  #(rejected, attachment)
+}
+
+fn receive_rejection(
+  rejected: process.Subject(telemetry.HttpRejectedMeta),
+  reason: telemetry.RejectReason,
+) -> telemetry.HttpRejectedMeta {
+  let assert Ok(meta) = process.receive(rejected, 1000)
+  case meta.reason == reason {
+    True -> meta
+    False -> receive_rejection(rejected, reason)
+  }
+}
+
+// --- the listener on the wire -------------------------------------------------
+
 pub fn invalid_keepalive_rejected_before_listener_start_test() {
-  let policy =
-    http.HttpPolicy(..http.local_http_policy("127.0.0.1"), sse_keepalive_ms: 0)
-  http.listener(empty_server(), fn() { Nil })
-  |> http.with_policy(policy)
+  http.new(empty_server())
+  |> http.with_sse_keepalive(duration.milliseconds(0))
   |> http.start()
-  |> should.equal(Error(
-    "Invalid Relay HTTP listener options, policy, or TLS settings",
-  ))
+  |> should.equal(Error(http.InvalidConfig(http.SseKeepalive)))
 }
 
 pub fn streamable_http_loopback_test() {
-  let policy =
-    http.HttpPolicy(
-      max_body_bytes: 512,
-      max_response_bytes: 4096,
-      request_timeout_ms: 2000,
-      sse_keepalive_ms: 250,
-      allowed_hosts: ["127.0.0.1"],
-      allowed_origins: ["http://127.0.0.1"],
-    )
-  let assert Ok(listener) = {
-    let options = http.HttpOptions(port: 0, host: "127.0.0.1")
-    http.listener(empty_server(), fn() { Nil })
-    |> http.with_options(options)
-    |> http.with_policy(policy)
-    |> http.start()
-  }
-  let port = http.http_server_port(listener)
+  let listener =
+    http.new(empty_server())
+    |> http.with_max_body_bytes(512)
+    |> http.with_max_response_bytes(4096)
+    |> http.with_request_timeout(duration.seconds(2))
+    |> http.with_allowed_hosts(["127.0.0.1"])
+    |> http.with_allowed_origins(["http://127.0.0.1"])
+    |> started
+  let port = http.port(listener)
   let body = envelope("server/discover", True, [])
   let assert Ok(#(200, response_headers, response_body)) =
     local_request(
@@ -160,13 +285,17 @@ pub fn streamable_http_loopback_test() {
       headers("server/discover", "application/json"),
       body,
     )
-  let response_text = bit_array.to_string(response_body) |> result.unwrap("")
-  should.be_true(string.contains(response_text, "supportedVersions"))
+  should.be_true(string.contains(text(response_body), "supportedVersions"))
   should.equal(
     list.key_find(response_headers, "mcp-protocol-version"),
     Ok("2026-07-28"),
   )
+  should.equal(
+    list.key_find(response_headers, "content-type"),
+    Ok("application/json"),
+  )
 
+  // The routing headers must match the body.
   let assert Ok(#(400, _, _)) =
     local_request(port, "post", headers("tools/list", "application/json"), body)
   let assert Ok(#(400, _, mismatched_method_body)) =
@@ -176,35 +305,29 @@ pub fn streamable_http_loopback_test() {
       headers("server/ping", "application/json"),
       body,
     )
-  let mismatched_method_text =
-    bit_array.to_string(mismatched_method_body) |> result.unwrap("")
-  should.be_true(string.contains(mismatched_method_text, "-32020"))
+  should.be_true(string.contains(text(mismatched_method_body), "-32020"))
 
   let unsupported_body =
     envelope_with_protocol("server/discover", True, [], "2099-01-01")
-  let assert Ok(#(400, _, unsupported_body_text)) =
+  let assert Ok(#(400, _, unsupported_response)) =
     local_request(
       port,
       "post",
       headers_with_protocol("server/discover", "application/json", "2099-01-01"),
       unsupported_body,
     )
-  let unsupported_text =
-    bit_array.to_string(unsupported_body_text) |> result.unwrap("")
-  should.be_true(string.contains(unsupported_text, "-32022"))
+  should.be_true(string.contains(text(unsupported_response), "-32022"))
 
   let version_mismatch_body =
     envelope_with_protocol("server/discover", True, [], "2025-11-25")
-  let assert Ok(#(400, _, version_mismatch_text)) =
+  let assert Ok(#(400, _, version_mismatch_response)) =
     local_request(
       port,
       "post",
       headers("server/discover", "application/json"),
       version_mismatch_body,
     )
-  let version_mismatch =
-    bit_array.to_string(version_mismatch_text) |> result.unwrap("")
-  should.be_true(string.contains(version_mismatch, "-32020"))
+  should.be_true(string.contains(text(version_mismatch_response), "-32020"))
 
   let unknown_method_body = envelope("testing/removed-method", True, [])
   let assert Ok(#(404, _, unknown_method_response)) =
@@ -214,10 +337,9 @@ pub fn streamable_http_loopback_test() {
       headers("testing/removed-method", "application/json"),
       unknown_method_body,
     )
-  let unknown_method_text =
-    bit_array.to_string(unknown_method_response) |> result.unwrap("")
-  should.be_true(string.contains(unknown_method_text, "-32601"))
+  should.be_true(string.contains(text(unknown_method_response), "-32601"))
 
+  // resources/read and prompts/get need a matching Mcp-Name header.
   let resource_read =
     envelope("resources/read", True, [
       #("uri", json.string("memory://missing/1")),
@@ -240,7 +362,7 @@ pub fn streamable_http_loopback_test() {
       ),
       resource_read,
     )
-  let assert Ok(#(200, _, _)) =
+  let assert Ok(#(200, _, missing_resource)) =
     local_request(
       port,
       "post",
@@ -251,6 +373,7 @@ pub fn streamable_http_loopback_test() {
       ),
       resource_read,
     )
+  should.be_true(string.contains(text(missing_resource), "-32002"))
   let prompt_get =
     envelope("prompts/get", True, [
       #("name", json.string("missing")),
@@ -263,13 +386,16 @@ pub fn streamable_http_loopback_test() {
       headers("prompts/get", "application/json"),
       prompt_get,
     )
-  let assert Ok(#(200, _, _)) =
+  let assert Ok(#(200, _, missing_prompt)) =
     local_request(
       port,
       "post",
       headers_with_name("prompts/get", "missing", "application/json"),
       prompt_get,
     )
+  should.be_true(string.contains(text(missing_prompt), "\"error\""))
+
+  // Origin and Host allow-lists.
   let assert Ok(#(403, _, _)) =
     local_request(
       port,
@@ -290,13 +416,14 @@ pub fn streamable_http_loopback_test() {
       ],
       body,
     )
-  let assert Ok(#(405, _, _)) =
+  let assert Ok(#(405, put_headers, _)) =
     local_request(
       port,
       "put",
       headers("server/discover", "application/json"),
       body,
     )
+  should.equal(list.key_find(put_headers, "allow"), Ok("POST"))
   let assert Ok(#(406, _, _)) =
     local_request(
       port,
@@ -304,6 +431,8 @@ pub fn streamable_http_loopback_test() {
       headers("server/discover", "application/json;q=0, text/event-stream;q=0"),
       body,
     )
+
+  // An immediate answer is JSON even when the client accepts SSE.
   let assert Ok(#(200, sse_headers, sse_body)) =
     local_request(
       port,
@@ -313,40 +442,9 @@ pub fn streamable_http_loopback_test() {
     )
   should.equal(
     list.key_find(sse_headers, "content-type"),
-    Ok("text/event-stream"),
+    Ok("application/json"),
   )
-  let sse_text = bit_array.to_string(sse_body) |> result.unwrap("")
-  should.be_true(string.contains(sse_text, "data: {"))
-
-  let capped_policy =
-    http.HttpPolicy(
-      max_body_bytes: 512,
-      max_response_bytes: 1,
-      request_timeout_ms: 2000,
-      sse_keepalive_ms: 250,
-      allowed_hosts: ["127.0.0.1"],
-      allowed_origins: ["http://127.0.0.1"],
-    )
-  let assert Ok(capped_listener) = {
-    let options = http.HttpOptions(port: 0, host: "127.0.0.1")
-    http.listener(empty_server(), fn() { Nil })
-    |> http.with_options(options)
-    |> http.with_policy(capped_policy)
-    |> http.start()
-  }
-  let assert Ok(#(200, capped_headers, capped_body)) =
-    local_request(
-      http.http_server_port(capped_listener),
-      "post",
-      headers("server/discover", "text/event-stream"),
-      body,
-    )
-  should.equal(
-    list.key_find(capped_headers, "content-type"),
-    Ok("text/event-stream"),
-  )
-  should.equal(bit_array.byte_size(capped_body), 0)
-  http.stop_http_server(capped_listener)
+  should.be_true(string.contains(text(sse_body), "supportedVersions"))
 
   let oversized =
     json.string(string.repeat("x", 600))
@@ -369,30 +467,37 @@ pub fn streamable_http_loopback_test() {
       notification,
     )
   should.equal(bit_array.byte_size(empty_body), 0)
-  http.stop_http_server(listener)
+  http.stop(listener)
+}
+
+pub fn response_over_the_limit_is_not_sent_test() {
+  let listener =
+    http.new(empty_server())
+    |> http.with_max_response_bytes(1)
+    |> started
+  let assert Ok(#(status, _, capped_body)) =
+    local_request(
+      http.port(listener),
+      "post",
+      headers("server/discover", "application/json, text/event-stream"),
+      envelope("server/discover", True, []),
+    )
+  should.not_equal(status, 200)
+  string.contains(text(capped_body), "supportedVersions") |> should.be_false
+  http.stop(listener)
 }
 
 pub fn live_sse_progress_burst_disconnect_cancels_worker_test() {
-  let policy =
-    http.HttpPolicy(
-      max_body_bytes: 512,
-      max_response_bytes: 4096,
-      request_timeout_ms: 1000,
-      sse_keepalive_ms: 250,
-      allowed_hosts: ["127.0.0.1"],
-      allowed_origins: ["http://127.0.0.1"],
-    )
   let notices = process.new_subject()
-  let assert Ok(listener) = {
-    let options = http.HttpOptions(port: 0, host: "127.0.0.1")
-    http.listener(burst_progress_server(), fn() { notices })
-    |> http.with_options(options)
-    |> http.with_policy(policy)
-    |> http.start()
-  }
+  let listener =
+    http.new_with_context(burst_progress_server(), fn(_) { Ok(notices) })
+    // Long enough that only the disconnect, never the invocation timeout,
+    // can end the worker within the wait below.
+    |> http.with_request_timeout(duration.seconds(10))
+    |> started
   let assert Ok(200) =
     disconnect_after_first_sse_event(
-      http.http_server_port(listener),
+      http.port(listener),
       "POST",
       [
         #("Accept", "application/json, text/event-stream"),
@@ -400,39 +505,32 @@ pub fn live_sse_progress_burst_disconnect_cancels_worker_test() {
         #("Mcp-Method", "tools/call"),
         #("Mcp-Name", "disconnect_probe"),
       ],
-      progress_call_envelope(),
+      progress_call_envelope("disconnect_probe"),
     )
   let assert Ok(ProgressBurstStarted(worker)) = process.receive(notices, 1000)
-  should.be_true(worker_exits_within(worker, 100))
+  should.be_true(worker_exits_within(worker, 50))
   case process.receive(notices, 0) {
     Ok(ProgressBurstFinished) -> should.fail()
     Ok(ProgressBurstStarted(_)) -> should.fail()
     Error(Nil) -> Nil
   }
-  http.stop_http_server(listener)
+  http.stop(listener)
 }
 
 /// Streamable HTTP cancels a request when its client disconnects. A buffered
 /// JSON call writes nothing until it finishes, so the listener must notice the
 /// closed socket itself, cancel the invocation, and write no result.
 pub fn buffered_call_disconnect_cancels_worker_test() {
-  let policy =
-    http.HttpPolicy(
-      max_body_bytes: 4096,
-      max_response_bytes: 4096,
-      request_timeout_ms: 5000,
-      sse_keepalive_ms: 250,
-      allowed_hosts: ["127.0.0.1"],
-      allowed_origins: ["http://127.0.0.1"],
-    )
   let notices = process.new_subject()
-  let assert Ok(listener) = {
-    let options = http.HttpOptions(port: 0, host: "127.0.0.1")
-    http.listener(slow_server(), fn() { notices })
-    |> http.with_options(options)
-    |> http.with_policy(policy)
-    |> http.start()
-  }
+  let cancelled = process.new_subject()
+  let attachment =
+    sinal.observe(telemetry.invocation_cancelled_event(), fn(_, meta) {
+      process.send(cancelled, meta)
+    })
+  let listener =
+    http.new_with_context(slow_server(), fn(_) { Ok(notices) })
+    |> http.with_request_timeout(duration.seconds(5))
+    |> started
   let body =
     envelope("tools/call", True, [
       #("name", json.string("slow_probe")),
@@ -440,7 +538,7 @@ pub fn buffered_call_disconnect_cancels_worker_test() {
     ])
   let assert Ok(connection) =
     send_and_hold(
-      http.http_server_port(listener),
+      http.port(listener),
       "POST",
       headers_with_name("tools/call", "slow_probe", "application/json"),
       body,
@@ -455,124 +553,466 @@ pub fn buffered_call_disconnect_cancels_worker_test() {
     True -> Nil
     False -> process.kill(worker)
   }
-  http.stop_http_server(listener)
+  let cancellation = process.receive(cancelled, 1000)
+  let assert Ok(Nil) = sinal.detach(attachment)
+  http.stop(listener)
   should.equal(written, <<>>)
   should.be_true(stopped)
+  let assert Ok(meta) = cancellation
+  meta.method |> should.equal("tools/call")
+  meta.tool |> should.equal(Some("slow_probe"))
   // The handler never finished, so no result was produced for the call.
   should.equal(process.receive(notices, 300), Error(Nil))
 }
 
 fn slow_server() -> server.Server(process.Subject(SlowNotice)) {
-  let assert Ok(name) = tool.tool_name("slow_probe")
-  let assert Ok(definition) =
-    tool.definition(name, codec.success(Nil), codec.success(Nil))
-  let definition = tool.with_metadata(definition, tool.empty_metadata())
   let slow_tool =
-    tool.handle_advanced(definition, fn(call, _input) {
-      let tool.HandlerCallContext(notices, _input_responses, _report_progress) =
-        call
+    tool.define("slow_probe", no_input(), no_input())
+    |> tool.handle_call(fn(call, _input) {
+      let notices = tool.context(call)
       process.send(notices, SlowStarted(process.self()))
       process.sleep(2000)
       process.send(notices, SlowFinished)
-      Ok(tool.Complete(Nil, []))
+      Ok(tool.complete(Nil))
     })
-  let assert Ok(registry) = tool.registry([slow_tool])
-  server.server(registry)
+  server.new([slow_tool])
 }
 
-fn progress_call_envelope() -> BitArray {
-  json.object([
-    #("jsonrpc", json.string("2.0")),
-    #("id", json.int(8)),
-    #("method", json.string("tools/call")),
-    #(
-      "params",
-      json.object([
-        #("name", json.string("disconnect_probe")),
-        #("arguments", json.object([])),
-        #(
-          "_meta",
-          json.object([
-            #(
-              "io.modelcontextprotocol/protocolVersion",
-              json.string("2026-07-28"),
-            ),
-            #("io.modelcontextprotocol/clientCapabilities", json.object([])),
-            #("progressToken", json.int(1)),
-          ]),
-        ),
-      ]),
-    ),
-  ])
-  |> json.to_string()
-  |> bit_array.from_string()
+fn progress_call_envelope(name: String) -> BitArray {
+  envelope_with_meta(
+    "tools/call",
+    True,
+    [#("name", json.string(name)), #("arguments", json.object([]))],
+    "2026-07-28",
+    [#("progressToken", json.int(1))],
+  )
 }
 
 fn burst_progress_server() -> server.Server(process.Subject(ProgressNotice)) {
-  let assert Ok(name) = tool.tool_name("disconnect_probe")
-  let assert Ok(tool) = case
-    tool.definition(name, codec.success(Nil), codec.success(Nil))
-  {
-    Ok(definition) -> {
-      let definition = tool.with_metadata(definition, tool.empty_metadata())
-      Ok({
-        let user_handler = fn(notices, _input, report_progress) {
-          process.send(notices, ProgressBurstStarted(process.self()))
-          report_http_progress_burst(notices, report_progress, 1, 100_000)
-          Ok(Nil)
-        }
-        let advanced_handler = fn(call, typed_input) {
-          let tool.HandlerCallContext(
-            application,
-            _input_responses,
-            report_progress,
-          ) = call
-          user_handler(application, typed_input, report_progress)
-          |> result.map(fn(output) { tool.Complete(output, []) })
-        }
-        tool.handle_advanced_with_error_renderer(
-          definition,
-          advanced_handler,
-          fn(application_error) {
-            case codec.encode_json(codec.success(Nil), application_error) {
-              Ok(text) -> text
-              Error(_) -> "Tool execution failed."
-            }
-          },
-        )
-      })
-    }
-    Error(error) -> Error(error)
-  }
-  let assert Ok(registry) = tool.registry([tool])
-  server.server(registry)
+  let burst =
+    tool.define("disconnect_probe", no_input(), no_input())
+    |> tool.handle_call(fn(call, _input) {
+      let notices = tool.context(call)
+      process.send(notices, ProgressBurstStarted(process.self()))
+      report_progress_burst(call, notices, 1, 100_000)
+      Ok(tool.complete(Nil))
+    })
+  server.new([burst])
 }
 
-fn report_http_progress_burst(
+fn report_progress_burst(
+  call: tool.Call(context),
   notices: process.Subject(ProgressNotice),
-  report_progress: fn(Int) -> Nil,
   current: Int,
   last: Int,
 ) -> Nil {
   case current > last {
     True -> process.send(notices, ProgressBurstFinished)
     False -> {
-      report_progress(current)
-      report_http_progress_burst(notices, report_progress, current + 1, last)
+      tool.report_progress(call, int.to_float(current), None, None)
+      report_progress_burst(call, notices, current + 1, last)
     }
   }
 }
 
-fn worker_exits_within(worker: process.Pid, attempts: Int) -> Bool {
-  case process.is_alive(worker) {
-    False -> True
-    True ->
+// --- server-sent events -------------------------------------------------------
+
+pub fn progress_streams_events_before_the_result_test() {
+  let progress =
+    tool.define("progress", no_input(), no_input())
+    |> tool.handle_call(fn(call, _input) {
+      tool.report_progress(call, 1.0, Some(2.0), Some("half way"))
+      tool.report_progress(call, 2.0, Some(2.0), None)
+      process.sleep(50)
+      Ok(tool.complete(Nil))
+    })
+  let listener = started(http.new(server.new([progress])))
+  let assert Ok(#(200, response_headers, body)) =
+    local_request(
+      http.port(listener),
+      "post",
+      headers_with_name(
+        "tools/call",
+        "progress",
+        "application/json, text/event-stream",
+      ),
+      progress_call_envelope("progress"),
+    )
+  http.stop(listener)
+  list.key_find(response_headers, "content-type")
+  |> should.equal(Ok("text/event-stream"))
+  list.key_find(response_headers, "transfer-encoding")
+  |> should.equal(Ok("chunked"))
+  list.key_find(response_headers, "connection") |> should.equal(Ok("close"))
+  let body = text(body)
+  let events =
+    string.split(body, "\n\n")
+    |> list.filter(fn(event) { event != "" })
+  list.length(events) |> should.equal(3)
+  list.all(events, string.starts_with(_, "data: ")) |> should.be_true
+  let assert [first, second, last] = events
+  string.contains(first, "notifications/progress") |> should.be_true
+  string.contains(first, "half way") |> should.be_true
+  string.contains(second, "notifications/progress") |> should.be_true
+  string.contains(last, "\"result\"") |> should.be_true
+  { index_of(body, "notifications/progress") < index_of(body, "\"result\"") }
+  |> should.be_true
+}
+
+pub fn idle_listen_stream_writes_keepalive_comments_test() {
+  let listener =
+    http.new(echo_server())
+    |> http.with_sse_keepalive(duration.milliseconds(30))
+    |> started
+  let assert Ok(connection) =
+    send_and_hold(
+      http.port(listener),
+      "POST",
+      headers("subscriptions/listen", "text/event-stream"),
+      envelope("subscriptions/listen", True, listen_params()),
+    )
+  let assert Ok(head) =
+    read_until(connection, <<"notifications/subscriptions/acknowledged">>, 2000)
+  string.contains(text(head), "text/event-stream") |> should.be_true
+  let assert Ok(_) = read_until(connection, <<": keepalive\n\n">>, 1000)
+  let assert Ok(_) = read_until(connection, <<": keepalive\n\n">>, 1000)
+  let _ = abort_connection(connection)
+  http.stop(listener)
+}
+
+// --- the mountable handler ----------------------------------------------------
+
+pub fn mounted_handler_answers_mcp_requests_test() {
+  let handler = mounted(http.new(echo_server()))
+
+  let call = http.handle(handler, echo_call("hello"))
+  call.status |> should.equal(200)
+  response.get_header(call, "content-type")
+  |> should.equal(Ok("application/json"))
+  response.get_header(call, "mcp-protocol-version")
+  |> should.equal(Ok("2026-07-28"))
+  let body = testing.body_text(call)
+  string.contains(body, "\"result\"") |> should.be_true
+  string.contains(body, "hello") |> should.be_true
+
+  let listing = http.handle(handler, testing.request("tools/list", []))
+  listing.status |> should.equal(200)
+  string.contains(testing.body_text(listing), "\"echo\"") |> should.be_true
+
+  let notification =
+    http.handle(
+      handler,
+      testing.request("notifications/cancelled", [
+        #("requestId", json.string("unknown")),
+      ]),
+    )
+  notification.status |> should.equal(202)
+  testing.body_text(notification) |> should.equal("")
+}
+
+pub fn mounted_handler_refuses_bad_requests_test() {
+  let handler =
+    mounted(http.new(echo_server()) |> http.with_max_body_bytes(256))
+
+  let get =
+    http.handle(handler, echo_call("x") |> request.set_method(gleam_http.Get))
+  get.status |> should.equal(405)
+  response.get_header(get, "allow") |> should.equal(Ok("POST"))
+
+  let wrong_type =
+    http.handle(
+      handler,
+      echo_call("x") |> request.set_header("content-type", "text/plain"),
+    )
+  wrong_type.status |> should.equal(415)
+
+  let wrong_accept =
+    http.handle(
+      handler,
+      echo_call("x") |> request.set_header("accept", "text/html"),
+    )
+  wrong_accept.status |> should.equal(406)
+
+  let wrong_host =
+    http.handle(handler, echo_call("x") |> request.set_host("evil.example"))
+  wrong_host.status |> should.equal(403)
+
+  let too_large = http.handle(handler, echo_call(string.repeat("x", 300)))
+  too_large.status |> should.equal(413)
+
+  let mismatch =
+    http.handle(
+      handler,
+      echo_call("x") |> request.set_header("mcp-name", "another"),
+    )
+  mismatch.status |> should.equal(400)
+  string.contains(testing.body_text(mismatch), "-32020") |> should.be_true
+
+  // handle cannot stream, so it refuses subscriptions/listen.
+  let listen =
+    http.handle(
+      handler,
+      testing.request("subscriptions/listen", listen_params()),
+    )
+  listen.status |> should.equal(406)
+}
+
+fn nested(depth: Int) -> json.Json {
+  case depth {
+    0 -> json.int(1)
+    _ -> json.preprocessed_array([nested(depth - 1)])
+  }
+}
+
+pub fn mounted_handler_refuses_deep_json_test() {
+  let handler = mounted(http.new(echo_server()))
+  let deep =
+    testing.request("tools/call", [
+      #("name", json.string("echo")),
+      #("arguments", json.object([#("text", nested(70))])),
+    ])
+  let response = http.handle(handler, deep)
+  response.status |> should.equal(400)
+  string.contains(testing.body_text(response), "-32600") |> should.be_true
+
+  // Within the depth limit, the same shape reaches the server.
+  let shallow =
+    testing.request("tools/call", [
+      #("name", json.string("echo")),
+      #("arguments", json.object([#("text", nested(10))])),
+    ])
+  let response = http.handle(handler, shallow)
+  response.status |> should.equal(200)
+  string.contains(testing.body_text(response), "-32602") |> should.be_true
+}
+
+pub fn context_builder_sees_the_request_test() {
+  let invoked = process.new_subject()
+  let whoami =
+    tool.define("whoami", no_input(), codec.string())
+    |> tool.handle_call(fn(call, _input) {
+      process.send(invoked, Nil)
+      Ok(tool.complete("tenant " <> tool.context(call)))
+    })
+  let handler =
+    http.new_with_context(server.new([whoami]), fn(request) {
+      case request.get_header(request, "x-tenant") {
+        Ok(tenant) -> Ok(tenant)
+        Error(Nil) ->
+          Error(
+            response.new(418)
+            |> response.set_header("x-refused", "no-tenant")
+            |> response.set_body(bytes_tree.from_string("no tenant")),
+          )
+      }
+    })
+    |> mounted
+  let call =
+    testing.request("tools/call", [
+      #("name", json.string("whoami")),
+      #("arguments", json.object([])),
+    ])
+
+  let answered =
+    http.handle(handler, request.set_header(call, "x-tenant", "acme"))
+  answered.status |> should.equal(200)
+  string.contains(testing.body_text(answered), "tenant acme") |> should.be_true
+  process.receive(invoked, 1000) |> should.equal(Ok(Nil))
+
+  // The builder's response is returned as is and the server never runs.
+  let refused = http.handle(handler, call)
+  refused.status |> should.equal(418)
+  response.get_header(refused, "x-refused") |> should.equal(Ok("no-tenant"))
+  testing.body_text(refused) |> should.equal("no tenant")
+  process.receive(invoked, 100) |> should.equal(Error(Nil))
+}
+
+// --- request and stream caps --------------------------------------------------
+
+fn gated_tool(
+  entered: process.Subject(process.Subject(Nil)),
+) -> tool.Tool(context) {
+  tool.define("gated", no_input(), no_input())
+  |> tool.handle_call(fn(call, _input) {
+    let release = process.new_subject()
+    process.send(entered, release)
+    let _ =
+      process.new_selector()
+      |> process.select(release)
+      |> process.merge_selector(tool.cancelled(call))
+      |> process.selector_receive(5000)
+    Ok(tool.complete(Nil))
+  })
+}
+
+pub fn requests_beyond_the_concurrency_cap_get_503_test() {
+  let entered = process.new_subject()
+  let handler =
+    http.new(server.new([gated_tool(entered)]))
+    |> http.with_max_concurrent_requests(1)
+    |> mounted
+  let #(rejected, attachment) = observe_rejections()
+  let results = process.new_subject()
+  let gated =
+    testing.request("tools/call", [
+      #("name", json.string("gated")),
+      #("arguments", json.object([])),
+    ])
+  process.spawn(fn() { process.send(results, http.handle(handler, gated)) })
+  let assert Ok(release) = process.receive(entered, 1000)
+
+  let busy = http.handle(handler, testing.request("tools/list", []))
+  busy.status |> should.equal(503)
+  response.get_header(busy, "retry-after") |> should.equal(Ok("1"))
+  let meta = receive_rejection(rejected, telemetry.TooManyRequests)
+  meta.status |> should.equal(503)
+  let assert Ok(Nil) = sinal.detach(attachment)
+
+  // The slot is released when the first request ends.
+  process.send(release, Nil)
+  let assert Ok(first) = process.receive(results, 2000)
+  first.status |> should.equal(200)
+  let later = http.handle(handler, testing.request("tools/list", []))
+  later.status |> should.equal(200)
+}
+
+fn listen_eventually(
+  peer: client.Client,
+  attempts: Int,
+) -> Result(client.Subscription, client.Error) {
+  case client.listen(peer, [subscriptions.ToolsListChanged]) {
+    Ok(subscription) -> Ok(subscription)
+    Error(error) ->
       case attempts <= 0 {
-        True -> False
+        True -> Error(error)
         False -> {
-          process.sleep(10)
-          worker_exits_within(worker, attempts - 1)
+          process.sleep(20)
+          listen_eventually(peer, attempts - 1)
         }
       }
   }
+}
+
+pub fn listen_streams_beyond_the_cap_get_503_test() {
+  let listener =
+    http.new(echo_server())
+    |> http.with_max_listen_streams(1)
+    |> http.with_sse_keepalive(duration.milliseconds(20))
+    |> started
+  let peer = connect(listener)
+  let #(rejected, attachment) = observe_rejections()
+  let assert Ok(first) = client.listen(peer, [subscriptions.ToolsListChanged])
+
+  let assert Error(client.HttpStatus(503, _)) =
+    client.listen(peer, [subscriptions.ToolsListChanged])
+  let meta = receive_rejection(rejected, telemetry.TooManyStreams)
+  meta.status |> should.equal(503)
+  let assert Ok(Nil) = sinal.detach(attachment)
+
+  // Ordinary requests still run while the stream is open.
+  let assert Ok(client.Succeeded("still served", _)) =
+    client.call(peer, echo_definition(), "still served")
+
+  // Closing the stream frees its slot once the next keepalive fails.
+  client.close_subscription(first)
+  let assert Ok(second) = listen_eventually(peer, 50)
+  client.close_subscription(second)
+  client.close(peer)
+  http.stop(listener)
+}
+
+// --- mounting in an application's mist server ---------------------------------
+
+pub fn mist_handler_serves_mcp_with_streaming_test() {
+  let readme =
+    resources.static("memo://readme", "Readme", fn(_context, uri) {
+      Ok([content.text_resource(uri, "Hello")])
+    })
+  let handler =
+    http.new(echo_server() |> server.with_resources([readme])) |> mounted
+  let ports = process.new_subject()
+  let assert Ok(application) =
+    mist.new(http.mist_handler(handler))
+    |> mist.bind("127.0.0.1")
+    |> mist.port(0)
+    |> mist.after_start(fn(port, _scheme, _interface) {
+      process.send(ports, port)
+    })
+    |> mist.start
+  let assert Ok(port) = process.receive(ports, 2000)
+  let peer = connect_port(port)
+
+  let assert Ok(discovery) = client.discover(peer)
+  discovery.supported_versions |> list.contains("2026-07-28") |> should.be_true
+  let assert Ok(client.Succeeded("mounted", _)) =
+    client.call(peer, echo_definition(), "mounted")
+
+  let assert Ok(subscription) =
+    client.listen(peer, [subscriptions.ResourceUpdated("memo://readme")])
+  http.notify(handler, subscriptions.ResourceUpdated("memo://readme"))
+  client.next_notification(subscription, duration.seconds(2))
+  |> should.equal(Ok(Some(subscriptions.ResourceUpdated("memo://readme"))))
+  client.close_subscription(subscription)
+  client.close(peer)
+  process.unlink(application.pid)
+  stop_supervisor(application.pid)
+  http.stop(handler)
+}
+
+// --- dynamic registration -----------------------------------------------------
+
+fn tool_names(peer: client.Client) -> List(String) {
+  let assert Ok(declarations) = client.list_tools(peer)
+  list.map(declarations, fn(declaration) { declaration.name })
+}
+
+pub fn registration_changes_listings_and_notifies_streams_test() {
+  let readme =
+    resources.static("memo://readme", "Readme", fn(_context, uri) {
+      Ok([content.text_resource(uri, "Hello")])
+    })
+  let listener =
+    http.new(echo_server() |> server.with_resources([readme])) |> started
+  let peer = connect(listener)
+  let assert Ok(subscription) =
+    client.listen(peer, [
+      subscriptions.ToolsListChanged,
+      subscriptions.ResourceUpdated("memo://readme"),
+    ])
+  let extra =
+    tool.define("extra", no_input(), no_input())
+    |> tool.handle(fn(_) { Ok(Nil) })
+
+  http.register_tool(listener, extra) |> should.equal(Ok(Nil))
+  http.register_tool(listener, extra)
+  |> should.equal(Error(server.DuplicateTool("extra")))
+  client.next_notification(subscription, duration.seconds(2))
+  |> should.equal(Ok(Some(subscriptions.ToolsListChanged)))
+  tool_names(peer) |> should.equal(["echo", "extra"])
+
+  http.unregister_tool(listener, "extra") |> should.be_true
+  http.unregister_tool(listener, "extra") |> should.be_false
+  client.next_notification(subscription, duration.seconds(2))
+  |> should.equal(Ok(Some(subscriptions.ToolsListChanged)))
+  tool_names(peer) |> should.equal(["echo"])
+
+  http.notify(listener, subscriptions.ResourceUpdated("memo://readme"))
+  client.next_notification(subscription, duration.seconds(2))
+  |> should.equal(Ok(Some(subscriptions.ResourceUpdated("memo://readme"))))
+  client.next_notification(subscription, duration.milliseconds(50))
+  |> should.equal(Ok(None))
+
+  client.close_subscription(subscription)
+  client.close(peer)
+  http.stop(listener)
+}
+
+pub fn mounted_handler_sees_registered_tools_test() {
+  let handler = mounted(http.new(empty_server()))
+  let assert Ok(Nil) = http.register_tool(handler, echo_tool())
+  let call = http.handle(handler, echo_call("registered"))
+  string.contains(testing.body_text(call), "registered") |> should.be_true
+  http.unregister_tool(handler, "echo") |> should.be_true
+  let gone = http.handle(handler, echo_call("registered"))
+  string.contains(testing.body_text(gone), "-32602") |> should.be_true
 }

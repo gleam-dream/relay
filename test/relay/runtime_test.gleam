@@ -2,28 +2,39 @@ import gleam/bit_array
 import gleam/dict
 import gleam/dynamic
 import gleam/dynamic/decode
-import gleam/erlang/process
+import gleam/erlang/process.{type Pid, type Subject}
+import gleam/int
 import gleam/json
-import gleam/option.{Some}
-import gleam/result
+import gleam/list
+import gleam/option.{type Option, None, Some}
+import gleam/otp/static_supervisor
 import gleam/string
-import gleeunit
+import gleam/time/duration
 import gleeunit/should
-import json/blueprint/codec
-import relay/runtime.{RuntimeConfig}
+import json/blueprint/codec.{type Codec}
+import json/blueprint/value
+import relay/reducer.{type ExchangeId}
+import relay/runtime
 import relay/server
+import relay/subscriptions
 import relay/telemetry
-import relay/test_codec
 import relay/tool
 import sinal
+import sinal/correlation
 
 type ProgressBurstNotice {
   ProgressBurstFinished
 }
 
 type SinkGateMessage {
-  DecideToHold(process.Subject(Bool))
-  StopSinkGate(process.Subject(Nil))
+  DecideToHold(Subject(Bool))
+  StopSinkGate(Subject(Nil))
+}
+
+/// What a probe handler reports to the test that called it.
+type Probe {
+  HandlerStarted(pid: Pid)
+  HandlerSawCancel
 }
 
 @external(erlang, "erlang", "self")
@@ -32,77 +43,362 @@ fn ffi_self() -> dynamic.Dynamic
 @external(erlang, "relay_ffi", "mailbox_size")
 fn ffi_mailbox_size(pid: dynamic.Dynamic) -> Int
 
-pub fn main() -> Nil {
-  gleeunit.main()
+@external(erlang, "relay_ffi", "monotonic_time_ms")
+fn monotonic_ms() -> Int
+
+// --- servers -----------------------------------------------------------------
+
+fn property(name: String, inner: Codec(a)) -> Codec(a) {
+  use value <- codec.field(name, inner, get: fn(value) { value })
+  codec.success(value)
 }
 
-fn send_output_to(
-  subject: process.Subject(BitArray),
-  output: runtime.RuntimeOutput,
-) -> Result(Nil, Nil) {
-  case output {
-    runtime.OutputWrite(_, bytes) -> process.send(subject, bytes)
-    runtime.OutputClose(_) -> Nil
+fn greeting() -> Codec(String) {
+  property("greeting", codec.string())
+}
+
+fn greet_tool() -> tool.Tool(String) {
+  tool.define("greet", property("name", codec.string()), greeting())
+  |> tool.with_description("Greets a user")
+  |> tool.handle_call(fn(call, user) {
+    Ok(tool.complete(tool.context(call) <> ": hello " <> user))
+  })
+}
+
+fn crash_tool() -> tool.Tool(String) {
+  tool.define("crash", property("name", codec.string()), greeting())
+  |> tool.with_description("Always crashes")
+  |> tool.handle(fn(_user: String) -> Result(String, Nil) {
+    panic as "Deliberate handler crash: secret-token-7B3F"
+  })
+}
+
+fn slow_tool() -> tool.Tool(String) {
+  tool.define("slow", property("ms", codec.int()), greeting())
+  |> tool.with_description("Slow handler")
+  |> tool.handle(fn(ms: Int) -> Result(String, Nil) {
+    process.sleep(ms)
+    Ok("finished slow")
+  })
+}
+
+fn fail_tool() -> tool.Tool(String) {
+  tool.define("fail", property("name", codec.string()), greeting())
+  |> tool.handle(fn(_user: String) -> Result(String, String) {
+    Error("private failure")
+  })
+}
+
+fn ask_tool() -> tool.Tool(String) {
+  tool.define("ask", property("name", codec.string()), greeting())
+  |> tool.handle_call(fn(_call, _user) {
+    Ok(
+      tool.request_input(
+        dict.from_list([
+          #("confirm", tool.InputRequest(tool.Elicitation, value.Object([]))),
+        ]),
+      ),
+    )
+  })
+}
+
+fn extra_tool() -> tool.Tool(String) {
+  tool.define("extra", codec.success(Nil), greeting())
+  |> tool.handle(fn(_input: Nil) -> Result(String, Nil) { Ok("extra ran") })
+}
+
+fn sample_server() -> server.Server(String) {
+  server.new([greet_tool(), crash_tool(), slow_tool(), fail_tool(), ask_tool()])
+}
+
+/// A handler that reports its pid, waits for its cancellation selector,
+/// reports that it saw it, and then keeps running regardless.
+fn stubborn_tool() -> tool.Tool(Subject(Probe)) {
+  tool.define("stubborn", codec.success(Nil), codec.success(Nil))
+  |> tool.handle_call(fn(call, _input) {
+    let probe = tool.context(call)
+    process.send(probe, HandlerStarted(process.self()))
+    case process.selector_receive(tool.cancelled(call), 10_000) {
+      Ok(Nil) -> process.send(probe, HandlerSawCancel)
+      Error(Nil) -> Nil
+    }
+    process.sleep(10_000)
+    Ok(tool.complete(Nil))
+  })
+}
+
+fn probe_server() -> server.Server(Subject(Probe)) {
+  server.new([stubborn_tool()])
+}
+
+// --- frames ------------------------------------------------------------------
+
+fn request_meta(extra: List(#(String, json.Json))) -> #(String, json.Json) {
+  #(
+    "_meta",
+    json.object([
+      #("io.modelcontextprotocol/protocolVersion", json.string("2026-07-28")),
+      #("io.modelcontextprotocol/clientCapabilities", json.object([])),
+      ..extra
+    ]),
+  )
+}
+
+fn request_frame(
+  id: String,
+  method: String,
+  params: List(#(String, json.Json)),
+  extra_meta: List(#(String, json.Json)),
+) -> BitArray {
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("id", json.string(id)),
+    #("method", json.string(method)),
+    #("params", json.object([request_meta(extra_meta), ..params])),
+  ])
+  |> json.to_string()
+  |> bit_array.from_string()
+}
+
+fn discover_frame(id: String) -> BitArray {
+  request_frame(id, "server/discover", [], [])
+}
+
+fn call_frame(id: String, tool_name: String, args: json.Json) -> BitArray {
+  request_frame(
+    id,
+    "tools/call",
+    [#("name", json.string(tool_name)), #("arguments", args)],
+    [],
+  )
+}
+
+fn greet_frame(id: String, name: String) -> BitArray {
+  call_frame(id, "greet", json.object([#("name", json.string(name))]))
+}
+
+fn slow_frame(id: String, ms: Int) -> BitArray {
+  call_frame(id, "slow", json.object([#("ms", json.int(ms))]))
+}
+
+fn listen_frame(id: String) -> BitArray {
+  request_frame(
+    id,
+    "subscriptions/listen",
+    [#("notifications", json.object([#("toolsListChanged", json.bool(True))]))],
+    [],
+  )
+}
+
+fn cancel_frame(request_id: String) -> BitArray {
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("method", json.string("notifications/cancelled")),
+    #("params", json.object([#("requestId", json.string(request_id))])),
+  ])
+  |> json.to_string()
+  |> bit_array.from_string()
+}
+
+fn nested(depth: Int) -> json.Json {
+  case depth {
+    0 -> json.string("leaf")
+    _ -> json.object([#("a", nested(depth - 1))])
   }
-  Ok(Nil)
 }
 
-pub fn invalid_runtime_config_reports_field_before_start_test() {
-  let config = RuntimeConfig(..runtime.default_config(), max_frame_bytes: 0)
-  runtime.validate_config(config)
-  |> should.equal(
-    Error(runtime.InvalidRuntimeSetting(runtime.MaxFrameBytes, 0)),
-  )
-  runtime.start(sample_server(), config, fn(_output) { Ok(Nil) })
-  |> should.equal(
-    Error(
-      runtime.InvalidRuntimeConfig(runtime.InvalidRuntimeSetting(
-        runtime.MaxFrameBytes,
-        0,
-      )),
-    ),
-  )
-}
+// --- helpers -----------------------------------------------------------------
 
-pub fn closing_one_runtime_exchange_preserves_other_exchange_test() {
+fn start_collecting(
+  srv: server.Server(context),
+  config: runtime.Config,
+) -> #(runtime.Runtime(context), Subject(runtime.Output)) {
   let outputs = process.new_subject()
   let assert Ok(rt) =
-    runtime.start(sample_server(), runtime.default_config(), fn(output) {
+    runtime.start(srv, config, fn(output) {
       process.send(outputs, output)
       Ok(Nil)
     })
-  let closing = server.fresh_exchange()
-  let survivor = server.fresh_exchange()
-  let slow =
-    make_call_frame("slow-close", "slow", json.object([#("ms", json.int(500))]))
-  let greet =
-    make_call_frame(
-      "survivor",
-      "greet",
-      json.object([#("name", json.string("Other"))]),
-    )
-  let assert Ok(Nil) = runtime.send_frame(rt, closing, "ctx", slow, 1000)
-  runtime.exchange_closed(rt, closing)
-  let assert Ok(Nil) = runtime.send_frame(rt, survivor, "ctx", greet, 1000)
+  #(rt, outputs)
+}
 
-  let assert Ok(runtime.OutputClose(closed)) = process.receive(outputs, 1000)
-  closed |> should.equal(closing)
+fn expect_write(
+  outputs: Subject(runtime.Output),
+  exchange: ExchangeId,
+) -> String {
   let assert Ok(runtime.OutputWrite(written, bytes)) =
     process.receive(outputs, 1000)
-  written |> should.equal(survivor)
+  written |> should.equal(exchange)
   let assert Ok(text) = bit_array.to_string(bytes)
-  string.contains(text, "Other") |> should.be_true
-  let assert Ok(runtime.OutputClose(completed)) = process.receive(outputs, 1000)
-  completed |> should.equal(survivor)
-  runtime.stop(rt, 1000)
+  text
+}
+
+fn expect_close(outputs: Subject(runtime.Output), exchange: ExchangeId) -> Nil {
+  let assert Ok(runtime.OutputClose(closed)) = process.receive(outputs, 1000)
+  closed |> should.equal(exchange)
+}
+
+fn expect_silence(outputs: Subject(runtime.Output), ms: Int) -> Nil {
+  process.receive(outputs, ms) |> should.equal(Error(Nil))
+}
+
+fn error_code(text: String) -> Int {
+  let assert Ok(code) =
+    json.parse(text, decode.at(["error", "code"], decode.int))
+  code
+}
+
+fn structured_greeting(text: String) -> String {
+  let assert Ok(greeting) =
+    json.parse(
+      text,
+      decode.at(["result", "structuredContent", "greeting"], decode.string),
+    )
+  greeting
+}
+
+fn has_result(text: String) -> Bool {
+  case json.parse(text, decode.at(["result"], decode.dynamic)) {
+    Ok(_) -> True
+    Error(_) -> False
+  }
+}
+
+/// Forwards every event whose `listener` equals `label` to the returned
+/// subject, so concurrent emitters elsewhere cannot interfere.
+fn capture(
+  event: sinal.Event(m, d),
+  label: String,
+  listener: fn(d) -> Option(String),
+) -> #(sinal.Attachment, Subject(#(m, d))) {
+  let events = process.new_subject()
+  let attachment =
+    sinal.observe(event, fn(measured, meta) {
+      case listener(meta) == Some(label) {
+        True -> process.send(events, #(measured, meta))
+        False -> Nil
+      }
+    })
+  #(attachment, events)
+}
+
+fn expect_event(events: Subject(#(m, d))) -> d {
+  let assert Ok(#(_, meta)) = process.receive(events, 1000)
+  meta
+}
+
+fn wait_down(monitor: process.Monitor, within: Int) -> process.ExitReason {
+  let assert Ok(process.ProcessDown(reason: reason, ..)) =
+    process.new_selector()
+    |> process.select_specific_monitor(monitor, fn(down) { down })
+    |> process.selector_receive(within)
+  reason
+}
+
+fn ms(count: Int) -> duration.Duration {
+  duration.milliseconds(count)
+}
+
+// --- configuration -----------------------------------------------------------
+
+pub fn invalid_runtime_config_reports_field_before_start_test() {
+  let config = runtime.config() |> runtime.with_max_frame_bytes(0)
+  runtime.validate(config)
+  |> should.equal(Error(runtime.InvalidConfig(runtime.MaxFrameBytes)))
+  let assert Error(runtime.InvalidConfig(runtime.MaxFrameBytes)) =
+    runtime.start(sample_server(), config, fn(_output) { Ok(Nil) })
+  Nil
+}
+
+pub fn validate_rejects_each_out_of_range_setting_test() {
+  let base = runtime.config()
+  [
+    #(runtime.with_max_live_exchanges(base, 0), runtime.MaxLiveExchanges),
+    #(runtime.with_max_live_exchanges(base, -1), runtime.MaxLiveExchanges),
+    #(runtime.with_max_frame_bytes(base, 0), runtime.MaxFrameBytes),
+    #(runtime.with_max_json_depth(base, 0), runtime.MaxJsonDepth),
+    #(runtime.with_invocation_timeout(base, ms(0)), runtime.InvocationTimeout),
+    #(runtime.with_cancellation_grace(base, ms(-1)), runtime.CancellationGrace),
+    #(runtime.with_tombstone_retention(base, ms(0)), runtime.TombstoneRetention),
+    #(runtime.with_max_tombstones(base, 0), runtime.MaxTombstones),
+  ]
+  |> list.each(fn(case_) {
+    let #(config, field) = case_
+    runtime.validate(config)
+    |> should.equal(Error(runtime.InvalidConfig(field)))
+  })
+  // A zero grace period is allowed: the handler is killed at once.
+  let assert Ok(_) =
+    runtime.validate(runtime.with_cancellation_grace(base, ms(0)))
+  let assert Ok(_) = runtime.validate(base)
+  runtime.describe_start_error(runtime.InvalidConfig(runtime.MaxJsonDepth))
+  |> string.contains("max_json_depth")
+  |> should.be_true
+}
+
+pub fn config_defaults_test() {
+  runtime.max_frame_bytes(runtime.config()) |> should.equal(1_048_576)
+  runtime.invocation_timeout(runtime.config())
+  |> duration.to_milliseconds
+  |> should.equal(30_000)
+  runtime.config()
+  |> runtime.with_max_frame_bytes(2048)
+  |> runtime.max_frame_bytes
+  |> should.equal(2048)
+}
+
+// --- exchanges ---------------------------------------------------------------
+
+pub fn runtime_lifecycle_test() {
+  let #(rt, outputs) = start_collecting(sample_server(), runtime.config())
+
+  let ex1 = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, ex1, "test_ctx", discover_frame("disc-1"), None)
+  expect_write(outputs, ex1) |> has_result |> should.be_true
+  expect_close(outputs, ex1)
+
+  let ex2 = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, ex2, "my_ctx", greet_frame("call-1", "Alice"), None)
+  expect_write(outputs, ex2)
+  |> structured_greeting
+  |> should.equal("my_ctx: hello Alice")
+  expect_close(outputs, ex2)
+
+  runtime.stop(rt)
+}
+
+pub fn closing_one_runtime_exchange_preserves_other_exchange_test() {
+  let #(rt, outputs) = start_collecting(sample_server(), runtime.config())
+  let closing = reducer.new_exchange_id()
+  let survivor = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, closing, "ctx", slow_frame("slow-close", 500), None)
+  runtime.exchange_closed(rt, closing)
+  let assert Ok(Nil) =
+    runtime.send_frame(
+      rt,
+      survivor,
+      "ctx",
+      greet_frame("survivor", "Other"),
+      None,
+    )
+
+  expect_close(outputs, closing)
+  expect_write(outputs, survivor)
+  |> string.contains("Other")
+  |> should.be_true
+  expect_close(outputs, survivor)
+  runtime.stop(rt)
 }
 
 pub fn failed_output_closes_only_its_exchange_test() {
-  let failed = server.fresh_exchange()
-  let survivor = server.fresh_exchange()
+  let failed = reducer.new_exchange_id()
+  let survivor = reducer.new_exchange_id()
   let outputs = process.new_subject()
   let assert Ok(rt) =
-    runtime.start(sample_server(), runtime.default_config(), fn(output) {
+    runtime.start(sample_server(), runtime.config(), fn(output) {
       case output {
         runtime.OutputWrite(exchange, _) if exchange == failed -> Error(Nil)
         _ -> {
@@ -112,575 +408,661 @@ pub fn failed_output_closes_only_its_exchange_test() {
       }
     })
   let assert Ok(Nil) =
-    runtime.send_frame(rt, failed, "ctx", make_discover_frame("failed"), 1000)
+    runtime.send_frame(rt, failed, "ctx", discover_frame("failed"), None)
   let assert Ok(Nil) =
-    runtime.send_frame(
-      rt,
-      survivor,
-      "ctx",
-      make_discover_frame("survivor"),
-      1000,
-    )
-  let assert Ok(runtime.OutputClose(closed)) = process.receive(outputs, 1000)
-  closed |> should.equal(failed)
-  let assert Ok(runtime.OutputWrite(written, _)) =
-    process.receive(outputs, 1000)
-  written |> should.equal(survivor)
-  let assert Ok(runtime.OutputClose(completed)) = process.receive(outputs, 1000)
-  completed |> should.equal(survivor)
-  runtime.stop(rt, 1000)
-}
-
-fn sample_server() -> server.Server(String) {
-  let assert Ok(greet_name) = tool.tool_name("greet")
-  let assert Ok(greet_tool) = case
-    tool.definition(
-      greet_name,
-      test_codec.property("name", codec.string()),
-      codec.string(),
-    )
-  {
-    Ok(definition) -> {
-      let definition =
-        tool.with_metadata(
-          definition,
-          tool.ToolMetadata(
-            ..tool.empty_metadata(),
-            description: Some("Greets a user"),
-          ),
-        )
-      Ok({
-        let user_handler = fn(ctx: String, user: String) {
-          Ok(ctx <> ": hello " <> user)
-        }
-        tool.handle_advanced_with_error_renderer(
-          definition,
-          fn(call, typed_input) {
-            let tool.HandlerCallContext(
-              application,
-              _input_responses,
-              _report_progress,
-            ) = call
-            case user_handler(application, typed_input) {
-              Ok(output) -> Ok(tool.Complete(output, []))
-            }
-          },
-          fn(application_error) {
-            case codec.encode_json(codec.success(Nil), application_error) {
-              Ok(text) -> text
-              Error(_) -> "Tool execution failed."
-            }
-          },
-        )
-      })
-    }
-    Error(error) -> Error(error)
-  }
-
-  let assert Ok(crash_name) = tool.tool_name("crash")
-  let assert Ok(crash_tool) = case
-    tool.definition(
-      crash_name,
-      test_codec.property("name", codec.string()),
-      codec.string(),
-    )
-  {
-    Ok(definition) -> {
-      let definition =
-        tool.with_metadata(
-          definition,
-          tool.ToolMetadata(
-            ..tool.empty_metadata(),
-            description: Some("Always crashes"),
-          ),
-        )
-      Ok(
-        tool.handle_with_error_renderer(
-          definition,
-          fn(_user: String) {
-            panic as "Deliberate handler crash: secret-token-7B3F"
-          },
-          fn(application_error) {
-            case codec.encode_json(codec.success(Nil), application_error) {
-              Ok(text) -> text
-              Error(_) -> "Tool execution failed."
-            }
-          },
-        ),
-      )
-    }
-    Error(error) -> Error(error)
-  }
-
-  let assert Ok(slow_name) = tool.tool_name("slow")
-  let assert Ok(slow_tool) = case
-    tool.definition(
-      slow_name,
-      test_codec.property("ms", codec.int()),
-      codec.string(),
-    )
-  {
-    Ok(definition) -> {
-      let definition =
-        tool.with_metadata(
-          definition,
-          tool.ToolMetadata(
-            ..tool.empty_metadata(),
-            description: Some("Slow handler"),
-          ),
-        )
-      Ok(
-        tool.handle_with_error_renderer(
-          definition,
-          fn(ms: Int) {
-            process.sleep(ms)
-            Ok("finished slow")
-          },
-          fn(application_error) {
-            case codec.encode_json(codec.success(Nil), application_error) {
-              Ok(text) -> text
-              Error(_) -> "Tool execution failed."
-            }
-          },
-        ),
-      )
-    }
-    Error(error) -> Error(error)
-  }
-
-  let assert Ok(reg) = tool.registry([greet_tool, crash_tool, slow_tool])
-  server.server(reg)
-}
-
-fn make_discover_frame(id: String) -> BitArray {
-  json.object([
-    #("jsonrpc", json.string("2.0")),
-    #("id", json.string(id)),
-    #("method", json.string("server/discover")),
-    #(
-      "params",
-      json.object([
-        #(
-          "_meta",
-          json.object([
-            #(
-              "io.modelcontextprotocol/protocolVersion",
-              json.string("2026-07-28"),
-            ),
-            #("io.modelcontextprotocol/clientCapabilities", json.object([])),
-          ]),
-        ),
-      ]),
-    ),
-  ])
-  |> json.to_string()
-  |> bit_array.from_string()
-}
-
-fn make_call_frame(id: String, tool_name: String, args: json.Json) -> BitArray {
-  json.object([
-    #("jsonrpc", json.string("2.0")),
-    #("id", json.string(id)),
-    #("method", json.string("tools/call")),
-    #(
-      "params",
-      json.object([
-        #(
-          "_meta",
-          json.object([
-            #(
-              "io.modelcontextprotocol/protocolVersion",
-              json.string("2026-07-28"),
-            ),
-            #("io.modelcontextprotocol/clientCapabilities", json.object([])),
-          ]),
-        ),
-        #("name", json.string(tool_name)),
-        #("arguments", args),
-      ]),
-    ),
-  ])
-  |> json.to_string()
-  |> bit_array.from_string()
-}
-
-pub fn runtime_lifecycle_test() {
-  let s = sample_server()
-  let sink_subj = process.new_subject()
-  let config = runtime.default_config()
-
-  let assert Ok(rt) =
-    runtime.start(s, config, fn(output) { send_output_to(sink_subj, output) })
-
-  // 1. Discover
-  let ex1 = server.fresh_exchange()
-  let assert Ok(Nil) =
-    runtime.send_frame(rt, ex1, "test_ctx", make_discover_frame("disc-1"), 1000)
-
-  let assert Ok(out1) = process.receive(sink_subj, 1000)
-  let assert Ok(str1) = bit_array.to_string(out1)
-  let assert Ok(json1) = json.parse(str1, decode.dynamic)
-  let assert Ok(dict1) =
-    decode.run(json1, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(_) = dict.get(dict1, "result")
-
-  // 2. Tools call
-  let ex2 = server.fresh_exchange()
-  let call_frame =
-    make_call_frame(
-      "call-1",
-      "greet",
-      json.object([#("name", json.string("Alice"))]),
-    )
-  let assert Ok(Nil) = runtime.send_frame(rt, ex2, "my_ctx", call_frame, 1000)
-
-  let assert Ok(out2) = process.receive(sink_subj, 1000)
-  let assert Ok(str2) = bit_array.to_string(out2)
-  let assert Ok(json2) = json.parse(str2, decode.dynamic)
-  let assert Ok(dict2) =
-    decode.run(json2, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(res2_dyn) = dict.get(dict2, "result")
-  let assert Ok(res2_dict) =
-    decode.run(res2_dyn, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(struct_content) = dict.get(res2_dict, "structuredContent")
-  let assert Ok(content_str) = decode.run(struct_content, decode.string)
-  content_str |> should.equal("my_ctx: hello Alice")
-
-  runtime.stop(rt, 1000)
+    runtime.send_frame(rt, survivor, "ctx", discover_frame("survivor"), None)
+  expect_close(outputs, failed)
+  let _ = expect_write(outputs, survivor)
+  expect_close(outputs, survivor)
+  runtime.stop(rt)
 }
 
 pub fn duplicate_exchange_does_not_consume_live_capacity_test() {
-  let config = RuntimeConfig(..runtime.default_config(), max_live_exchanges: 1)
-  let output = process.new_subject()
-  let assert Ok(rt) =
-    runtime.start(sample_server(), config, fn(item) {
-      send_output_to(output, item)
-    })
-  let duplicate = server.fresh_exchange()
-  let request = make_discover_frame("duplicate")
+  let config = runtime.config() |> runtime.with_max_live_exchanges(1)
+  let #(rt, outputs) = start_collecting(sample_server(), config)
+  let duplicate = reducer.new_exchange_id()
+  let request = discover_frame("duplicate")
 
-  let assert Ok(Nil) = runtime.send_frame(rt, duplicate, "ctx", request, 1000)
-  let assert Ok(_) = process.receive(output, 1000)
-  let assert Ok(Nil) = runtime.send_frame(rt, duplicate, "ctx", request, 1000)
+  let assert Ok(Nil) = runtime.send_frame(rt, duplicate, "ctx", request, None)
+  let _ = expect_write(outputs, duplicate)
+  expect_close(outputs, duplicate)
+  // A frame on an exchange the runtime already saw is dropped silently.
+  let assert Ok(Nil) = runtime.send_frame(rt, duplicate, "ctx", request, None)
+  let fresh = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, fresh, "ctx", discover_frame("fresh"), None)
+  let _ = expect_write(outputs, fresh)
+  expect_close(outputs, fresh)
+
+  runtime.stop(rt)
+}
+
+pub fn runtime_equal_wire_ids_on_distinct_exchanges_test() {
+  let #(rt, outputs) = start_collecting(sample_server(), runtime.config())
+  let ex1 = reducer.new_exchange_id()
+  let ex2 = reducer.new_exchange_id()
+
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, ex1, "ctx1", greet_frame("same-id", "User1"), None)
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, ex2, "ctx2", greet_frame("same-id", "User2"), None)
+
+  let written =
+    [
+      process.receive(outputs, 1000),
+      process.receive(outputs, 1000),
+      process.receive(outputs, 1000),
+      process.receive(outputs, 1000),
+    ]
+    |> list.filter_map(fn(output) {
+      case output {
+        Ok(runtime.OutputWrite(exchange, bytes)) -> {
+          let assert Ok(text) = bit_array.to_string(bytes)
+          Ok(#(exchange, structured_greeting(text)))
+        }
+        _ -> Error(Nil)
+      }
+    })
+  list.sort(written, fn(a, b) { string.compare(a.1, b.1) })
+  |> should.equal([#(ex1, "ctx1: hello User1"), #(ex2, "ctx2: hello User2")])
+
+  runtime.stop(rt)
+}
+
+pub fn runtime_repeated_close_test() {
+  let #(rt, _outputs) = start_collecting(sample_server(), runtime.config())
+
+  runtime.close(rt)
+  runtime.close(rt)
+  runtime.close(rt)
+
+  runtime.send_frame(
+    rt,
+    reducer.new_exchange_id(),
+    "ctx",
+    discover_frame("1"),
+    None,
+  )
+  |> should.equal(Error(runtime.RuntimeStopped))
+
+  runtime.stop(rt)
+}
+
+// --- frame admission ---------------------------------------------------------
+
+pub fn runtime_frame_bound_test() {
+  let label = "frame-bound"
+  let #(attachment, rejected) =
+    capture(telemetry.frame_rejected_event(), label, fn(m) { m.listener })
+  let config =
+    runtime.config()
+    |> runtime.with_max_frame_bytes(20)
+    |> runtime.with_label(label)
+  let #(rt, _outputs) = start_collecting(sample_server(), config)
+
+  let exchange = reducer.new_exchange_id()
+  let frame = discover_frame("large-1")
+  runtime.send_frame(rt, exchange, "ctx", frame, None)
+  |> should.equal(Error(runtime.FrameTooLarge(bit_array.byte_size(frame), 20)))
+  expect_event(rejected)
+  |> should.equal(telemetry.FrameRejectedMeta(
+    exchange_id: reducer.exchange_id_to_int(exchange),
+    problem: telemetry.FrameTooLarge,
+    listener: Some(label),
+  ))
+
+  runtime.stop(rt)
+  let assert Ok(Nil) = sinal.detach(attachment)
+}
+
+pub fn frame_deeper_than_max_json_depth_is_rejected_test() {
+  let label = "frame-depth"
+  let #(attachment, rejected) =
+    capture(telemetry.frame_rejected_event(), label, fn(m) { m.listener })
+  let config =
+    runtime.config()
+    |> runtime.with_max_json_depth(8)
+    |> runtime.with_label(label)
+  let #(rt, outputs) = start_collecting(sample_server(), config)
+
+  let deep = reducer.new_exchange_id()
+  let frame =
+    call_frame(
+      "deep",
+      "greet",
+      json.object([#("name", json.string("x")), #("deep", nested(10))]),
+    )
+  runtime.send_frame(rt, deep, "ctx", frame, None)
+  |> should.equal(Error(runtime.FrameTooDeep(8)))
+  expect_event(rejected)
+  |> should.equal(telemetry.FrameRejectedMeta(
+    exchange_id: reducer.exchange_id_to_int(deep),
+    problem: telemetry.NestingTooDeep,
+    listener: Some(label),
+  ))
+  // Nothing reached the sink for the refused frame.
+  expect_silence(outputs, 20)
+
+  // A frame within the limit (discover nests four levels) is admitted.
+  let shallow = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, shallow, "ctx", discover_frame("shallow"), None)
+  expect_write(outputs, shallow) |> has_result |> should.be_true
+
+  runtime.stop(rt)
+  let assert Ok(Nil) = sinal.detach(attachment)
+}
+
+pub fn default_max_json_depth_is_64_test() {
+  let #(rt, outputs) = start_collecting(sample_server(), runtime.config())
+  let frame =
+    call_frame(
+      "deep",
+      "greet",
+      json.object([#("name", json.string("x")), #("deep", nested(70))]),
+    )
+  runtime.send_frame(rt, reducer.new_exchange_id(), "ctx", frame, None)
+  |> should.equal(Error(runtime.FrameTooDeep(64)))
+  expect_silence(outputs, 20)
+  runtime.stop(rt)
+}
+
+pub fn too_many_live_exchanges_is_rejected_test() {
+  let label = "live-exchanges"
+  let #(attachment, rejected) =
+    capture(telemetry.frame_rejected_event(), label, fn(m) { m.listener })
+  let config =
+    runtime.config()
+    |> runtime.with_max_live_exchanges(1)
+    |> runtime.with_label(label)
+  let #(rt, outputs) = start_collecting(sample_server(), config)
+
+  let busy = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, busy, "ctx", slow_frame("busy", 100), None)
+  let refused = reducer.new_exchange_id()
+  runtime.send_frame(rt, refused, "ctx", discover_frame("refused"), None)
+  |> should.equal(Error(runtime.TooManyLiveExchanges(1, 1)))
+  expect_event(rejected)
+  |> should.equal(telemetry.FrameRejectedMeta(
+    exchange_id: reducer.exchange_id_to_int(refused),
+    problem: telemetry.TooManyExchanges,
+    listener: Some(label),
+  ))
+
+  // Once the busy exchange closes its slot is free again.
+  let _ = expect_write(outputs, busy)
+  expect_close(outputs, busy)
+  let next = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, next, "ctx", discover_frame("next"), None)
+  let _ = expect_write(outputs, next)
+
+  runtime.stop(rt)
+  let assert Ok(Nil) = sinal.detach(attachment)
+}
+
+// --- cancellation, timeouts and crashes --------------------------------------
+
+pub fn runtime_cancellation_test() {
+  let label = "client-cancel"
+  let #(attachment, cancelled) =
+    capture(telemetry.invocation_cancelled_event(), label, fn(m) { m.listener })
+  let config = runtime.config() |> runtime.with_label(label)
+  let #(rt, outputs) = start_collecting(sample_server(), config)
+
+  let call = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, call, "ctx", slow_frame("cancel-req-1", 300), None)
+  let notification = reducer.new_exchange_id()
   let assert Ok(Nil) =
     runtime.send_frame(
       rt,
-      server.fresh_exchange(),
+      notification,
       "ctx",
-      make_discover_frame("fresh"),
-      1000,
+      cancel_frame("cancel-req-1"),
+      None,
     )
 
-  runtime.stop(rt, 1000)
+  expect_close(outputs, call)
+  expect_close(outputs, notification)
+  let meta = expect_event(cancelled)
+  meta.method |> should.equal("tools/call")
+  meta.tool |> should.equal(Some("slow"))
+
+  // The handler ignores the signal and finishes within the grace period; its
+  // late result is dropped, so nothing is written for the cancelled request.
+  expect_silence(outputs, 400)
+
+  runtime.stop(rt)
+  let assert Ok(Nil) = sinal.detach(attachment)
 }
 
-pub fn runtime_crash_isolation_test() {
-  let s = sample_server()
-  let sink_subj = process.new_subject()
-  let crash_subj = process.new_subject()
-  let crash_event = telemetry.invocation_crashed_event()
-  let crash_handler = fn(_meas, meta: telemetry.InvocationCrashedMeta) {
-    process.send(crash_subj, meta)
-  }
-  let crash_attachment = sinal.observe(crash_event, crash_handler)
-  let config = runtime.default_config()
+pub fn exchange_closed_fires_cancelled_selector_then_kills_after_grace_test() {
+  let probe = process.new_subject()
+  let config = runtime.config() |> runtime.with_cancellation_grace(ms(200))
+  let #(rt, outputs) = start_collecting(probe_server(), config)
 
-  let assert Ok(rt) =
-    runtime.start(s, config, fn(output) { send_output_to(sink_subj, output) })
-
-  // Call the crashing tool
-  let ex = server.fresh_exchange()
-  let call_crash =
-    make_call_frame(
-      "crash-1",
-      "crash",
-      json.object([#("name", json.string("test"))]),
-    )
-  let assert Ok(Nil) = runtime.send_frame(rt, ex, "ctx", call_crash, 1000)
-
-  // Expect sanitized internal error (-32603)
-  let assert Ok(out) = process.receive(sink_subj, 1000)
-  let assert Ok(str) = bit_array.to_string(out)
-  let assert Ok(parsed) = json.parse(str, decode.dynamic)
-  let assert Ok(d) =
-    decode.run(parsed, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(err_dyn) = dict.get(d, "error")
-  let assert Ok(err_dict) =
-    decode.run(err_dyn, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(code_dyn) = dict.get(err_dict, "code")
-  let assert Ok(code) = decode.run(code_dyn, decode.int)
-  code |> should.equal(-32_603)
-  let assert Ok(crash_meta) = process.receive(crash_subj, 1000)
-  crash_meta.reason |> should.equal("handler crashed (redacted)")
-  string.contains(crash_meta.reason, "secret-token-7B3F")
-  |> should.equal(False)
-
-  // Verify owner is still alive and responds to normal requests
-  let ex_alive = server.fresh_exchange()
-  let assert Ok(Nil) =
-    runtime.send_frame(
-      rt,
-      ex_alive,
-      "ctx",
-      make_discover_frame("alive-1"),
-      1000,
-    )
-  let assert Ok(out_alive) = process.receive(sink_subj, 1000)
-  let assert Ok(str_alive) = bit_array.to_string(out_alive)
-  let assert Ok(parsed_alive) = json.parse(str_alive, decode.dynamic)
-  let assert Ok(dict_alive) =
-    decode.run(parsed_alive, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(_) = dict.get(dict_alive, "result")
-
-  runtime.stop(rt, 1000)
-  let assert Ok(Nil) = sinal.detach(crash_attachment)
-}
-
-pub fn request_admitted_runtime_observation_test() {
-  let event_subj = process.new_subject()
-  let ev = telemetry.request_admitted_event()
-  let handler = fn(_meas, meta: telemetry.RequestAdmittedMeta) {
-    process.send(event_subj, meta)
-  }
-  let att = sinal.observe(ev, handler)
-  let assert Ok(rt) =
-    runtime.start(sample_server(), runtime.default_config(), fn(_output) {
-      Ok(Nil)
-    })
-  let exchange = server.fresh_exchange()
-
+  let exchange = reducer.new_exchange_id()
   let assert Ok(Nil) =
     runtime.send_frame(
       rt,
       exchange,
-      "ctx",
-      make_discover_frame("admitted"),
-      1000,
+      probe,
+      call_frame("stubborn-1", "stubborn", json.object([])),
+      None,
     )
-  let assert Ok(meta) = process.receive(event_subj, 1000)
-  meta.exchange_id |> should.equal(server.exchange_id_to_int(exchange))
-  meta.method |> should.equal("server/discover")
+  let assert Ok(HandlerStarted(pid)) = process.receive(probe, 1000)
+  let monitor = process.monitor(pid)
+  let closed_at = monotonic_ms()
+  runtime.exchange_closed(rt, exchange)
 
-  runtime.stop(rt, 1000)
-  let assert Ok(Nil) = sinal.detach(att)
+  let assert Ok(HandlerSawCancel) = process.receive(probe, 1000)
+  expect_close(outputs, exchange)
+  // The handler ignored the signal; it lives until the grace period ends.
+  process.is_alive(pid) |> should.be_true
+  wait_down(monitor, 2000) |> should.equal(process.Killed)
+  { monotonic_ms() - closed_at >= 150 } |> should.be_true
+  expect_silence(outputs, 20)
+
+  runtime.stop(rt)
+}
+
+pub fn zero_cancellation_grace_kills_handler_at_once_test() {
+  let probe = process.new_subject()
+  let config = runtime.config() |> runtime.with_cancellation_grace(ms(0))
+  let #(rt, outputs) = start_collecting(probe_server(), config)
+
+  let exchange = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(
+      rt,
+      exchange,
+      probe,
+      call_frame("stubborn-0", "stubborn", json.object([])),
+      None,
+    )
+  let assert Ok(HandlerStarted(pid)) = process.receive(probe, 1000)
+  let monitor = process.monitor(pid)
+  runtime.exchange_closed(rt, exchange)
+
+  wait_down(monitor, 100) |> should.equal(process.Killed)
+  expect_close(outputs, exchange)
+
+  runtime.stop(rt)
 }
 
 pub fn runtime_timeout_test() {
-  let s = sample_server()
-  let sink_subj = process.new_subject()
-  // Short timeout: 50ms
+  let label = "timeout"
+  let #(attachment, crashed) =
+    capture(telemetry.invocation_crashed_event(), label, fn(m) { m.listener })
+  let probe = process.new_subject()
   let config =
-    RuntimeConfig(
-      max_live_exchanges: 10,
-      max_frame_bytes: 1024,
-      invocation_timeout_ms: 50,
-      tombstone_retention_ms: 1000,
+    runtime.config()
+    |> runtime.with_invocation_timeout(ms(100))
+    |> runtime.with_cancellation_grace(ms(50))
+    |> runtime.with_label(label)
+  let #(rt, outputs) = start_collecting(probe_server(), config)
+
+  let exchange = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(
+      rt,
+      exchange,
+      probe,
+      call_frame("slow-1", "stubborn", json.object([])),
+      None,
     )
+  let assert Ok(HandlerStarted(pid)) = process.receive(probe, 1000)
+  let monitor = process.monitor(pid)
 
-  let assert Ok(rt) =
-    runtime.start(s, config, fn(output) { send_output_to(sink_subj, output) })
+  expect_write(outputs, exchange) |> error_code |> should.equal(-32_603)
+  expect_close(outputs, exchange)
+  let assert Ok(HandlerSawCancel) = process.receive(probe, 1000)
+  let meta = expect_event(crashed)
+  meta.reason |> should.equal(telemetry.HandlerTimedOut)
+  meta.method |> should.equal("tools/call")
+  meta.tool |> should.equal(Some("stubborn"))
+  wait_down(monitor, 1000) |> should.equal(process.Killed)
 
-  // Call slow tool for 300ms
-  let ex = server.fresh_exchange()
-  let call_slow =
-    make_call_frame("slow-1", "slow", json.object([#("ms", json.int(300))]))
-  let assert Ok(Nil) = runtime.send_frame(rt, ex, "ctx", call_slow, 1000)
-
-  // Expect internal error (-32603) from timeout
-  let assert Ok(out) = process.receive(sink_subj, 1000)
-  let assert Ok(str) = bit_array.to_string(out)
-  let assert Ok(parsed) = json.parse(str, decode.dynamic)
-  let assert Ok(d) =
-    decode.run(parsed, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(err_dyn) = dict.get(d, "error")
-  let assert Ok(err_dict) =
-    decode.run(err_dyn, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(code_dyn) = dict.get(err_dict, "code")
-  let assert Ok(code) = decode.run(code_dyn, decode.int)
-  code |> should.equal(-32_603)
-
-  runtime.stop(rt, 1000)
+  runtime.stop(rt)
+  let assert Ok(Nil) = sinal.detach(attachment)
 }
 
-pub fn runtime_cancellation_test() {
-  let s = sample_server()
-  let sink_subj = process.new_subject()
-  let config =
-    RuntimeConfig(
-      max_live_exchanges: 10,
-      max_frame_bytes: 1024,
-      invocation_timeout_ms: 5000,
-      tombstone_retention_ms: 1000,
+pub fn runtime_crash_isolation_test() {
+  let label = "crash"
+  let #(attachment, crashed) =
+    capture(telemetry.invocation_crashed_event(), label, fn(m) { m.listener })
+  let config = runtime.config() |> runtime.with_label(label)
+  let #(rt, outputs) = start_collecting(sample_server(), config)
+
+  // A neighbour invocation is in flight while the other handler crashes.
+  let neighbour = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, neighbour, "ctx", slow_frame("neighbour", 150), None)
+  let crashing = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(
+      rt,
+      crashing,
+      "ctx",
+      call_frame("crash-1", "crash", json.object([#("name", json.string("t"))])),
+      None,
     )
 
-  let assert Ok(rt) =
-    runtime.start(s, config, fn(output) { send_output_to(sink_subj, output) })
+  let text = expect_write(outputs, crashing)
+  error_code(text) |> should.equal(-32_603)
+  string.contains(text, "secret-token-7B3F") |> should.be_false
+  expect_close(outputs, crashing)
+  let meta = expect_event(crashed)
+  meta.reason |> should.equal(telemetry.HandlerCrashed)
+  meta.tool |> should.equal(Some("crash"))
 
-  // Start slow tool
-  let ex1 = server.fresh_exchange()
-  let call_slow =
-    make_call_frame(
-      "cancel-req-1",
-      "slow",
-      json.object([#("ms", json.int(300))]),
-    )
-  let assert Ok(Nil) = runtime.send_frame(rt, ex1, "ctx", call_slow, 1000)
+  expect_write(outputs, neighbour)
+  |> structured_greeting
+  |> should.equal("finished slow")
+  expect_close(outputs, neighbour)
 
-  // Cancel it immediately
-  let ex2 = server.fresh_exchange()
-  let cancel_frame =
-    json.object([
-      #("jsonrpc", json.string("2.0")),
-      #("method", json.string("notifications/cancelled")),
-      #("params", json.object([#("requestId", json.string("cancel-req-1"))])),
-    ])
-    |> json.to_string()
-    |> bit_array.from_string()
+  // The runtime still answers.
+  let alive = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, alive, "ctx", discover_frame("alive-1"), None)
+  expect_write(outputs, alive) |> has_result |> should.be_true
 
-  let assert Ok(Nil) = runtime.send_frame(rt, ex2, "ctx", cancel_frame, 1000)
+  runtime.stop(rt)
+  let assert Ok(Nil) = sinal.detach(attachment)
+}
 
-  // Wait 400ms: ensure NO completion message is received for cancel-req-1!
-  case process.receive(sink_subj, 400) {
-    Ok(_) -> should.fail()
-    Error(Nil) -> Nil
+// --- telemetry metadata ------------------------------------------------------
+
+pub fn request_admitted_runtime_observation_test() {
+  let label = "admitted"
+  let #(attachment, admitted) =
+    capture(telemetry.request_admitted_event(), label, fn(m) { m.listener })
+  let config = runtime.config() |> runtime.with_label(label)
+  let #(rt, _outputs) = start_collecting(sample_server(), config)
+  let corr = correlation.from_key("admitted-correlation")
+
+  let exchange = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, exchange, "ctx", discover_frame("a"), Some(corr))
+  expect_event(admitted)
+  |> should.equal(telemetry.RequestAdmittedMeta(
+    exchange_id: reducer.exchange_id_to_int(exchange),
+    method: "server/discover",
+    correlation: Some(corr),
+    listener: Some(label),
+  ))
+
+  let uncorrelated = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, uncorrelated, "ctx", discover_frame("b"), None)
+  let meta = expect_event(admitted)
+  meta.exchange_id |> should.equal(reducer.exchange_id_to_int(uncorrelated))
+  meta.correlation |> should.equal(None)
+
+  runtime.stop(rt)
+  let assert Ok(Nil) = sinal.detach(attachment)
+}
+
+pub fn invocation_started_metadata_test() {
+  let label = "started"
+  let #(attachment, started) =
+    capture(telemetry.invocation_started_event(), label, fn(m) { m.listener })
+  let config = runtime.config() |> runtime.with_label(label)
+  let #(rt, outputs) = start_collecting(sample_server(), config)
+  let corr = correlation.from_key("started-correlation")
+
+  let exchange = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, exchange, "ctx", greet_frame("s", "Ann"), Some(corr))
+  let meta = expect_event(started)
+  meta.exchange_id |> should.equal(reducer.exchange_id_to_int(exchange))
+  meta.method |> should.equal("tools/call")
+  meta.tool |> should.equal(Some("greet"))
+  meta.correlation |> should.equal(Some(corr))
+  meta.listener |> should.equal(Some(label))
+  let _ = expect_write(outputs, exchange)
+
+  runtime.stop(rt)
+  let assert Ok(Nil) = sinal.detach(attachment)
+}
+
+pub fn invocation_completed_status_test() {
+  let label = "completed"
+  let #(attachment, completed) =
+    capture(telemetry.invocation_completed_event(), label, fn(m) { m.listener })
+  let config = runtime.config() |> runtime.with_label(label)
+  let #(rt, outputs) = start_collecting(sample_server(), config)
+  let corr = correlation.from_key("completed-correlation")
+
+  let run = fn(id, tool_name, args) {
+    let exchange = reducer.new_exchange_id()
+    let assert Ok(Nil) =
+      runtime.send_frame(
+        rt,
+        exchange,
+        "ctx",
+        call_frame(id, tool_name, args),
+        Some(corr),
+      )
+    let _ = expect_write(outputs, exchange)
+    expect_close(outputs, exchange)
+    let assert Ok(#(measured, meta)) = process.receive(completed, 1000)
+    let telemetry.InvocationCompletedMeasurements(duration_ms) = measured
+    { duration_ms >= 0 } |> should.be_true
+    meta.exchange_id |> should.equal(reducer.exchange_id_to_int(exchange))
+    meta.method |> should.equal("tools/call")
+    meta.tool |> should.equal(Some(tool_name))
+    meta.correlation |> should.equal(Some(corr))
+    meta.status
   }
+  let named = json.object([#("name", json.string("Bo"))])
 
-  runtime.stop(rt, 1000)
+  run("ok", "greet", named) |> should.equal(telemetry.Succeeded)
+  run("tool-failed", "fail", named) |> should.equal(telemetry.ToolFailed)
+  run("input", "ask", named) |> should.equal(telemetry.InputRequested)
+  run("bad-args", "greet", json.object([#("name", json.int(5))]))
+  |> should.equal(telemetry.Failed)
+
+  runtime.stop(rt)
+  let assert Ok(Nil) = sinal.detach(attachment)
 }
 
-pub fn runtime_frame_bound_test() {
-  let s = sample_server()
-  let sink_subj = process.new_subject()
-  let config =
-    RuntimeConfig(
-      max_live_exchanges: 10,
-      max_frame_bytes: 20,
-      // very small
-      invocation_timeout_ms: 1000,
-      tombstone_retention_ms: 1000,
+pub fn exchange_closed_telemetry_carries_label_test() {
+  let label = "closed"
+  let #(attachment, closed) =
+    capture(telemetry.exchange_closed_event(), label, fn(m) { m.listener })
+  let config = runtime.config() |> runtime.with_label(label)
+  let #(rt, _outputs) = start_collecting(sample_server(), config)
+
+  let exchange = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, exchange, "ctx", discover_frame("c"), None)
+  expect_event(closed)
+  |> should.equal(telemetry.ExchangeClosedMeta(
+    exchange_id: reducer.exchange_id_to_int(exchange),
+    listener: Some(label),
+  ))
+
+  runtime.stop(rt)
+  let assert Ok(Nil) = sinal.detach(attachment)
+}
+
+// --- live server changes -----------------------------------------------------
+
+pub fn notify_and_tool_changes_reach_listen_stream_test() {
+  let #(rt, outputs) = start_collecting(sample_server(), runtime.config())
+
+  let stream = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, stream, "ctx", listen_frame("listen-1"), None)
+  expect_write(outputs, stream)
+  |> string.contains("notifications/subscriptions/acknowledged")
+  |> should.be_true
+
+  runtime.notify(rt, subscriptions.ToolsListChanged)
+  expect_write(outputs, stream)
+  |> string.contains("notifications/tools/list_changed")
+  |> should.be_true
+
+  // The stream did not ask for prompt changes: nothing is written for them.
+  runtime.notify(rt, subscriptions.PromptsListChanged)
+  runtime.register_tool(rt, extra_tool())
+  expect_write(outputs, stream)
+  |> string.contains("notifications/tools/list_changed")
+  |> should.be_true
+
+  // A duplicate registration is ignored and announces nothing.
+  runtime.register_tool(rt, extra_tool())
+  let call = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(
+      rt,
+      call,
+      "ctx",
+      call_frame("x1", "extra", json.object([])),
+      None,
     )
+  expect_write(outputs, call)
+  |> structured_greeting
+  |> should.equal("extra ran")
+  expect_close(outputs, call)
 
-  let assert Ok(rt) =
-    runtime.start(s, config, fn(output) { send_output_to(sink_subj, output) })
+  runtime.unregister_tool(rt, "extra")
+  expect_write(outputs, stream)
+  |> string.contains("notifications/tools/list_changed")
+  |> should.be_true
+  // Removing an absent tool announces nothing.
+  runtime.unregister_tool(rt, "extra")
+  let gone = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(
+      rt,
+      gone,
+      "ctx",
+      call_frame("x2", "extra", json.object([])),
+      None,
+    )
+  expect_write(outputs, gone) |> error_code |> should.equal(-32_602)
+  expect_close(outputs, gone)
 
-  let ex = server.fresh_exchange()
-  let large_frame = make_discover_frame("large-1")
-  let res = runtime.send_frame(rt, ex, "ctx", large_frame, 1000)
-  case res {
-    Error(runtime.FrameTooLarge(_, _)) -> Nil
-    _ -> should.fail()
+  runtime.end_streams(rt)
+  let ended = expect_write(outputs, stream)
+  let assert Ok(#(id, result_type)) =
+    json.parse(ended, {
+      use id <- decode.field("id", decode.string)
+      use result_type <- decode.subfield(
+        ["result", "resultType"],
+        decode.string,
+      )
+      decode.success(#(id, result_type))
+    })
+  #(id, result_type) |> should.equal(#("listen-1", "complete"))
+  expect_close(outputs, stream)
+
+  // The stream is gone: later notifications reach no one.
+  runtime.notify(rt, subscriptions.ToolsListChanged)
+  expect_silence(outputs, 50)
+
+  runtime.stop(rt)
+}
+
+// --- supervision -------------------------------------------------------------
+
+fn wait_for_restart(
+  name: process.Name(message),
+  previous: Pid,
+  attempts: Int,
+) -> Pid {
+  case process.named(name) {
+    Ok(pid) if pid != previous -> pid
+    _ if attempts <= 0 -> panic as "the supervised runtime did not restart"
+    _ -> {
+      process.sleep(10)
+      wait_for_restart(name, previous, attempts - 1)
+    }
   }
-
-  runtime.stop(rt, 1000)
 }
 
-pub fn runtime_equal_wire_ids_on_distinct_exchanges_test() {
-  let s = sample_server()
-  let sink_subj = process.new_subject()
-  let config = runtime.default_config()
-
-  let assert Ok(rt) =
-    runtime.start(s, config, fn(output) { send_output_to(sink_subj, output) })
-
-  // Two distinct exchanges with same JSON-RPC id: "same-id"
-  let ex1 = server.fresh_exchange()
-  let ex2 = server.fresh_exchange()
-
-  let f1 =
-    make_call_frame(
-      "same-id",
-      "greet",
-      json.object([#("name", json.string("User1"))]),
+pub fn supervised_runtime_restarts_with_fresh_state_test() {
+  let name = process.new_name("relay_runtime_test")
+  let outputs = process.new_subject()
+  let spec =
+    runtime.supervised(
+      sample_server(),
+      runtime.config(),
+      fn(output) {
+        process.send(outputs, output)
+        Ok(Nil)
+      },
+      name,
     )
-  let f2 =
-    make_call_frame(
-      "same-id",
-      "greet",
-      json.object([#("name", json.string("User2"))]),
+  let assert Ok(supervisor) =
+    static_supervisor.new(static_supervisor.OneForOne)
+    |> static_supervisor.add(spec)
+    |> static_supervisor.start
+
+  let rt = runtime.named(name)
+  runtime.register_tool(rt, extra_tool())
+  let first_call = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(
+      rt,
+      first_call,
+      "ctx",
+      call_frame("e1", "extra", json.object([])),
+      None,
     )
+  expect_write(outputs, first_call)
+  |> structured_greeting
+  |> should.equal("extra ran")
+  expect_close(outputs, first_call)
 
-  let assert Ok(Nil) = runtime.send_frame(rt, ex1, "ctx1", f1, 1000)
-  let assert Ok(Nil) = runtime.send_frame(rt, ex2, "ctx2", f2, 1000)
+  let assert Ok(first) = process.named(name)
+  process.kill(first)
+  let _second = wait_for_restart(name, first, 100)
 
-  let assert Ok(out1) = process.receive(sink_subj, 1000)
-  let assert Ok(out2) = process.receive(sink_subj, 1000)
+  // The restarted runtime starts from the server description: the tool
+  // registered at run time is gone, and the old exchange id is new to it.
+  let rt = runtime.named(name)
+  let after = reducer.new_exchange_id()
+  let assert Ok(Nil) =
+    runtime.send_frame(
+      rt,
+      after,
+      "ctx",
+      call_frame("e2", "extra", json.object([])),
+      None,
+    )
+  expect_write(outputs, after) |> error_code |> should.equal(-32_602)
+  expect_close(outputs, after)
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, first_call, "ctx", greet_frame("again", "Zed"), None)
+  expect_write(outputs, first_call)
+  |> structured_greeting
+  |> should.equal("ctx: hello Zed")
 
-  let assert Ok(str1) = bit_array.to_string(out1)
-  let assert Ok(str2) = bit_array.to_string(out2)
-
-  // Both completed successfully
-  let assert True =
-    string.contains(str1, "User1") || string.contains(str2, "User1")
-  let assert True =
-    string.contains(str1, "User2") || string.contains(str2, "User2")
-
-  runtime.stop(rt, 1000)
+  process.unlink(supervisor.pid)
+  process.kill(supervisor.pid)
 }
 
-pub fn runtime_repeated_close_test() {
-  let s = sample_server()
-  let sink_subj = process.new_subject()
-  let config = runtime.default_config()
-
-  let assert Ok(rt) =
-    runtime.start(s, config, fn(output) { send_output_to(sink_subj, output) })
-
-  runtime.close(rt)
-  runtime.close(rt)
-  runtime.close(rt)
-
-  // Subsequent frame submissions reject with RuntimeStopped
-  let ex = server.fresh_exchange()
-  let res = runtime.send_frame(rt, ex, "ctx", make_discover_frame("1"), 1000)
-  res |> should.equal(Error(runtime.RuntimeStopped))
-
-  runtime.stop(rt, 1000)
-}
+// --- progress ----------------------------------------------------------------
 
 pub fn runtime_progress_backpressure_bounds_mailbox_test() {
   let notices = process.new_subject()
   let observations = process.new_subject()
   let gate = start_sink_gate()
-  let assert Ok(name) = tool.tool_name("progress_burst")
-  let assert Ok(tool) = case
-    tool.definition(name, codec.success(Nil), codec.success(Nil))
-  {
-    Ok(definition) -> {
-      let definition = tool.with_metadata(definition, tool.empty_metadata())
-      Ok({
-        let user_handler = fn(notices, _input, report_progress) {
-          report_progress_burst(report_progress, 1, 128)
-          process.send(notices, ProgressBurstFinished)
-          Ok(Nil)
-        }
-        let advanced_handler = fn(call, typed_input) {
-          let tool.HandlerCallContext(
-            application,
-            _input_responses,
-            report_progress,
-          ) = call
-          user_handler(application, typed_input, report_progress)
-          |> result.map(fn(output) { tool.Complete(output, []) })
-        }
-        tool.handle_advanced_with_error_renderer(
-          definition,
-          advanced_handler,
-          fn(application_error) {
-            case codec.encode_json(codec.success(Nil), application_error) {
-              Ok(text) -> text
-              Error(_) -> "Tool execution failed."
-            }
-          },
-        )
-      })
-    }
-    Error(error) -> Error(error)
-  }
-  let assert Ok(registry) = tool.registry([tool])
-  let config =
-    RuntimeConfig(..runtime.default_config(), invocation_timeout_ms: 5000)
+  let burst =
+    tool.define("progress_burst", codec.success(Nil), codec.success(Nil))
+    |> tool.handle_call(fn(call, _input) {
+      report_progress_burst(call, 1, 128)
+      process.send(tool.context(call), ProgressBurstFinished)
+      Ok(tool.complete(Nil))
+    })
+  let config = runtime.config() |> runtime.with_invocation_timeout(ms(5000))
   let assert Ok(rt) =
-    runtime.start(server.server(registry), config, fn(output) {
+    runtime.start(server.new([burst]), config, fn(output) {
       case output {
         runtime.OutputClose(_) -> Ok(Nil)
         runtime.OutputWrite(_, _) -> {
@@ -703,66 +1085,41 @@ pub fn runtime_progress_backpressure_bounds_mailbox_test() {
         }
       }
     })
-  let exchange = server.fresh_exchange()
-  let assert Ok(Nil) =
-    runtime.send_frame(
-      rt,
-      exchange,
-      notices,
-      progress_call_frame("progress-burst"),
-      1000,
+  let frame =
+    request_frame(
+      "progress-burst",
+      "tools/call",
+      [
+        #("name", json.string("progress_burst")),
+        #("arguments", json.object([])),
+      ],
+      [#("progressToken", json.int(1))],
     )
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, reducer.new_exchange_id(), notices, frame, None)
   let assert Ok(#(queued, release)) = process.receive(observations, 3000)
   process.send(release, Nil)
   let assert Ok(ProgressBurstFinished) = process.receive(notices, 5000)
-  runtime.stop(rt, 1000)
+  runtime.stop(rt)
   stop_sink_gate(gate)
   should.be_true(queued <= 1)
 }
 
-fn progress_call_frame(id: String) -> BitArray {
-  json.object([
-    #("jsonrpc", json.string("2.0")),
-    #("id", json.string(id)),
-    #("method", json.string("tools/call")),
-    #(
-      "params",
-      json.object([
-        #("name", json.string("progress_burst")),
-        #("arguments", json.object([])),
-        #(
-          "_meta",
-          json.object([
-            #(
-              "io.modelcontextprotocol/protocolVersion",
-              json.string("2026-07-28"),
-            ),
-            #("io.modelcontextprotocol/clientCapabilities", json.object([])),
-            #("progressToken", json.int(1)),
-          ]),
-        ),
-      ]),
-    ),
-  ])
-  |> json.to_string()
-  |> bit_array.from_string()
-}
-
 fn report_progress_burst(
-  report_progress: fn(Int) -> Nil,
+  call: tool.Call(context),
   current: Int,
   last: Int,
 ) -> Nil {
   case current > last {
     True -> Nil
     False -> {
-      report_progress(current)
-      report_progress_burst(report_progress, current + 1, last)
+      tool.report_progress(call, int.to_float(current), None, None)
+      report_progress_burst(call, current + 1, last)
     }
   }
 }
 
-fn start_sink_gate() -> process.Subject(SinkGateMessage) {
+fn start_sink_gate() -> Subject(SinkGateMessage) {
   let ready = process.new_subject()
   let _pid =
     process.spawn_unlinked(fn() {
@@ -774,10 +1131,7 @@ fn start_sink_gate() -> process.Subject(SinkGateMessage) {
   subject
 }
 
-fn sink_gate_loop(
-  subject: process.Subject(SinkGateMessage),
-  first: Bool,
-) -> Nil {
+fn sink_gate_loop(subject: Subject(SinkGateMessage), first: Bool) -> Nil {
   case process.receive(subject, 10_000) {
     Error(_) -> Nil
     Ok(DecideToHold(reply)) -> {
@@ -788,7 +1142,7 @@ fn sink_gate_loop(
   }
 }
 
-fn stop_sink_gate(gate: process.Subject(SinkGateMessage)) -> Nil {
+fn stop_sink_gate(gate: Subject(SinkGateMessage)) -> Nil {
   let reply = process.new_subject()
   process.send(gate, StopSinkGate(reply))
   let _ = process.receive(reply, 1000)

@@ -13,14 +13,17 @@ gleam_json = ">= 3.0.0 and < 4.0.0"
 gleam_http = ">= 4.4.0 and < 5.0.0"
 gleam_erlang = ">= 1.0.0 and < 2.0.0"
 gleam_otp = ">= 1.0.0 and < 2.0.0"
+gleam_time = ">= 1.11.0 and < 2.0.0"
 json_blueprint = { path = "../json_blueprint" }
 sinal = { path = "../sinal" }
-# relay_ffi.erl reads mist's internal `Connection` record (body, socket,
-# transport, factory_name) to set SSE send timeouts and write keepalive
-# comments. The record shape is identical in mist 6.0.2 and 6.0.3; recheck it
-# and the SSE keepalive tests when a new mist 6.x release appears.
+http_gun = { path = "../http_gun" }
+# Streaming uses mist's public `chunked` API. Two optional helpers in
+# relay_ffi.erl read mist's `Connection` record (body, socket, transport,
+# factory_name): a socket send timeout for event streams and the closure
+# watch that cancels a buffered request when its client disconnects. Both
+# fall back safely on another record shape; recheck them and the disconnect
+# tests when a new mist 6.x release appears.
 mist = ">= 6.0.2 and < 7.0.0"
-gun = ">= 2.6.0 and < 3.0.0"
 
 [dev-dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"

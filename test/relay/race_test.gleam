@@ -1,26 +1,24 @@
-import gleam/bit_array
 import gleam/dynamic
 import gleam/dynamic/decode
 import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{Some}
-import gleeunit
+import gleam/option.{None}
+import gleam/set
+import gleam/time/duration
 import gleeunit/should
 import json/blueprint/codec
-import relay/runtime.{RuntimeConfig}
-import relay/server.{ExchangeClosed, MessageReceived}
+import relay/reducer.{ExchangeClosed, Received}
+import relay/reducer_support as support
+import relay/runtime
+import relay/server.{type Server}
 import relay/test_codec
 import relay/tool
 
-pub fn main() -> Nil {
-  gleeunit.main()
-}
-
 fn send_output_to(
   subject: Subject(BitArray),
-  output: runtime.RuntimeOutput,
+  output: runtime.Output,
 ) -> Result(Nil, Nil) {
   case output {
     runtime.OutputWrite(_, bytes) -> process.send(subject, bytes)
@@ -31,6 +29,9 @@ fn send_output_to(
 
 @external(erlang, "erlang", "self")
 fn ffi_self() -> dynamic.Dynamic
+
+@external(erlang, "relay_race_ffi", "drain")
+fn drain() -> Nil
 
 @external(erlang, "relay_ffi", "mailbox_size")
 fn ffi_mailbox_size(pid: dynamic.Dynamic) -> Int
@@ -45,237 +46,134 @@ fn repeat(times: Int, f: fn(Int) -> Nil) -> Nil {
   }
 }
 
-fn sample_registry() -> tool.Registry(String) {
-  let assert Ok(name) = tool.tool_name("echo")
-  let assert Ok(t) = case
-    tool.definition(
-      name,
+fn echo_server() -> Server(String) {
+  server.new([
+    tool.define(
+      "echo",
       test_codec.property("val", codec.string()),
       codec.string(),
     )
-  {
-    Ok(definition) -> {
-      let definition =
-        tool.with_metadata(
-          definition,
-          tool.ToolMetadata(
-            ..tool.empty_metadata(),
-            description: Some("Echoes"),
-          ),
-        )
-      Ok(
-        tool.handle_with_error_renderer(
-          definition,
-          fn(val: String) { Ok(val) },
-          fn(application_error) {
-            case codec.encode_json(codec.success(Nil), application_error) {
-              Ok(text) -> text
-              Error(_) -> "Tool execution failed."
-            }
-          },
-        ),
-      )
-    }
-    Error(error) -> Error(error)
-  }
-  let assert Ok(reg) = tool.registry([t])
-  reg
+    |> tool.with_description("Echoes")
+    |> tool.handle(fn(val: String) { Ok(val) }),
+  ])
 }
 
-fn slow_registry(delay_ms: Int) -> tool.Registry(String) {
-  let assert Ok(name) = tool.tool_name("slow_tool")
-  let assert Ok(t) = case
-    tool.definition(
-      name,
+fn slow_server(delay_ms: Int) -> Server(String) {
+  server.new([
+    tool.define(
+      "slow_tool",
       test_codec.property("val", codec.string()),
       codec.string(),
     )
-  {
-    Ok(definition) -> {
-      let definition =
-        tool.with_metadata(
-          definition,
-          tool.ToolMetadata(
-            ..tool.empty_metadata(),
-            description: Some("Sleeps and echoes"),
-          ),
-        )
-      Ok(
-        tool.handle_with_error_renderer(
-          definition,
-          fn(val: String) {
-            process.sleep(delay_ms)
-            Ok(val)
-          },
-          fn(application_error) {
-            case codec.encode_json(codec.success(Nil), application_error) {
-              Ok(text) -> text
-              Error(_) -> "Tool execution failed."
-            }
-          },
-        ),
-      )
-    }
-    Error(error) -> Error(error)
-  }
-  let assert Ok(reg) = tool.registry([t])
-  reg
-}
-
-fn make_call_frame(id: String, tool: String, arg: String) -> BitArray {
-  json.object([
-    #("jsonrpc", json.string("2.0")),
-    #("id", json.string(id)),
-    #("method", json.string("tools/call")),
-    #(
-      "params",
-      json.object([
-        #("name", json.string(tool)),
-        #("arguments", json.object([#("val", json.string(arg))])),
-        #(
-          "_meta",
-          json.object([
-            #(
-              "io.modelcontextprotocol/protocolVersion",
-              json.string("2026-07-28"),
-            ),
-            #("io.modelcontextprotocol/clientCapabilities", json.object([])),
-          ]),
-        ),
-      ]),
-    ),
+    |> tool.with_description("Sleeps and echoes")
+    |> tool.handle(fn(val: String) {
+      process.sleep(delay_ms)
+      Ok(val)
+    }),
   ])
-  |> json.to_string()
-  |> bit_array.from_string()
 }
 
-fn make_cancel_frame(id: String) -> BitArray {
-  json.object([
-    #("jsonrpc", json.string("2.0")),
-    #("method", json.string("notifications/cancelled")),
-    #("params", json.object([#("requestId", json.string(id))])),
-  ])
-  |> json.to_string()
-  |> bit_array.from_string()
+fn call_frame(id: String, tool: String, arg: String) -> BitArray {
+  support.call(id, tool, [#("val", json.string(arg))])
 }
 
-// 1. Equal wire IDs on distinct exchanges (repeated 20 times)
+fn start(
+  srv: Server(String),
+  config: runtime.Config,
+) -> #(runtime.Runtime(String), Subject(BitArray)) {
+  let box: Subject(BitArray) = process.new_subject()
+  let assert Ok(rt) =
+    runtime.start(srv, config, fn(output) { send_output_to(box, output) })
+  #(rt, box)
+}
+
+fn send(rt: runtime.Runtime(String), frame: BitArray) -> Nil {
+  let assert Ok(Nil) =
+    runtime.send_frame(rt, reducer.new_exchange_id(), "ctx", frame, None)
+  Nil
+}
+
+// 1. Equal wire ids on distinct exchanges (repeated 20 times)
 pub fn equal_wire_ids_race_test() {
+  drain()
   repeat(20, fn(iter) {
-    let reg = sample_registry()
-    let s = server.server(reg)
-    let box: Subject(BitArray) = process.new_subject()
-    let sink = fn(output) { send_output_to(box, output) }
-    let cfg = runtime.default_config()
+    let #(rt, box) = start(echo_server(), runtime.config())
 
-    let assert Ok(rt) = runtime.start(s, cfg, sink)
-
-    let ex1 = server.fresh_exchange()
-    let ex2 = server.fresh_exchange()
-
-    // Send two requests with identical wire ID "same-id" on distinct exchanges
-    let frame1 =
-      make_call_frame("same-id", "echo", "msg-1-" <> int.to_string(iter))
-    let frame2 =
-      make_call_frame("same-id", "echo", "msg-2-" <> int.to_string(iter))
-
-    let assert Ok(_) = runtime.send_frame(rt, ex1, "ctx", frame1, 1000)
-    let assert Ok(_) = runtime.send_frame(rt, ex2, "ctx", frame2, 1000)
+    // Two requests with the identical wire id "same-id" on distinct exchanges.
+    let first = "msg-1-" <> int.to_string(iter)
+    let second = "msg-2-" <> int.to_string(iter)
+    send(rt, call_frame("same-id", "echo", first))
+    send(rt, call_frame("same-id", "echo", second))
 
     let assert Ok(resp1) = process.receive(box, 3000)
     let assert Ok(resp2) = process.receive(box, 3000)
 
-    let assert Ok(str1) = bit_array.to_string(resp1)
-    let assert Ok(str2) = bit_array.to_string(resp2)
-
-    // Both should parse as valid JSON
-    let assert Ok(_) = json.parse(str1, decode.dynamic)
-    let assert Ok(_) = json.parse(str2, decode.dynamic)
+    // Each exchange gets its own answer.
+    [resp1, resp2]
+    |> list.map(fn(bytes) {
+      support.at(bytes, ["result", "structuredContent"], decode.string)
+    })
+    |> set.from_list
+    |> should.equal(set.from_list([first, second]))
 
     runtime.close(rt)
-    runtime.stop(rt, 1000)
+    runtime.stop(rt)
 
-    // Verify test process mailbox is completely clean
+    // The test process mailbox is clean.
     ffi_mailbox_size(ffi_self()) |> should.equal(0)
   })
 }
 
-// 2. Duplicate admission on same exchange in pure reducer
+// 2. Duplicate admission on the same exchange in the pure reducer
 pub fn duplicate_admission_race_test() {
-  let reg = sample_registry()
-  let s0 = server.server(reg)
-  let ex = server.exchange_id(501)
-  let frame = make_call_frame("dup-adm", "echo", "test")
+  let s0 = reducer.init(echo_server())
+  let ex = reducer.new_exchange_id()
+  let frame = call_frame("dup-adm", "echo", "test")
 
-  // First message admitted
-  let #(s1, eff1) = server.step(s0, MessageReceived(ex, "ctx", frame))
+  // The first message is admitted.
+  let #(s1, eff1) = reducer.step(s0, Received(ex, "ctx", frame, None))
   list.length(eff1) |> should.equal(2)
 
-  // Second message on same exchange ID while first is pending
-  let #(_s2, eff2) = server.step(s1, MessageReceived(ex, "ctx", frame))
-  // Discarded / no invocation
+  // A second message on the same exchange while the first is pending is
+  // discarded without an invocation.
+  let #(_s2, eff2) = reducer.step(s1, Received(ex, "ctx", frame, None))
   eff2 |> should.equal([])
 }
 
-// 3. Cancel-before-start
+// 3. Cancel before start
 pub fn cancel_before_start_race_test() {
-  let reg = sample_registry()
-  let s = server.server(reg)
-  let box: Subject(BitArray) = process.new_subject()
-  let sink = fn(output) { send_output_to(box, output) }
-  let cfg = runtime.default_config()
+  let #(rt, box) = start(echo_server(), runtime.config())
 
-  let assert Ok(rt) = runtime.start(s, cfg, sink)
+  // A cancellation for a request that never started.
+  send(rt, support.cancel("non-existent-id"))
 
-  let ex = server.fresh_exchange()
-  // Send cancellation for a request that has never been started
-  let cancel_frame = make_cancel_frame("non-existent-id")
-  let assert Ok(_) = runtime.send_frame(rt, ex, "ctx", cancel_frame, 1000)
-
-  // Cancellation notification MUST NOT produce any wire response
-  let timeout_res = process.receive(box, 200)
-  timeout_res |> should.be_error()
+  // A cancellation notification produces no wire response.
+  process.receive(box, 200) |> should.be_error()
 
   runtime.close(rt)
-  runtime.stop(rt, 1000)
+  runtime.stop(rt)
 }
 
 // 4. Cancel racing completion (repeated 20 times)
 pub fn cancel_racing_completion_test() {
+  drain()
   repeat(20, fn(iter) {
-    // Tool that sleeps briefly so cancel arrives while running
-    let reg = slow_registry(30)
-    let s = server.server(reg)
-    let box: Subject(BitArray) = process.new_subject()
-    let sink = fn(output) { send_output_to(box, output) }
-    let cfg = runtime.default_config()
+    // The tool sleeps briefly so the cancellation arrives while it runs.
+    let #(rt, box) = start(slow_server(30), runtime.config())
 
-    let assert Ok(rt) = runtime.start(s, cfg, sink)
-
-    let ex1 = server.fresh_exchange()
     let req_id = "race-cancel-" <> int.to_string(iter)
-    let call_frame = make_call_frame(req_id, "slow_tool", "fast")
-    let assert Ok(_) = runtime.send_frame(rt, ex1, "ctx", call_frame, 1000)
+    send(rt, call_frame(req_id, "slow_tool", "fast"))
+    send(rt, support.cancel(req_id))
 
-    // Send cancel immediately
-    let ex2 = server.fresh_exchange()
-    let cancel_frame = make_cancel_frame(req_id)
-    let assert Ok(_) = runtime.send_frame(rt, ex2, "ctx", cancel_frame, 1000)
-
-    // Either cancel wins (no output) or completion wins (one output), but NEVER two outputs
+    // Either the cancellation wins (no output) or the completion wins (one
+    // output), but never two outputs.
     case process.receive(box, 300) {
-      Ok(_) -> {
-        // If completion won, ensure no second message arrives
-        process.receive(box, 150) |> should.be_error()
-      }
-      Error(_) -> {
-        // Cancel won, mailbox is empty
-        Nil
-      }
+      Ok(_) -> process.receive(box, 150) |> should.be_error()
+      Error(_) -> Nil
     }
 
     runtime.close(rt)
-    runtime.stop(rt, 1000)
+    runtime.stop(rt)
 
     ffi_mailbox_size(ffi_self()) |> should.equal(0)
   })
@@ -283,107 +181,84 @@ pub fn cancel_racing_completion_test() {
 
 // 5. Late completion after cancel
 pub fn late_completion_after_cancel_test() {
-  let reg = slow_registry(100)
-  let s = server.server(reg)
-  let box: Subject(BitArray) = process.new_subject()
-  let sink = fn(output) { send_output_to(box, output) }
-  let cfg = runtime.default_config()
+  drain()
+  let #(rt, box) = start(slow_server(100), runtime.config())
 
-  let assert Ok(rt) = runtime.start(s, cfg, sink)
+  send(rt, call_frame("late-cancel", "slow_tool", "sleepy"))
 
-  let ex1 = server.fresh_exchange()
-  let call_frame = make_call_frame("late-cancel", "slow_tool", "sleepy")
-  let assert Ok(_) = runtime.send_frame(rt, ex1, "ctx", call_frame, 1000)
-
-  // Wait 10ms then cancel
+  // Cancel after 10 ms, then wait past the 100 ms handler runtime.
   process.sleep(10)
-  let ex2 = server.fresh_exchange()
-  let cancel_frame = make_cancel_frame("late-cancel")
-  let assert Ok(_) = runtime.send_frame(rt, ex2, "ctx", cancel_frame, 1000)
-
-  // Sleep past the 100ms handler runtime
+  send(rt, support.cancel("late-cancel"))
   process.sleep(150)
 
-  // The late completion MUST have been suppressed by the tombstone
-  let late_msg = process.receive(box, 200)
-  late_msg |> should.be_error()
+  // The late completion was suppressed.
+  process.receive(box, 200) |> should.be_error()
 
   runtime.close(rt)
-  runtime.stop(rt, 1000)
+  runtime.stop(rt)
 
   ffi_mailbox_size(ffi_self()) |> should.equal(0)
 }
 
 // 6. Stale callback after owner replacement
 pub fn stale_callback_after_owner_replacement_test() {
-  let reg = slow_registry(150)
-  let s = server.server(reg)
+  drain()
+  let srv = slow_server(150)
   let box: Subject(BitArray) = process.new_subject()
   let sink = fn(output) { send_output_to(box, output) }
-  let cfg = runtime.default_config()
 
-  let assert Ok(rt1) = runtime.start(s, cfg, sink)
+  let assert Ok(rt1) = runtime.start(srv, runtime.config(), sink)
+  send(rt1, call_frame("stale-1", "slow_tool", "data"))
 
-  let ex1 = server.fresh_exchange()
-  let call_frame = make_call_frame("stale-1", "slow_tool", "data")
-  let assert Ok(_) = runtime.send_frame(rt1, ex1, "ctx", call_frame, 1000)
-
-  // Close and stop owner 1 while invocation is running
+  // Close and stop owner 1 while the invocation runs.
   runtime.close(rt1)
-  runtime.stop(rt1, 100)
+  runtime.stop(rt1)
 
-  // Start new owner 2
-  let assert Ok(rt2) = runtime.start(s, cfg, sink)
+  // Start owner 2 on the same sink.
+  let assert Ok(rt2) = runtime.start(srv, runtime.config(), sink)
 
-  // Wait until owner 1's invocation would have finished
+  // Wait until owner 1's invocation would have finished.
   process.sleep(200)
 
-  // No stale message leaked into the sink from the stopped owner
+  // No stale message leaked into the sink from the stopped owner.
   process.receive(box, 100) |> should.be_error()
 
   runtime.close(rt2)
-  runtime.stop(rt2, 1000)
+  runtime.stop(rt2)
 
   ffi_mailbox_size(ffi_self()) |> should.equal(0)
 }
 
 // 7. Simultaneous handler completion (repeated 5 times)
 pub fn simultaneous_handler_completion_test() {
+  drain()
   repeat(5, fn(iter) {
-    let reg = sample_registry()
-    let s = server.server(reg)
-    let box: Subject(BitArray) = process.new_subject()
-    let sink = fn(output) { send_output_to(box, output) }
-    let cfg =
-      RuntimeConfig(
-        max_frame_bytes: 65_536,
-        max_live_exchanges: 100,
-        invocation_timeout_ms: 5000,
-        tombstone_retention_ms: 10_000,
-      )
+    let config =
+      runtime.config()
+      |> runtime.with_max_frame_bytes(65_536)
+      |> runtime.with_max_live_exchanges(100)
+      |> runtime.with_invocation_timeout(duration.seconds(5))
+      |> runtime.with_tombstone_retention(duration.seconds(10))
+    let #(rt, box) = start(echo_server(), config)
 
-    let assert Ok(rt) = runtime.start(s, cfg, sink)
-
-    // Dispatch 10 concurrent requests
-    let ids = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    list.each(ids, fn(i) {
-      let ex = server.fresh_exchange()
-      let id_str = "sim-" <> int.to_string(iter) <> "-" <> int.to_string(i)
-      let frame = make_call_frame(id_str, "echo", id_str)
-      let assert Ok(_) = runtime.send_frame(rt, ex, "ctx", frame, 1000)
-    })
-
-    // All 10 must complete and produce distinct responses
-    let responses =
-      list.map(ids, fn(_) {
-        let assert Ok(resp) = process.receive(box, 3000)
-        resp
+    // Dispatch 10 concurrent requests.
+    let ids =
+      list.map([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], fn(i) {
+        let id = "sim-" <> int.to_string(iter) <> "-" <> int.to_string(i)
+        send(rt, call_frame(id, "echo", id))
+        id
       })
 
-    list.length(responses) |> should.equal(10)
+    // All 10 complete with distinct responses.
+    list.map(ids, fn(_) {
+      let assert Ok(resp) = process.receive(box, 3000)
+      support.at(resp, ["id"], decode.string)
+    })
+    |> set.from_list
+    |> should.equal(set.from_list(ids))
 
     runtime.close(rt)
-    runtime.stop(rt, 1000)
+    runtime.stop(rt)
 
     ffi_mailbox_size(ffi_self()) |> should.equal(0)
   })
@@ -391,32 +266,30 @@ pub fn simultaneous_handler_completion_test() {
 
 // 8. Repeated close idempotency
 pub fn repeated_close_idempotency_test() {
-  let reg = sample_registry()
-  let s = server.server(reg)
-  let box: Subject(BitArray) = process.new_subject()
-  let sink = fn(output) { send_output_to(box, output) }
-  let cfg = runtime.default_config()
+  let #(rt, _box) = start(echo_server(), runtime.config())
 
-  let assert Ok(rt) = runtime.start(s, cfg, sink)
-
-  // Repeated runtime close calls
+  // Repeated runtime close calls.
   runtime.close(rt)
   runtime.close(rt)
   runtime.close(rt)
 
-  // Sending frame after close fails cleanly
-  let ex = server.fresh_exchange()
-  let frame = make_call_frame("after-close", "echo", "hi")
-  runtime.send_frame(rt, ex, "ctx", frame, 1000)
-  |> should.be_error()
+  // A frame after close fails cleanly.
+  runtime.send_frame(
+    rt,
+    reducer.new_exchange_id(),
+    "ctx",
+    call_frame("after-close", "echo", "hi"),
+    None,
+  )
+  |> should.equal(Error(runtime.RuntimeStopped))
 
-  // Pure reducer repeated close is also idempotent
-  let ex2 = server.exchange_id(999)
-  let s0 = server.server(reg)
-  let #(s1, eff1) = server.step(s0, ExchangeClosed(ex2))
+  // A repeated close in the pure reducer is idempotent too.
+  let ex = reducer.new_exchange_id()
+  let s0 = reducer.init(echo_server())
+  let #(s1, eff1) = reducer.step(s0, ExchangeClosed(ex))
   eff1 |> should.equal([])
-  let #(_s2, eff2) = server.step(s1, ExchangeClosed(ex2))
+  let #(_s2, eff2) = reducer.step(s1, ExchangeClosed(ex))
   eff2 |> should.equal([])
 
-  runtime.stop(rt, 1000)
+  runtime.stop(rt)
 }

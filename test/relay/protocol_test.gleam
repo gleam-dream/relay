@@ -3,35 +3,99 @@ import gleam/dynamic/decode
 import gleam/json
 import gleam/option.{None, Some}
 import gleam/string
-import gleeunit
 import gleeunit/should
 import json/blueprint/number
 import json/blueprint/value
+import relay/content
+import relay/internal/core
+import relay/internal/jsonrpc.{ProgressInteger, RequestInteger, RequestString}
+import relay/internal/logging.{Debug, Warning}
 import relay/internal/protocol/v2026_07_28 as v2026
-import relay/logging.{Debug, Warning}
-import relay/protocol/jsonrpc.{ProgressInteger, RequestInteger, RequestString}
 
-pub fn main() -> Nil {
-  gleeunit.main()
+const identity = v2026.Identity("relay", "0.1.0")
+
+fn no_capabilities() -> v2026.Capabilities {
+  v2026.Capabilities(
+    tools: False,
+    resources: False,
+    prompts: False,
+    completions: False,
+  )
 }
 
-// Test discovery response shape and serverInfo
+fn decoded(
+  rendered: json.Json,
+  path: List(String),
+  decoder: decode.Decoder(a),
+) -> a {
+  let assert Ok(found) =
+    json.parse(json.to_string(rendered), decode.at(path, decoder))
+  found
+}
+
+fn present(rendered: json.Json, path: List(String)) -> Bool {
+  case json.parse(json.to_string(rendered), decode.at(path, decode.dynamic)) {
+    Ok(_) -> True
+    Error(_) -> False
+  }
+}
+
+// The discovery response carries the result, versions and serverInfo.
 pub fn discovery_response_test() {
-  let req_id = RequestString("disc-1")
-  let resp_json = v2026.encode_discovery_response(req_id)
-  let str = json.to_string(resp_json)
-
-  // Parse back to inspect fields
-  let assert Ok(parsed) = json.parse(str, decode.dynamic)
-  let assert Ok(dict) =
-    decode.run(parsed, decode.dict(decode.string, decode.dynamic))
-
-  let assert Ok(_) = dict.get(dict, "result")
+  let rendered =
+    v2026.encode_discovery_response(
+      RequestString("disc-1"),
+      no_capabilities(),
+      identity,
+      None,
+    )
+  decoded(rendered, ["result", "supportedVersions"], decode.list(decode.string))
+  |> should.equal(["2026-07-28"])
+  decoded(rendered, ["result", "resultType"], decode.string)
+  |> should.equal("complete")
+  decoded(
+    rendered,
+    ["result", "_meta", "io.modelcontextprotocol/serverInfo", "name"],
+    decode.string,
+  )
+  |> should.equal("relay")
+  present(rendered, ["result", "instructions"]) |> should.be_false
 }
 
-// Test unsupported version returns -32022
+pub fn discovery_response_advertises_offered_capabilities_test() {
+  let rendered =
+    v2026.encode_discovery_response(
+      RequestInteger(1),
+      v2026.Capabilities(
+        tools: True,
+        resources: True,
+        prompts: False,
+        completions: True,
+      ),
+      v2026.Identity("notes", "1.0.0"),
+      Some("Read the notes."),
+    )
+  decoded(
+    rendered,
+    ["result", "capabilities", "tools", "listChanged"],
+    decode.bool,
+  )
+  |> should.be_true
+  decoded(
+    rendered,
+    ["result", "capabilities", "resources", "subscribe"],
+    decode.bool,
+  )
+  |> should.be_true
+  present(rendered, ["result", "capabilities", "completions"]) |> should.be_true
+  present(rendered, ["result", "capabilities", "prompts"]) |> should.be_false
+  decoded(rendered, ["result", "instructions"], decode.string)
+  |> should.equal("Read the notes.")
+}
+
+// An unsupported protocol version answers -32022.
 pub fn unsupported_version_test() {
-  let raw_request =
+  let raw =
     json.object([
       #("jsonrpc", json.string("2.0")),
       #("id", json.int(1)),
@@ -54,13 +118,9 @@ pub fn unsupported_version_test() {
     ])
     |> json.to_string()
 
-  let admission = v2026.admit_message(raw_request)
-  case admission {
-    v2026.AdmittedRejected(Some(RequestInteger(1)), err) -> {
-      err.code |> should.equal(-32_022)
-    }
-    _ -> should.fail()
-  }
+  let assert v2026.AdmittedRejected(Some(RequestInteger(1)), err) =
+    v2026.admit_message(raw)
+  err.code |> should.equal(-32_022)
 }
 
 pub fn exact_blueprint_number_round_trips_through_wire_test() {
@@ -75,31 +135,31 @@ pub fn exact_blueprint_number_round_trips_through_wire_test() {
   let assert Ok(expected) =
     number.parse(number_text, number.limits(1024, 100, 1000))
 
-  case v2026.admit_message(raw) {
-    v2026.AdmittedRequest(v2026.ToolsCall(
-      _,
-      _,
-      _,
-      value.Object([#("n", value.Number(actual))]),
-      _,
-      _,
-    )) -> actual |> should.equal(expected)
-    _ -> should.fail()
-  }
+  let assert v2026.AdmittedRequest(v2026.ToolsCall(
+    _,
+    _,
+    "exact",
+    value.Object([#("n", value.Number(actual))]),
+    None,
+    None,
+  )) = v2026.admit_message(raw)
+  actual |> should.equal(expected)
 
   let response =
-    v2026.encode_call_success_response(
+    v2026.encode_call_response(
       RequestInteger(1),
-      value.Object([#("n", value.Number(expected))]),
+      Some(value.Object([#("n", value.Number(expected))])),
+      [],
+      False,
+      identity,
     )
-  let rendered = json.to_string(response)
-  string.contains(rendered, "\"n\":" <> number_text)
-  |> should.equal(True)
+  string.contains(json.to_string(response), "\"n\":" <> number_text)
+  |> should.be_true
 }
 
 pub fn json_parser_preserves_non_ascii_text_test() {
-  let assert Ok(value) = json.parse("\"€\"", decode.dynamic)
-  let assert Ok(text) = decode.run(value, decode.string)
+  let assert Ok(parsed) = json.parse("\"€\"", decode.dynamic)
+  let assert Ok(text) = decode.run(parsed, decode.string)
   text |> should.equal("€")
 }
 
@@ -130,21 +190,17 @@ pub fn malformed_present_client_info_is_rejected_test() {
       ),
     ])
 
-  case v2026.admit_message(discovery_request(meta)) {
-    v2026.AdmittedRejected(Some(RequestInteger(7)), err) ->
-      err.code |> should.equal(-32_602)
-    _ -> should.fail()
-  }
+  let assert v2026.AdmittedRejected(Some(RequestInteger(7)), err) =
+    v2026.admit_message(discovery_request(meta))
+  err.code |> should.equal(-32_602)
 }
 
 pub fn malformed_present_progress_token_is_rejected_test() {
   let meta = request_meta([#("progressToken", json.bool(True))])
 
-  case v2026.admit_message(discovery_request(meta)) {
-    v2026.AdmittedRejected(Some(RequestInteger(7)), err) ->
-      err.code |> should.equal(-32_602)
-    _ -> should.fail()
-  }
+  let assert v2026.AdmittedRejected(Some(RequestInteger(7)), err) =
+    v2026.admit_message(discovery_request(meta))
+  err.code |> should.equal(-32_602)
 }
 
 pub fn valid_client_info_and_zero_progress_token_are_retained_test() {
@@ -160,15 +216,12 @@ pub fn valid_client_info_and_zero_progress_token_are_retained_test() {
       #("progressToken", json.int(0)),
     ])
 
-  case v2026.admit_message(discovery_request(meta)) {
-    v2026.AdmittedRequest(v2026.Discover(_, admitted)) -> {
-      admitted.client_info
-      |> should.equal(Some(v2026.ClientInfo("client", "1.2.3")))
-      admitted.progress_token
-      |> should.equal(Some(ProgressInteger(0)))
-    }
-    _ -> should.fail()
-  }
+  let assert v2026.AdmittedRequest(v2026.Discover(_, admitted)) =
+    v2026.admit_message(discovery_request(meta))
+  admitted.client_info
+  |> should.equal(Some(v2026.ClientInfo("client", "1.2.3")))
+  admitted.progress_token
+  |> should.equal(Some(ProgressInteger(0)))
 }
 
 pub fn modern_log_level_is_request_scoped_metadata_test() {
@@ -177,14 +230,11 @@ pub fn modern_log_level_is_request_scoped_metadata_test() {
       #("io.modelcontextprotocol/logLevel", json.string("debug")),
     ])
 
-  case v2026.admit_message(discovery_request(meta)) {
-    v2026.AdmittedRequest(v2026.Discover(_, admitted)) -> {
-      admitted.log_level |> should.equal(Some(Debug))
-      v2026.request_allows_log(admitted, Debug) |> should.be_true
-      v2026.request_allows_log(admitted, Warning) |> should.be_true
-    }
-    _ -> should.fail()
-  }
+  let assert v2026.AdmittedRequest(v2026.Discover(_, admitted)) =
+    v2026.admit_message(discovery_request(meta))
+  admitted.log_level |> should.equal(Some(Debug))
+  v2026.request_allows_log(admitted, Debug) |> should.be_true
+  v2026.request_allows_log(admitted, Warning) |> should.be_true
 }
 
 pub fn legacy_logging_set_level_rpc_is_not_admitted_test() {
@@ -193,11 +243,9 @@ pub fn legacy_logging_set_level_rpc_is_not_admitted_test() {
       #("level", json.string("debug")),
     ])
 
-  case v2026.admit_message(raw) {
-    v2026.AdmittedRejected(Some(RequestInteger(7)), err) ->
-      err.code |> should.equal(-32_601)
-    _ -> should.fail()
-  }
+  let assert v2026.AdmittedRejected(Some(RequestInteger(7)), err) =
+    v2026.admit_message(raw)
+  err.code |> should.equal(-32_601)
 }
 
 pub fn resource_read_continuation_is_rejected_test() {
@@ -207,11 +255,9 @@ pub fn resource_read_continuation_is_rejected_test() {
       #("requestState", json.string("continue-me")),
     ])
 
-  case v2026.admit_message(raw) {
-    v2026.AdmittedRejected(Some(RequestInteger(7)), err) ->
-      err.code |> should.equal(-32_602)
-    _ -> should.fail()
-  }
+  let assert v2026.AdmittedRejected(Some(RequestInteger(7)), err) =
+    v2026.admit_message(raw)
+  err.code |> should.equal(-32_602)
 }
 
 pub fn prompt_get_continuation_is_admitted_test() {
@@ -221,80 +267,190 @@ pub fn prompt_get_continuation_is_admitted_test() {
       #("inputResponses", json.object([])),
     ])
 
-  case v2026.admit_message(raw) {
-    v2026.AdmittedRequest(v2026.PromptsGet(
-      RequestInteger(7),
-      _,
-      "welcome",
-      _,
-      None,
-      Some(value.Object([])),
-    )) -> Nil
-    _ -> should.fail()
-  }
+  let assert v2026.AdmittedRequest(v2026.PromptsGet(
+    RequestInteger(7),
+    _,
+    "welcome",
+    _,
+    None,
+    Some(value.Object([])),
+  )) = v2026.admit_message(raw)
+}
+
+fn completion_request(extra: List(#(String, json.Json))) -> String {
+  service_request("completion/complete", [
+    #(
+      "ref",
+      json.object([
+        #("type", json.string("ref/prompt")),
+        #("name", json.string("welcome")),
+      ]),
+    ),
+    #(
+      "argument",
+      json.object([
+        #("name", json.string("name")),
+        #("value", json.string("a")),
+      ]),
+    ),
+    ..extra
+  ])
+}
+
+// The 2026-07-28 schema nests the known argument values under
+// `context.arguments`.
+pub fn completion_parses_spec_shaped_context_test() {
+  let raw =
+    completion_request([
+      #(
+        "context",
+        json.object([
+          #(
+            "arguments",
+            json.object([
+              #("lang", json.string("gleam")),
+              #("tone", json.string("dry")),
+            ]),
+          ),
+        ]),
+      ),
+    ])
+
+  let assert v2026.AdmittedRequest(v2026.CompletionComplete(
+    RequestInteger(7),
+    _,
+    core.CompletionQuery(core.PromptTarget("welcome"), "name", "a", known),
+  )) = v2026.admit_message(raw)
+  known
+  |> should.equal(dict.from_list([#("lang", "gleam"), #("tone", "dry")]))
+}
+
+pub fn completion_without_context_has_no_known_arguments_test() {
+  let assert v2026.AdmittedRequest(v2026.CompletionComplete(
+    _,
+    _,
+    core.CompletionQuery(_, _, _, known),
+  )) = v2026.admit_message(completion_request([]))
+  known |> should.equal(dict.new())
+}
+
+pub fn completion_resource_reference_is_parsed_test() {
+  let raw =
+    service_request("completion/complete", [
+      #(
+        "ref",
+        json.object([
+          #("type", json.string("ref/resource")),
+          #("uri", json.string("memo://{id}")),
+        ]),
+      ),
+      #(
+        "argument",
+        json.object([
+          #("name", json.string("id")),
+          #("value", json.string("4")),
+        ]),
+      ),
+    ])
+  let assert v2026.AdmittedRequest(v2026.CompletionComplete(
+    _,
+    _,
+    core.CompletionQuery(core.ResourceTarget("memo://{id}"), "id", "4", _),
+  )) = v2026.admit_message(raw)
+}
+
+pub fn completion_context_with_non_string_argument_is_rejected_test() {
+  let raw =
+    completion_request([
+      #(
+        "context",
+        json.object([
+          #("arguments", json.object([#("count", json.int(3))])),
+        ]),
+      ),
+    ])
+  let assert v2026.AdmittedRejected(Some(RequestInteger(7)), err) =
+    v2026.admit_message(raw)
+  err.code |> should.equal(-32_602)
 }
 
 fn service_request(
   method: String,
   fields: List(#(String, json.Json)),
 ) -> String {
-  let meta = request_meta([])
   json.object([
     #("jsonrpc", json.string("2.0")),
     #("id", json.int(7)),
     #("method", json.string(method)),
-    #("params", json.object([#("_meta", meta), ..fields])),
+    #("params", json.object([#("_meta", request_meta([])), ..fields])),
   ])
   |> json.to_string
 }
 
-// Test call success encoding includes resultType: "complete" and serverInfo in _meta
+// A call success has resultType "complete" and serverInfo in _meta.
 pub fn call_success_encoding_test() {
-  let req_id = RequestString("call-1")
-  let structured = value.String("hello world")
-  let resp = v2026.encode_call_success_response(req_id, structured)
-  let str = json.to_string(resp)
+  let rendered =
+    v2026.encode_call_response(
+      RequestString("call-1"),
+      Some(value.String("hello world")),
+      [content.text("hello world")],
+      False,
+      identity,
+    )
 
-  // Verify resultType is complete and serverInfo exists
-  let assert Ok(parsed) = json.parse(str, decode.dynamic)
-  let assert Ok(dict) =
-    decode.run(parsed, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(result_dyn) = dict.get(dict, "result")
-  let assert Ok(result_dict) =
-    decode.run(result_dyn, decode.dict(decode.string, decode.dynamic))
-
-  let assert Ok(res_type) = dict.get(result_dict, "resultType")
-  let assert Ok(res_type_str) = decode.run(res_type, decode.string)
-  res_type_str |> should.equal("complete")
-
-  let assert Ok(meta_dyn) = dict.get(result_dict, "_meta")
-  let assert Ok(meta_dict) =
-    decode.run(meta_dyn, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(server_info_dyn) =
-    dict.get(meta_dict, "io.modelcontextprotocol/serverInfo")
-  let assert Ok(server_info_dict) =
-    decode.run(server_info_dyn, decode.dict(decode.string, decode.string))
-  let assert Ok(name) = dict.get(server_info_dict, "name")
-  name |> should.equal("relay")
+  decoded(rendered, ["result", "resultType"], decode.string)
+  |> should.equal("complete")
+  decoded(rendered, ["result", "structuredContent"], decode.string)
+  |> should.equal("hello world")
+  present(rendered, ["result", "isError"]) |> should.be_false
+  decoded(
+    rendered,
+    ["result", "_meta", "io.modelcontextprotocol/serverInfo"],
+    decode.dict(decode.string, decode.string),
+  )
+  |> should.equal(dict.from_list([#("name", "relay"), #("version", "0.1.0")]))
 }
 
-// Test call error encoding includes isError: true, text in content, and NO structuredContent
+// A tool error has isError: true, its text in content and no
+// structuredContent.
 pub fn call_error_encoding_test() {
-  let req_id = RequestString("call-err-1")
-  let resp = v2026.encode_call_error_response(req_id, "Something went wrong")
-  let str = json.to_string(resp)
+  let rendered =
+    v2026.encode_call_response(
+      RequestString("call-err-1"),
+      None,
+      [content.text("Something went wrong")],
+      True,
+      identity,
+    )
 
-  let assert Ok(parsed) = json.parse(str, decode.dynamic)
-  let assert Ok(dict) =
-    decode.run(parsed, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(result_dyn) = dict.get(dict, "result")
-  let assert Ok(result_dict) =
-    decode.run(result_dyn, decode.dict(decode.string, decode.dynamic))
+  decoded(rendered, ["result", "isError"], decode.bool) |> should.be_true
+  decoded(
+    rendered,
+    ["result", "content"],
+    decode.list(decode.at(["text"], decode.string)),
+  )
+  |> should.equal(["Something went wrong"])
+  present(rendered, ["result", "structuredContent"]) |> should.be_false
+}
 
-  let assert Ok(is_error_dyn) = dict.get(result_dict, "isError")
-  let assert Ok(is_error) = decode.run(is_error_dyn, decode.bool)
-  is_error |> should.equal(True)
-
-  // structuredContent should NOT be present on application error
-  dict.get(result_dict, "structuredContent") |> should.be_error()
+// Whole progress values encode as integers, fractions as floats; total and
+// message are optional.
+pub fn progress_notification_encoding_test() {
+  v2026.encode_progress_notification(
+    jsonrpc.ProgressString("tok"),
+    0.5,
+    Some(2.0),
+    Some("half"),
+  )
+  |> json.to_string
+  |> should.equal(
+    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":"
+    <> "{\"progressToken\":\"tok\",\"progress\":0.5,\"total\":2,\"message\":\"half\"}}",
+  )
+  v2026.encode_progress_notification(ProgressInteger(3), 1.0, None, None)
+  |> json.to_string
+  |> should.equal(
+    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":"
+    <> "{\"progressToken\":3,\"progress\":1}}",
+  )
 }

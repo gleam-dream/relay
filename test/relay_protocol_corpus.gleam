@@ -1,14 +1,22 @@
+//// Prints one JSON line per wire message Relay delivers, for
+//// `scripts/relay_schema_check.py`, which validates each against the frozen
+//// MCP 2026-07-28 schema. Every server message passes through the reducer
+//// (admission, routing, invocation and response encoding), so the gate
+//// checks the delivered wire shapes. Each line is
+//// `{"label", "definition", ["resultDefinition",] "instance"}`.
+
 import gleam/bit_array
 import gleam/io
 import gleam/json
-import gleam/option.{None, Some}
+import gleam/option.{None}
 import gleam/string
 import json/blueprint/codec
 import relay/completion
 import relay/content
 import relay/internal/protocol/v2026_07_28 as v2026
+import relay/internal/subscriptions_state as subs
 import relay/prompts
-import relay/protocol/jsonrpc.{RequestString}
+import relay/reducer
 import relay/resources
 import relay/server
 import relay/subscriptions
@@ -16,234 +24,128 @@ import relay/test_codec
 import relay/tool
 
 pub fn main() -> Nil {
-  // 1. Tool setup
-  let assert Ok(greet_name) = tool.tool_name("greet")
-  let assert Ok(greet_tool) = case
-    tool.definition(
-      greet_name,
+  // Tools: one that succeeds and one that fails with an application error.
+  let greet =
+    tool.define(
+      "greet",
       test_codec.property("name", codec.string()),
       codec.string(),
     )
-  {
-    Ok(definition) -> {
-      let definition =
-        tool.with_metadata(
-          definition,
-          tool.ToolMetadata(
-            ..tool.empty_metadata(),
-            description: Some("Greets the user"),
-          ),
-        )
-      Ok(
-        tool.handle_with_error_renderer(
-          definition,
-          fn(name: String) { Ok("Hello " <> name) },
-          fn(application_error) {
-            case codec.encode_json(codec.success(Nil), application_error) {
-              Ok(text) -> text
-              Error(_) -> "Tool execution failed."
-            }
-          },
-        ),
-      )
-    }
-    Error(error) -> Error(error)
-  }
-
-  let assert Ok(fail_name) = tool.tool_name("fail_tool")
-  let assert Ok(fail_tool) = case
-    tool.definition(
-      fail_name,
+    |> tool.with_description("Greets the user")
+    |> tool.handle(fn(name: String) { Ok("Hello " <> name) })
+  let fail =
+    tool.define(
+      "fail_tool",
       test_codec.property("msg", codec.string()),
       codec.string(),
     )
-  {
-    Ok(definition) -> {
-      let definition =
-        tool.with_metadata(
-          definition,
-          tool.ToolMetadata(
-            ..tool.empty_metadata(),
-            description: Some("Fails with application error"),
+    |> tool.with_description("Fails with application error")
+    |> tool.handle_with_error_renderer(
+      fn(msg: String) { Error("application error: " <> msg) },
+      tool.error_message,
+    )
+  let tools = reducer.init(server.new([greet, fail]))
+
+  let #(tools, delivered) = deliver(tools, "server/discover", [])
+  emit("discover", "DiscoverResultResponse", delivered)
+
+  let #(tools, delivered) = deliver(tools, "tools/list", [])
+  emit("tools_list", "ListToolsResultResponse", delivered)
+
+  let #(tools, delivered) =
+    deliver(tools, "tools/call", [
+      #("name", json.string("greet")),
+      #("arguments", json.object([#("name", json.string("World"))])),
+    ])
+  emit("tool_call_success", "CallToolResultResponse", delivered)
+
+  let #(tools, delivered) =
+    deliver(tools, "tools/call", [
+      #("name", json.string("fail_tool")),
+      #("arguments", json.object([#("msg", json.string("deliberate failure"))])),
+    ])
+  emit("tool_call_error", "CallToolResultResponse", delivered)
+
+  // An unsupported protocol version is refused at admission.
+  let #(_tools, delivered) =
+    deliver_frame(
+      tools,
+      frame(
+        "server/discover",
+        json.object([
+          #(
+            "io.modelcontextprotocol/protocolVersion",
+            json.string("2024-01-01"),
           ),
-        )
-      Ok(
-        tool.handle_with_error_renderer(
-          definition,
-          fn(msg: String) { Error("application error: " <> msg) },
-          fn(application_error) {
-            case
-              codec.encode_json(
-                test_codec.property("reason", codec.string()),
-                application_error,
-              )
-            {
-              Ok(text) -> text
-              Error(_) -> "Tool execution failed."
-            }
-          },
-        ),
-      )
-    }
-    Error(error) -> Error(error)
-  }
-
-  let assert Ok(reg) = tool.registry([greet_tool, fail_tool])
-
-  // 1. Discover response
-  let disc_wire =
-    v2026.encode_discovery_response(RequestString("disc-1"))
-    |> json.to_string()
-  emit("discover", "DiscoverResultResponse", disc_wire)
-
-  // 2. Tools list response
-  let decls = tool.declarations(reg, "corpus")
-  let list_wire =
-    v2026.encode_tools_list_response(RequestString("list-1"), decls)
-    |> json.to_string()
-  emit("tools_list", "ListToolsResultResponse", list_wire)
-
-  // 3. Call success response
-  let assert Ok(args_val) =
-    codec.encode(test_codec.property("name", codec.string()), "World")
-  let assert Ok(call_success_val) =
-    tool.dispatch(reg, "corpus", greet_name, args_val)
-  let call_success_wire =
-    v2026.encode_call_success_response(
-      RequestString("call-1"),
-      call_success_val,
+          #("io.modelcontextprotocol/clientCapabilities", json.object([])),
+        ]),
+        [],
+      ),
     )
-    |> json.to_string()
-  emit("tool_call_success", "CallToolResultResponse", call_success_wire)
+  emit("unsupported_version", "UnsupportedProtocolVersionError", delivered)
 
-  // 4. Call application error response
-  let call_err_wire =
-    v2026.encode_call_error_response(
-      RequestString("call-2"),
-      "application error: deliberate failure",
-    )
-    |> json.to_string()
-  emit("tool_call_error", "CallToolResultResponse", call_err_wire)
-
-  let subscription_id = RequestString("sub-1")
-  let filter =
-    subscriptions.SubscriptionFilter(
-      tools_list_changed: True,
-      resources_list_changed: True,
-      prompts_list_changed: True,
-      resource_subscriptions: ["memory://corpus/one"],
-    )
-  let listen_wire =
-    v2026.encode_subscriptions_listen_request(subscription_id, filter)
-    |> json.to_string
-  emit("subscriptions_listen", "SubscriptionsListenRequest", listen_wire)
-  let acknowledgement_wire =
-    v2026.encode_subscriptions_acknowledged_notification(
-      subscription_id,
-      filter,
-    )
-    |> json.to_string
-  emit(
-    "subscriptions_acknowledged",
-    "SubscriptionsAcknowledgedNotification",
-    acknowledgement_wire,
-  )
-  let resource_updated_wire =
-    v2026.encode_resource_updated_notification(
-      subscription_id,
-      "memory://corpus/one",
-    )
-    |> json.to_string
-  emit("resource_updated", "ResourceUpdatedNotification", resource_updated_wire)
-  let tools_changed_wire =
-    v2026.encode_tools_list_changed_notification(subscription_id)
-    |> json.to_string
-  emit("tools_list_changed", "ToolListChangedNotification", tools_changed_wire)
-  let resources_changed_wire =
-    v2026.encode_resources_list_changed_notification(subscription_id)
-    |> json.to_string
-  emit(
-    "resources_list_changed",
-    "ResourceListChangedNotification",
-    resources_changed_wire,
-  )
-  let prompts_changed_wire =
-    v2026.encode_prompts_list_changed_notification(subscription_id)
-    |> json.to_string
-  emit(
-    "prompts_list_changed",
-    "PromptListChangedNotification",
-    prompts_changed_wire,
-  )
-
-  // 5. Unsupported protocol version error
-  let unsupp_err =
-    jsonrpc.unsupported_protocol_version("2024-01-01", ["2026-07-28"])
-  let unsupp_wire =
-    jsonrpc.error_to_json(Some(RequestString("unsupp-1")), unsupp_err)
-    |> json.to_string()
-  emit("unsupported_version", "UnsupportedProtocolVersionError", unsupp_wire)
-
-  // Service results below pass through server admission, dispatch and response
-  // encoding, so the gate checks the actual delivered wire shapes.
-  let assert Ok(empty_registry) = tool.registry([])
+  // Services: resources, a template, a prompt and a completion handler.
   let resource =
-    resources.resource(
+    resources.static(
       "memory://corpus/one",
       "corpus resource",
       fn(_context: Nil, uri) {
         Ok([
-          content.TextResourceContents(uri, "resource body", Some("text/plain")),
+          content.TextResourceContents(
+            uri,
+            "resource body",
+            option.Some("text/plain"),
+            [],
+          ),
         ])
       },
     )
-  let assert Ok(template) =
-    resources.resource_template(
+  let template =
+    resources.template(
       "memory://corpus/{id}",
       "corpus template",
       fn(_context: Nil, uri) {
         Ok([
-          content.TextResourceContents(uri, "template body", Some("text/plain")),
+          content.TextResourceContents(
+            uri,
+            "template body",
+            option.Some("text/plain"),
+            [],
+          ),
         ])
       },
     )
   let prompt =
     prompts.prompt("welcome", [], fn(_context: Nil, _arguments) {
-      Ok(
-        prompts.PromptResult(None, [
-          prompts.PromptMessage(content.UserRole, content.text_content("hello")),
-        ]),
-      )
+      Ok(prompts.PromptResult(None, [prompts.user_message("hello")], []))
     })
-  let completion =
-    completion.completion(fn(_context: Nil, _reference, argument) {
-      Ok(completion.CompletionValues([argument.value], Some(1), Some(False)))
+  let complete =
+    completion.completion(fn(_context: Nil, request: completion.Request) {
+      Ok(completion.Values([request.value], option.Some(1), option.Some(False)))
     })
-  let service_server =
-    server.server(empty_registry)
-    |> server.with_resources([resource])
-    |> server.with_resource_templates([template])
+  let services =
+    server.new([greet])
+    |> server.with_resources([resource, template])
     |> server.with_prompts([prompt])
-    |> server.with_completion(Some(completion))
+    |> server.with_completion(complete)
+    |> reducer.init
 
-  let #(service_server, delivered) =
-    deliver(service_server, "resources/list", [])
+  let #(services, delivered) = deliver(services, "resources/list", [])
   emit_service(
     "resources_list",
     "ListResourcesResultResponse",
     "ListResourcesResult",
     delivered,
   )
-  let #(service_server, delivered) =
-    deliver(service_server, "resources/templates/list", [])
+  let #(services, delivered) = deliver(services, "resources/templates/list", [])
   emit_service(
     "resource_templates_list",
     "ListResourceTemplatesResultResponse",
     "ListResourceTemplatesResult",
     delivered,
   )
-  let #(service_server, delivered) =
-    deliver(service_server, "resources/read", [
+  let #(services, delivered) =
+    deliver(services, "resources/read", [
       #("uri", json.string("memory://corpus/one")),
     ])
   emit_service(
@@ -252,15 +154,15 @@ pub fn main() -> Nil {
     "ReadResourceResult",
     delivered,
   )
-  let #(service_server, delivered) = deliver(service_server, "prompts/list", [])
+  let #(services, delivered) = deliver(services, "prompts/list", [])
   emit_service(
     "prompts_list",
     "ListPromptsResultResponse",
     "ListPromptsResult",
     delivered,
   )
-  let #(service_server, delivered) =
-    deliver(service_server, "prompts/get", [
+  let #(services, delivered) =
+    deliver(services, "prompts/get", [
       #("name", json.string("welcome")),
       #("arguments", json.object([])),
     ])
@@ -270,8 +172,8 @@ pub fn main() -> Nil {
     "GetPromptResult",
     delivered,
   )
-  let #(_service_server, delivered) =
-    deliver(service_server, "completion/complete", [
+  let #(services, delivered) =
+    deliver(services, "completion/complete", [
       #(
         "ref",
         json.object([
@@ -286,6 +188,12 @@ pub fn main() -> Nil {
           #("value", json.string("a")),
         ]),
       ),
+      #(
+        "context",
+        json.object([
+          #("arguments", json.object([#("lang", json.string("gleam"))])),
+        ]),
+      ),
     ])
   emit_service(
     "completion",
@@ -293,64 +201,148 @@ pub fn main() -> Nil {
     "CompleteResult",
     delivered,
   )
+
+  // A listen stream: the request as the client encodes it, then the
+  // acknowledgement and every notification kind the server writes on it.
+  let filter =
+    subs.filter_of([
+      subscriptions.ToolsListChanged,
+      subscriptions.ResourcesListChanged,
+      subscriptions.PromptsListChanged,
+      subscriptions.ResourceUpdated("memory://corpus/one"),
+    ])
+  let listen =
+    frame("subscriptions/listen", default_meta(), [
+      #("notifications", v2026.filter_to_json(filter)),
+    ])
+  emit("subscriptions_listen", "SubscriptionsListenRequest", body(listen))
+
+  let exchange = reducer.new_exchange_id()
+  let #(services, effects) =
+    reducer.step(services, reducer.Received(exchange, Nil, listen, None))
+  let assert [reducer.Admitted(_, _), reducer.Write(_, ack)] = effects
+  emit(
+    "subscriptions_acknowledged",
+    "SubscriptionsAcknowledgedNotification",
+    body(ack),
+  )
+
+  let services =
+    notify(
+      services,
+      subscriptions.ResourceUpdated("memory://corpus/one"),
+      "resource_updated",
+      "ResourceUpdatedNotification",
+    )
+  let services =
+    notify(
+      services,
+      subscriptions.ToolsListChanged,
+      "tools_list_changed",
+      "ToolListChangedNotification",
+    )
+  let services =
+    notify(
+      services,
+      subscriptions.ResourcesListChanged,
+      "resources_list_changed",
+      "ResourceListChangedNotification",
+    )
+  let _services =
+    notify(
+      services,
+      subscriptions.PromptsListChanged,
+      "prompts_list_changed",
+      "PromptListChangedNotification",
+    )
+  Nil
+}
+
+fn default_meta() -> json.Json {
+  json.object([
+    #("io.modelcontextprotocol/protocolVersion", json.string("2026-07-28")),
+    #("io.modelcontextprotocol/clientCapabilities", json.object([])),
+  ])
+}
+
+fn frame(
+  method: String,
+  meta: json.Json,
+  fields: List(#(String, json.Json)),
+) -> BitArray {
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("id", json.int(1)),
+    #("method", json.string(method)),
+    #("params", json.object([#("_meta", meta), ..fields])),
+  ])
+  |> json.to_string
+  |> bit_array.from_string
 }
 
 fn deliver(
-  server: server.Server(Nil),
+  state: reducer.State(Nil),
   method: String,
   fields: List(#(String, json.Json)),
-) -> #(server.Server(Nil), String) {
-  let meta =
-    json.object([
-      #("io.modelcontextprotocol/protocolVersion", json.string("2026-07-28")),
-      #("io.modelcontextprotocol/clientCapabilities", json.object([])),
-    ])
-  let request =
-    json.object([
-      #("jsonrpc", json.string("2.0")),
-      #("id", json.int(1)),
-      #("method", json.string(method)),
-      #("params", json.object([#("_meta", meta), ..fields])),
-    ])
-  let #(server, effects) =
-    server.step(
-      server,
-      server.MessageReceived(
-        server.fresh_exchange(),
-        Nil,
-        request |> json.to_string |> bit_array.from_string,
-      ),
+) -> #(reducer.State(Nil), String) {
+  deliver_frame(state, frame(method, default_meta(), fields))
+}
+
+// Steps one request frame through the reducer, runs its invocation when it
+// starts one, and returns the response the client receives.
+fn deliver_frame(
+  state: reducer.State(Nil),
+  bytes: BitArray,
+) -> #(reducer.State(Nil), String) {
+  let #(state, effects) =
+    reducer.step(
+      state,
+      reducer.Received(reducer.new_exchange_id(), Nil, bytes, None),
     )
   case effects {
-    [
-      server.EmitRequestAdmitted(_, _),
-      server.Write(_, bytes),
-      server.CloseExchange(_),
-    ] -> #(server, response_body(bytes))
-    [server.EmitRequestAdmitted(_, _), server.StartInvocation(invocation)] -> {
-      let #(server, effects) = server.step(server, server.perform(invocation))
-      let assert [server.Write(_, bytes), server.CloseExchange(_)] = effects
-      #(server, response_body(bytes))
+    [reducer.Admitted(_, _), reducer.Write(_, bytes), reducer.Close(_)]
+    | [reducer.Write(_, bytes), reducer.Close(_)] -> #(state, body(bytes))
+    [reducer.Admitted(_, _), reducer.Start(invocation)] -> {
+      let finished = reducer.perform(invocation, fn(_, _, _) { Nil })
+      let #(state, effects) = reducer.step(state, finished)
+      let assert [reducer.Write(_, bytes), reducer.Close(_)] = effects
+      #(state, body(bytes))
     }
-    _ -> panic as "service corpus request was not delivered"
+    _ -> panic as "corpus request was not delivered"
   }
 }
 
-fn response_body(bytes: BitArray) -> String {
+fn notify(
+  state: reducer.State(Nil),
+  notification: subscriptions.Notification,
+  label: String,
+  definition: String,
+) -> reducer.State(Nil) {
+  let #(state, effects) = reducer.step(state, reducer.Notify(notification))
+  let assert [reducer.Write(_, bytes)] = effects
+  emit(label, definition, body(bytes))
+  state
+}
+
+// The JSON text of a frame, without the newline the reducer appends.
+fn body(bytes: BitArray) -> String {
   let assert Ok(text) = bit_array.to_string(bytes)
-  string.drop_end(text, 1)
+  case string.ends_with(text, "\n") {
+    True -> string.drop_end(text, 1)
+    False -> text
+  }
 }
 
 fn emit(label: String, definition: String, wire_json: String) -> Nil {
-  let line =
+  io.println(
     "{\"label\":"
     <> json.to_string(json.string(label))
     <> ",\"definition\":"
     <> json.to_string(json.string(definition))
     <> ",\"instance\":"
     <> wire_json
-    <> "}"
-  io.println(line)
+    <> "}",
+  )
 }
 
 fn emit_service(
@@ -359,7 +351,7 @@ fn emit_service(
   result_definition: String,
   wire_json: String,
 ) -> Nil {
-  let line =
+  io.println(
     "{\"label\":"
     <> json.to_string(json.string(label))
     <> ",\"definition\":"
@@ -368,6 +360,6 @@ fn emit_service(
     <> json.to_string(json.string(result_definition))
     <> ",\"instance\":"
     <> wire_json
-    <> "}"
-  io.println(line)
+    <> "}",
+  )
 }

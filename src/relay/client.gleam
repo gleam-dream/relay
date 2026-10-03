@@ -1,99 +1,149 @@
-//// MCP client for the `2026-07-28` revision over Streamable HTTP or a local
-//// stdio child process.
+//// An MCP client for the `2026-07-28` revision, over Streamable HTTP, a
+//// local stdio child process, or a server in the same VM.
 ////
-//// Use this module to discover a peer, list and call tools, read resources, get
-//// prompts, request completions, listen for subscription notifications, and
-//// send raw checked JSON-RPC calls. `http_config` derives an `HttpClientConfig`
-//// from an absolute URL, and `stdio_config` describes a child process; both
-//// carry explicit timeout, response-size, input-method and listing limits.
+//// Build a `Config` with `http(url)`, `stdio(executable, arguments)` or
+//// `in_process(server, context)`, adjust it with the `with_*` setters, and
+//// `connect`. Then:
 ////
-//// `call_definition` and `call_content_definition` reuse the codecs of a
-//// `relay/tool` definition. `call_discovered` sends exact
-//// `json/blueprint/value` arguments to a tool returned by `list_tools`. An
-//// `InputRequired` outcome holds a continuation that `resume_tool` answers, so
-//// the peer must stay open until the call reaches a terminal outcome.
+//// - `call(client, definition, input)` calls a tool with the same
+////   `relay/tool.Definition` the server registered, and decodes its output;
+//// - `list_tools` and `call_discovered` serve tools known only at runtime;
+//// - `read_resource`, `get_prompt`, `complete`, `discover`, the listings,
+////   `listen` and the raw `call_raw` and `list_raw` cover the rest.
+////
+//// Every operation returns `Result(_, Error)`. `Error` carries the HTTP
+//// status, the JSON-RPC error, or the transport failure with its
+//// submission `Evidence`; branch on `kind(error)` or `evidence(error)` and
+//// log `describe_error(error)`. A tool's own failure is not an `Error`: it
+//// is the `ToolFailed` result.
+////
+//// Per-call controls are views on the client: `with_deadline`,
+//// `with_cancellation` and `with_correlation` return a new handle over the
+//// same connection, and every operation through it honours them. In MCP
+//// `2026-07-28` closing the connection cancels a request, so a deadline or a
+//// cancellation that ends an HTTP call closes that call's connection, and
+//// the server stops its handler; the next call reconnects.
 ////
 //// ```gleam
 //// import gleam/result
 //// import relay/client
 //// import relay/tool
 ////
-//// pub fn call_greet(
-////   definition: tool.Definition(String, String),
-//// ) -> Result(#(client.Client, client.ToolCallOutcome(String)), client.ClientError) {
-////   use config <- result.try(client.http_config("http://127.0.0.1:3000/"))
-////   use peer <- result.try(
-////     config |> client.with_timeout(30_000) |> client.connect_http(),
-////   )
-////   Ok(#(peer, client.call_definition(peer, definition, "Ada")))
+//// pub fn greet(
+////   greet: tool.Definition(String, String),
+//// ) -> Result(String, client.Error) {
+////   use config <- result.try(client.http("http://127.0.0.1:3000/"))
+////   use peer <- result.try(client.connect(config))
+////   let outcome = client.call(peer, greet, "Ada")
+////   client.close(peer)
+////   case outcome {
+////     Ok(client.Succeeded(text, _)) -> Ok(text)
+////     Ok(_) -> Ok("the tool did not answer")
+////     Error(error) -> Error(error)
+////   }
 //// }
 //// ```
+////
+//// | Setting | Default | Setter |
+//// | --- | --- | --- |
+//// | request timeout | 30 s | `with_timeout`, per call `with_deadline` |
+//// | connect | 10 s | `with_connect_timeout` |
+//// | response size | 1 MiB | `with_max_response_bytes` |
+//// | listings | 256 pages, 10,000 items | `with_listing_limits` |
+//// | stdio pending calls | 64, then `TooManyPendingCalls` | `with_max_pending_calls` |
+//// | input methods advertised | none | `with_input_methods` |
+//// | headers over plain HTTP to a non-loopback host | refused | `allow_plaintext_headers` |
+//// | retries | none: decide with `evidence` | |
 
 import gleam/bit_array
 import gleam/dict.{type Dict}
 import gleam/dynamic.{type Dynamic}
-import gleam/dynamic/decode as dyn_decode
-import gleam/erlang/process
+import gleam/dynamic/decode.{type Decoder}
+import gleam/erlang/process.{type Subject}
+import gleam/http
+import gleam/http/request
 import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/otp/actor
 import gleam/result
 import gleam/string
+import gleam/time/duration.{type Duration}
 import gleam/uri
-import json/blueprint/codec.{type Codec, encode}
-import json/blueprint/value as blueprint_value
+import http_gun
+import http_gun/body
+import http_gun/cancellation.{type Token}
+import http_gun/config as gun_config
+import http_gun/deadline.{type Deadline}
+import http_gun/destination
+import http_gun/error as gun_error
+import json/blueprint/codec
+import json/blueprint/value.{type Value}
 import relay/completion
-import relay/content
+import relay/content.{type ContentBlock, type ResourceContents}
+import relay/internal/core
+import relay/internal/emit
 import relay/internal/protocol/v2026_07_28 as v2026
+import relay/internal/subscriptions_state as subs
 import relay/internal/transport/stdio_client
+import relay/internal/wire
 import relay/prompts
-import relay/protocol/jsonrpc.{RequestString}
-import relay/subscriptions.{type SubscriptionFilter, SubscriptionFilter}
+import relay/reducer
+import relay/resources
+import relay/runtime
+import relay/server.{type Server}
+import relay/subscriptions.{type Notification}
+import relay/telemetry
 import relay/tool
+import sinal/correlation.{type Correlation}
 
 const protocol_version = "2026-07-28"
 
-/// Validated connection parameters derived from one endpoint URL.
-type ClientConfig {
-  ClientConfig(
-    host: String,
-    port: Int,
-    path: String,
-    secure: Bool,
-    timeout_ms: Int,
+// --- configuration -----------------------------------------------------------
+
+type Target {
+  HttpTarget(secure: Bool, host: String, port: Int, path: String)
+  StdioTarget(command: fn() -> #(String, List(String)))
+  InProcessTarget(open: fn(Int) -> Result(Peer, Nil))
+}
+
+/// How to reach a server. Build it with `http`, `stdio` or `in_process`;
+/// `connect` validates it.
+pub opaque type Config {
+  Config(
+    target: Target,
+    timeout: Duration,
+    connect_timeout: Duration,
     max_response_bytes: Int,
-  )
-}
-
-/// URL-derived HTTP settings with explicit bounds and optional CA trust.
-pub opaque type HttpClientConfig {
-  HttpClientConfig(
-    connection: ClientConfig,
+    input_methods: List(tool.InputMethod),
+    max_listing_pages: Int,
+    max_listing_items: Int,
+    headers: Option(fn() -> List(#(String, String))),
+    plaintext_headers: Bool,
     ca_cert_file: Option(String),
-    input_methods: List(InputMethod),
-    listing_limits: ListingLimits,
+    http_client: Option(http_gun.Client),
+    max_pending_calls: Int,
+    label: Option(String),
   )
 }
 
-/// Optional server-initiated methods this client is prepared to answer.
-pub type InputMethod {
-  Elicitation
-  Sampling
-  Roots
-}
-
-/// Aggregate bounds for a paginated listing.
-pub type ListingLimits {
-  ListingLimits(max_pages: Int, max_items: Int)
-}
-
-pub fn default_listing_limits() -> ListingLimits {
-  ListingLimits(max_pages: 256, max_items: 10_000)
-}
-
-fn valid_listing_limits(limits: ListingLimits) -> Bool {
-  limits.max_pages > 0 && limits.max_items > 0
+fn defaults(target: Target) -> Config {
+  Config(
+    target: target,
+    timeout: duration.seconds(30),
+    connect_timeout: duration.seconds(10),
+    max_response_bytes: 1_048_576,
+    input_methods: [],
+    max_listing_pages: 256,
+    max_listing_items: 10_000,
+    headers: None,
+    plaintext_headers: False,
+    ca_cert_file: None,
+    http_client: None,
+    max_pending_calls: 64,
+    label: None,
+  )
 }
 
 @external(erlang, "relay_url_ffi", "valid_ipv6")
@@ -102,110 +152,85 @@ fn valid_ipv6(host: String) -> Bool
 @external(erlang, "relay_url_ffi", "path_without_controls")
 fn path_without_controls(path: String) -> Bool
 
-fn parse_http_url(url: String) -> Result(uri.Uri, Nil) {
-  case
-    string.starts_with(string.lowercase(url), "http://[")
-    || string.starts_with(string.lowercase(url), "https://[")
-  {
-    False -> uri.parse(url)
-    True ->
-      case string.split_once(url, "[") {
-        Error(_) -> Error(Nil)
-        Ok(#(prefix, bracketed)) ->
-          case string.split_once(bracketed, "]") {
-            Error(_) -> Error(Nil)
-            Ok(#(address, suffix)) ->
-              case
-                valid_ipv6(address)
-                && {
-                  suffix == ""
-                  || string.starts_with(suffix, "/")
-                  || string.starts_with(suffix, ":")
-                }
-              {
-                False -> Error(Nil)
-                True ->
-                  case uri.parse(prefix <> "relay-ipv6.invalid" <> suffix) {
-                    Error(_) -> Error(Nil)
-                    Ok(parsed) ->
-                      Ok(uri.Uri(..parsed, host: Some("[" <> address <> "]")))
-                  }
-              }
-          }
-      }
+/// A Streamable HTTP server at an absolute `http` or `https` URL, such as
+/// `"https://mcp.example.com/mcp"`. A URL with userinfo, a query or a
+/// fragment fails with `InvalidConfig(Url)`; a missing path becomes `/`.
+pub fn http(url: String) -> Result(Config, Error) {
+  case parse_http_url(url) {
+    Ok(target) -> Ok(defaults(target))
+    Error(Nil) -> Error(InvalidConfig(Url))
   }
 }
 
-/// Parses an absolute HTTP(S) endpoint. Query, fragment, and userinfo are not
-/// MCP endpoint components. A missing path becomes `/`.
-pub fn http_config(url: String) -> Result(HttpClientConfig, ClientError) {
-  case parse_http_url(url) {
-    Error(_) -> Error(InvalidClientConfiguration)
-    Ok(parsed) -> {
-      let secure = case parsed.scheme {
-        Some(scheme) -> string.lowercase(scheme) == "https"
-        None -> False
-      }
-      let scheme_valid = case parsed.scheme {
-        Some(scheme) -> {
-          let scheme = string.lowercase(scheme)
-          scheme == "http" || scheme == "https"
+fn parse_http_url(url: String) -> Result(Target, Nil) {
+  use parsed <- result.try(parse_uri(url))
+  use scheme <- result.try(option.to_result(parsed.scheme, Nil))
+  let secure = string.lowercase(scheme) == "https"
+  use host <- result.try(option.to_result(parsed.host, Nil))
+  let port = case parsed.port {
+    Some(port) -> port
+    None if secure -> 443
+    None -> 80
+  }
+  let path = case parsed.path {
+    "" -> "/"
+    path -> path
+  }
+  case
+    { string.lowercase(scheme) == "http" || secure }
+    && parsed.userinfo == None
+    && parsed.query == None
+    && parsed.fragment == None
+    && valid_authority(url)
+    && valid_host(host)
+    && path_without_controls(path)
+    && valid_percent_escapes(string.to_graphemes(path))
+    && string.starts_with(path, "/")
+    && port > 0
+    && port < 65_536
+  {
+    True -> Ok(HttpTarget(secure, unbracket(host), port, path))
+    False -> Error(Nil)
+  }
+}
+
+fn parse_uri(url: String) -> Result(uri.Uri, Nil) {
+  let lowered = string.lowercase(url)
+  case
+    string.starts_with(lowered, "http://[")
+    || string.starts_with(lowered, "https://[")
+  {
+    False -> uri.parse(url)
+    True -> {
+      use #(prefix, bracketed) <- result.try(string.split_once(url, "["))
+      use #(address, suffix) <- result.try(string.split_once(bracketed, "]"))
+      case
+        valid_ipv6(address)
+        && {
+          suffix == ""
+          || string.starts_with(suffix, "/")
+          || string.starts_with(suffix, ":")
         }
-        None -> False
-      }
-      case parsed.host {
-        Some(host) -> {
-          let port = case parsed.port {
-            Some(explicit) -> explicit
-            None if secure -> 443
-            None -> 80
-          }
-          let path = case parsed.path {
-            "" -> "/"
-            other -> other
-          }
-          case
-            scheme_valid
-            && parsed.userinfo == None
-            && parsed.query == None
-            && parsed.fragment == None
-            && valid_raw_authority(url)
-            && valid_url_host(host)
-            && valid_url_path(path)
-            && port > 0
-            && port < 65_536
-            && string.starts_with(path, "/")
-          {
-            False -> Error(InvalidClientConfiguration)
-            True ->
-              Ok(HttpClientConfig(
-                connection: ClientConfig(
-                  host: unbracket_host(host),
-                  port: port,
-                  path: path,
-                  secure: secure,
-                  timeout_ms: 30_000,
-                  max_response_bytes: 1_048_576,
-                ),
-                ca_cert_file: None,
-                input_methods: [],
-                listing_limits: default_listing_limits(),
-              ))
-          }
+      {
+        False -> Error(Nil)
+        True -> {
+          use parsed <- result.map(uri.parse(
+            prefix <> "relay-ipv6.invalid" <> suffix,
+          ))
+          uri.Uri(..parsed, host: Some("[" <> address <> "]"))
         }
-        _ -> Error(InvalidClientConfiguration)
       }
     }
   }
 }
 
-fn valid_raw_authority(url: String) -> Bool {
+fn valid_authority(url: String) -> Bool {
   case string.split_once(url, "://") {
-    Error(_) -> False
+    Error(Nil) -> False
     Ok(#(_, rest)) -> {
       let authority = case string.split_once(rest, "/") {
-        Ok(#(before_path, _)) -> before_path
-        Error(_) -> rest
+        Ok(#(authority, _)) -> authority
+        Error(Nil) -> rest
       }
       authority != ""
       && !string.ends_with(authority, ":")
@@ -215,751 +240,1353 @@ fn valid_raw_authority(url: String) -> Bool {
   }
 }
 
-fn valid_url_path(path: String) -> Bool {
-  path_without_controls(path)
-  && valid_percent_escapes(string.to_graphemes(path))
-}
-
 fn valid_percent_escapes(chars: List(String)) -> Bool {
   case chars {
     [] -> True
     ["%", first, second, ..rest] ->
-      is_hex_digit(first) && is_hex_digit(second) && valid_percent_escapes(rest)
+      is_hex(first) && is_hex(second) && valid_percent_escapes(rest)
     ["%", ..] -> False
     [_, ..rest] -> valid_percent_escapes(rest)
   }
 }
 
-fn is_hex_digit(char: String) -> Bool {
+fn is_hex(char: String) -> Bool {
   string.contains("0123456789abcdefABCDEF", char)
 }
 
-fn valid_url_host(host: String) -> Bool {
+fn valid_host(host: String) -> Bool {
   host != ""
   && path_without_controls(host)
   && string.trim(host) == host
   && !string.contains(host, " ")
-  && !string.contains(host, "\n")
-  && !string.contains(host, "\t")
   && { !string.starts_with(host, "[") || string.ends_with(host, "]") }
 }
 
-fn unbracket_host(host: String) -> String {
+fn unbracket(host: String) -> String {
   case string.starts_with(host, "[") && string.ends_with(host, "]") {
     True -> host |> string.drop_start(1) |> string.drop_end(1)
     False -> host
   }
 }
 
-/// Last timeout value wins; validation occurs before connecting.
-pub fn with_timeout(
-  config: HttpClientConfig,
-  timeout_ms: Int,
-) -> HttpClientConfig {
-  HttpClientConfig(
-    ..config,
-    connection: ClientConfig(..config.connection, timeout_ms: timeout_ms),
+/// A server launched as a local child process that speaks MCP on its
+/// standard input and output. The executable runs directly, never through a
+/// shell. The command is held in a closure, so it does not print in
+/// `string.inspect`, crash reports or logs.
+pub fn stdio(executable: String, arguments: List(String)) -> Config {
+  defaults(StdioTarget(fn() { #(executable, arguments) }))
+}
+
+/// A server in this VM, served through its own `relay/runtime` with this
+/// context: no socket and no child process, the same wire messages. Useful
+/// for tests (`relay/testing.connect`) and for composing servers.
+pub fn in_process(server: Server(context), context: context) -> Config {
+  defaults(
+    InProcessTarget(fn(max_frame_bytes) {
+      in_process_peer(server, context, max_frame_bytes)
+    }),
   )
 }
 
-/// Last response limit wins; validation occurs before connecting.
-pub fn with_max_response_bytes(
-  config: HttpClientConfig,
-  max_response_bytes: Int,
-) -> HttpClientConfig {
-  HttpClientConfig(
-    ..config,
-    connection: ClientConfig(
-      ..config.connection,
-      max_response_bytes: max_response_bytes,
+/// How long one request may take; a view's `with_deadline` can shorten it.
+pub fn with_timeout(config: Config, timeout: Duration) -> Config {
+  Config(..config, timeout: timeout)
+}
+
+/// How long connecting, or starting the stdio child, may take.
+pub fn with_connect_timeout(config: Config, timeout: Duration) -> Config {
+  Config(..config, connect_timeout: timeout)
+}
+
+/// The largest response, or listen event, the client reads.
+pub fn with_max_response_bytes(config: Config, bytes: Int) -> Config {
+  Config(..config, max_response_bytes: bytes)
+}
+
+/// Advertises the server-initiated input methods this application will
+/// answer itself; a request for another method fails with
+/// `UnsupportedInputRequest`.
+pub fn with_input_methods(
+  config: Config,
+  methods: List(tool.InputMethod),
+) -> Config {
+  Config(..config, input_methods: methods)
+}
+
+/// Bounds the listings: at most `pages` pages and `items` items.
+pub fn with_listing_limits(config: Config, pages: Int, items: Int) -> Config {
+  Config(..config, max_listing_pages: pages, max_listing_items: items)
+}
+
+/// Adds headers to every HTTP request, computed per request so a
+/// refreshing token source plugs in:
+/// `with_headers(config, fn() { [#("authorization", "Bearer " <> token())] })`.
+/// Header names must be lowercase. Over plain `http://`, a client with
+/// headers reaches only loopback addresses unless `allow_plaintext_headers`.
+pub fn with_headers(
+  config: Config,
+  headers: fn() -> List(#(String, String)),
+) -> Config {
+  Config(..config, headers: Some(headers))
+}
+
+/// Lets a client with headers send them over plain `http://` to a
+/// non-loopback host, where anyone on the path can read them.
+pub fn allow_plaintext_headers(config: Config) -> Config {
+  Config(..config, plaintext_headers: True)
+}
+
+/// Trusts the CA certificates in this PEM file instead of the system's, for
+/// HTTPS.
+pub fn with_ca_cert_file(config: Config, path: String) -> Config {
+  Config(..config, ca_cert_file: Some(path))
+}
+
+/// Sends through this HTTP Gun client instead of starting one, sharing its
+/// pool, destination policy, cassettes and telemetry. Relay narrows each
+/// request to the URL's host and never stops the client.
+pub fn with_http_client(config: Config, client: http_gun.Client) -> Config {
+  Config(..config, http_client: Some(client))
+}
+
+/// How many calls may wait for a stdio child at once.
+pub fn with_max_pending_calls(config: Config, count: Int) -> Config {
+  Config(..config, max_pending_calls: count)
+}
+
+/// The `client` label in Relay's client telemetry, and the HTTP Gun label of
+/// a client Relay starts.
+pub fn with_label(config: Config, label: String) -> Config {
+  Config(..config, label: Some(label))
+}
+
+// --- errors ------------------------------------------------------------------
+
+/// The setting `connect` refused.
+pub type ConfigField {
+  Url
+  RequestTimeout
+  ConnectTimeout
+  MaxResponseBytes
+  ListingLimits
+  CaCertFile
+  MaxPendingCalls
+  Headers
+}
+
+/// Whether the server may have received a request.
+pub type Evidence {
+  /// Nothing reached the server; sending again cannot duplicate an effect.
+  NotSent
+  /// The request may have reached the server, which may have acted on it.
+  MaybeSent
+  /// The server received the request and answered it.
+  Completed
+}
+
+/// Why an operation failed. It may gain variants in a minor release:
+/// branch on `kind` and `evidence`, and match variants with a `_` arm.
+pub type Error {
+  InvalidConfig(field: ConfigField)
+  /// The connection or the child process could not be established.
+  ConnectFailed
+  /// The HTTP client's destination policy refused the host.
+  Refused
+  TimedOut(evidence: Evidence)
+  Cancelled(evidence: Evidence)
+  ConnectionClosed(evidence: Evidence)
+  ResponseTooLarge(limit: Int)
+  TooManyPendingCalls(limit: Int)
+  /// The server answered with a non-success HTTP status and no JSON-RPC
+  /// error; a 401 or 403 carries its `WWW-Authenticate` challenge.
+  HttpStatus(status: Int, www_authenticate: Option(String))
+  /// The server answered with a JSON-RPC error object.
+  RpcError(code: Int, message: String, data: Option(Value))
+  /// The response broke the protocol; `detail` is for logs only.
+  MalformedResponse(detail: String)
+  /// The server does not support the `2026-07-28` revision.
+  UnsupportedVersion(supported: List(String))
+  /// The server asked for an input method this client did not advertise.
+  UnsupportedInputRequest(method: String)
+  /// The arguments could not be encoded or are not a JSON object; `detail`
+  /// is for logs only.
+  InvalidArguments(detail: String)
+  /// `resume` needs exactly one JSON object response per request key.
+  InvalidInputResponses
+  ListingLimitExceeded(limit: Int)
+}
+
+/// The closed classification of an `Error`. It never gains variants.
+pub type Kind {
+  /// Fix the configuration.
+  Configuration
+  /// The server could not be reached, or the connection broke.
+  Unreachable
+  Timeout
+  Cancellation
+  /// Too many calls were waiting.
+  Overloaded
+  /// The server refused the request with an HTTP status.
+  Rejected
+  /// The server answered with a JSON-RPC error or broke the protocol.
+  Protocol
+  /// Fix the arguments or the input responses.
+  InvalidInput
+  /// A response or listing exceeded its bound.
+  TooLarge
+}
+
+/// The closed classification of an error, for branching.
+pub fn kind(error: Error) -> Kind {
+  case error {
+    InvalidConfig(_) -> Configuration
+    ConnectFailed | Refused | ConnectionClosed(_) -> Unreachable
+    TimedOut(_) -> Timeout
+    Cancelled(_) -> Cancellation
+    TooManyPendingCalls(_) -> Overloaded
+    HttpStatus(..) -> Rejected
+    RpcError(..)
+    | MalformedResponse(_)
+    | UnsupportedVersion(_)
+    | UnsupportedInputRequest(_) -> Protocol
+    InvalidArguments(_) | InvalidInputResponses -> InvalidInput
+    ResponseTooLarge(_) | ListingLimitExceeded(_) -> TooLarge
+  }
+}
+
+/// Whether the server may have received the request.
+pub fn evidence(error: Error) -> Evidence {
+  case error {
+    InvalidConfig(_)
+    | ConnectFailed
+    | Refused
+    | TooManyPendingCalls(_)
+    | InvalidArguments(_)
+    | InvalidInputResponses -> NotSent
+    TimedOut(evidence) | Cancelled(evidence) | ConnectionClosed(evidence) ->
+      evidence
+    ResponseTooLarge(_) | MalformedResponse(_) -> MaybeSent
+    HttpStatus(..)
+    | RpcError(..)
+    | UnsupportedVersion(_)
+    | UnsupportedInputRequest(_)
+    | ListingLimitExceeded(_) -> Completed
+  }
+}
+
+/// Whether sending the same request again is safe: always for a failure
+/// that sent nothing, for a lost connection or a timeout only when the
+/// operation is idempotent, and for HTTP 429 and 503.
+pub fn is_retryable(error: Error, idempotent idempotent: Bool) -> Bool {
+  case kind(error), evidence(error) {
+    Unreachable, NotSent | Timeout, NotSent | Overloaded, _ -> True
+    Unreachable, MaybeSent | Timeout, MaybeSent -> idempotent
+    Rejected, _ ->
+      case error {
+        HttpStatus(429, _) | HttpStatus(503, _) -> True
+        _ -> False
+      }
+    _, _ -> False
+  }
+}
+
+/// A stable identifier for logs and stored records, such as
+/// `"timed_out.maybe_sent"`.
+pub fn name(error: Error) -> String {
+  let evidence_name = fn(evidence) {
+    case evidence {
+      NotSent -> "not_sent"
+      MaybeSent -> "maybe_sent"
+      Completed -> "completed"
+    }
+  }
+  case error {
+    InvalidConfig(_) -> "invalid_config"
+    ConnectFailed -> "connect_failed"
+    Refused -> "refused"
+    TimedOut(evidence) -> "timed_out." <> evidence_name(evidence)
+    Cancelled(evidence) -> "cancelled." <> evidence_name(evidence)
+    ConnectionClosed(evidence) ->
+      "connection_closed." <> evidence_name(evidence)
+    ResponseTooLarge(_) -> "response_too_large"
+    TooManyPendingCalls(_) -> "too_many_pending_calls"
+    HttpStatus(status, _) -> "http_status." <> int.to_string(status)
+    RpcError(code, ..) -> "rpc_error." <> int.to_string(code)
+    MalformedResponse(_) -> "malformed_response"
+    UnsupportedVersion(_) -> "unsupported_version"
+    UnsupportedInputRequest(_) -> "unsupported_input_request"
+    InvalidArguments(_) -> "invalid_arguments"
+    InvalidInputResponses -> "invalid_input_responses"
+    ListingLimitExceeded(_) -> "listing_limit_exceeded"
+  }
+}
+
+/// A one-line description for logs.
+pub fn describe_error(error: Error) -> String {
+  case error {
+    InvalidConfig(field) ->
+      "invalid Relay client setting: " <> config_field_name(field)
+    ConnectFailed -> "the MCP server could not be reached"
+    Refused -> "the destination policy refused the MCP server's address"
+    TimedOut(_) -> "the MCP request timed out"
+    Cancelled(_) -> "the MCP request was cancelled"
+    ConnectionClosed(_) -> "the connection to the MCP server closed"
+    ResponseTooLarge(limit) ->
+      "the MCP response exceeds " <> int.to_string(limit) <> " bytes"
+    TooManyPendingCalls(limit) ->
+      "more than " <> int.to_string(limit) <> " calls wait for the stdio server"
+    HttpStatus(status, _) ->
+      "the MCP server answered HTTP " <> int.to_string(status)
+    RpcError(code, message, _) ->
+      "the MCP server answered JSON-RPC error "
+      <> int.to_string(code)
+      <> ": "
+      <> message
+    MalformedResponse(detail) -> "malformed MCP response: " <> detail
+    UnsupportedVersion(supported) ->
+      "the MCP server supports "
+      <> string.join(supported, ", ")
+      <> ", not "
+      <> protocol_version
+    UnsupportedInputRequest(method) ->
+      "the MCP server asked for "
+      <> method
+      <> ", which this client did not advertise"
+    InvalidArguments(detail) -> "invalid tool arguments: " <> detail
+    InvalidInputResponses ->
+      "input responses must answer every request key with one JSON object"
+    ListingLimitExceeded(limit) ->
+      "the listing exceeds its limit of " <> int.to_string(limit)
+  }
+}
+
+fn config_field_name(field: ConfigField) -> String {
+  case field {
+    Url -> "the URL"
+    RequestTimeout -> "the request timeout"
+    ConnectTimeout -> "the connect timeout"
+    MaxResponseBytes -> "the response size limit"
+    ListingLimits -> "the listing limits"
+    CaCertFile -> "the CA certificate file"
+    MaxPendingCalls -> "the pending call limit"
+    Headers -> "the request headers"
+  }
+}
+
+// --- the connection ----------------------------------------------------------
+
+type Outgoing {
+  Outgoing(body: BitArray, id: String, method: String, name: Option(String))
+}
+
+type Budget {
+  Budget(
+    timeout_ms: Int,
+    deadline: Option(Deadline),
+    cancellation: Option(Token),
+    correlation: Option(Correlation),
+    max_bytes: Int,
+  )
+}
+
+type Incoming {
+  Incoming(status: Int, body: BitArray, www_authenticate: Option(String))
+}
+
+type Stream {
+  Stream(next: fn(Int) -> Result(Option(BitArray), Error), close: fn() -> Nil)
+}
+
+type Peer {
+  Peer(
+    send: fn(Outgoing, Budget) -> Result(Incoming, Error),
+    listen: fn(Outgoing, Budget) -> Result(Stream, Error),
+    close: fn() -> Nil,
+  )
+}
+
+/// A connected client. Copies share the connection; `with_deadline`,
+/// `with_cancellation` and `with_correlation` return views of it.
+pub opaque type Client {
+  Client(
+    peer: Peer,
+    config: Config,
+    deadline: Option(Deadline),
+    cancellation: Option(Token),
+    correlation: Option(Correlation),
+  )
+}
+
+fn ms(value: Duration) -> Int {
+  duration.to_milliseconds(value)
+}
+
+fn validate(config: Config) -> Result(Config, Error) {
+  case Nil {
+    _ if config.max_response_bytes <= 0 -> Error(InvalidConfig(MaxResponseBytes))
+    _ if config.max_listing_pages <= 0 || config.max_listing_items <= 0 ->
+      Error(InvalidConfig(ListingLimits))
+    _ if config.max_pending_calls <= 0 -> Error(InvalidConfig(MaxPendingCalls))
+    _ ->
+      case ms(config.timeout) > 0, ms(config.connect_timeout) > 0 {
+        False, _ -> Error(InvalidConfig(RequestTimeout))
+        _, False -> Error(InvalidConfig(ConnectTimeout))
+        True, True ->
+          case config.ca_cert_file, config.target {
+            Some(""), _ -> Error(InvalidConfig(CaCertFile))
+            Some(_), HttpTarget(secure: False, ..) ->
+              Error(InvalidConfig(CaCertFile))
+            Some(_), StdioTarget(_) | Some(_), InProcessTarget(_) ->
+              Error(InvalidConfig(CaCertFile))
+            _, _ -> Ok(config)
+          }
+      }
+  }
+}
+
+/// Validates the configuration and connects: starts the HTTP client, the
+/// stdio child or the in-process runtime. The connection is linked to the
+/// calling process.
+pub fn connect(config: Config) -> Result(Client, Error) {
+  use config <- result.try(validate(config))
+  use peer <- result.try(case config.target {
+    HttpTarget(secure, host, port, path) ->
+      http_peer(config, secure, host, port, path)
+    StdioTarget(command) -> stdio_peer(config, command)
+    InProcessTarget(open) ->
+      open(config.max_response_bytes) |> result.replace_error(ConnectFailed)
+  })
+  // A caller's HTTP Gun view may carry a correlation; Relay's telemetry
+  // copies it unless a Relay view sets its own.
+  let correlation = case config.http_client {
+    Some(gun) -> http_gun.correlation(gun)
+    None -> None
+  }
+  Ok(Client(peer, config, None, None, correlation))
+}
+
+/// Closes the connection and every request and stream on it.
+pub fn close(client: Client) -> Nil {
+  client.peer.close()
+}
+
+/// A view whose operations all end by `deadline`, a budget shared across
+/// calls; the client's timeout still applies when it is shorter.
+pub fn with_deadline(client: Client, deadline: Deadline) -> Client {
+  Client(..client, deadline: Some(deadline))
+}
+
+/// A view whose operations end when `token` is cancelled. A cancelled HTTP
+/// call closes its connection, which cancels it on the server; a stdio call
+/// sends `notifications/cancelled`.
+pub fn with_cancellation(client: Client, token: Token) -> Client {
+  Client(..client, cancellation: Some(token))
+}
+
+/// A view whose operations carry this correlation in Relay's and HTTP
+/// Gun's telemetry.
+pub fn with_correlation(client: Client, correlation: Correlation) -> Client {
+  Client(..client, correlation: Some(correlation))
+}
+
+fn budget(client: Client) -> Budget {
+  Budget(
+    timeout_ms: ms(client.config.timeout),
+    deadline: client.deadline,
+    cancellation: client.cancellation,
+    correlation: client.correlation,
+    max_bytes: client.config.max_response_bytes,
+  )
+}
+
+fn remaining_ms(budget: Budget) -> Int {
+  case budget.deadline {
+    None -> budget.timeout_ms
+    Some(deadline) ->
+      int.min(budget.timeout_ms, ms(deadline.remaining(deadline)))
+  }
+}
+
+fn is_cancelled(budget: Budget) -> Bool {
+  case budget.cancellation {
+    Some(token) -> cancellation.is_cancelled(token)
+    None -> False
+  }
+}
+
+// --- HTTP --------------------------------------------------------------------
+
+fn http_peer(
+  config: Config,
+  secure: Bool,
+  host: String,
+  port: Int,
+  path: String,
+) -> Result(Peer, Error) {
+  let entry = case string.contains(host, ":") {
+    True -> "[" <> host <> "]:" <> int.to_string(port)
+    False -> host <> ":" <> int.to_string(port)
+  }
+  let plaintext = case config.headers, config.plaintext_headers, secure {
+    Some(_), False, False -> destination.PlaintextToLoopbackOnly
+    _, _, _ -> destination.AllowPlaintext
+  }
+  let policy =
+    destination.default()
+    |> destination.allow_loopback
+    |> destination.allow_private
+    |> destination.only_hosts([entry])
+    |> destination.with_plaintext(plaintext)
+  use #(gun, owned) <- result.try(case config.http_client {
+    Some(gun) -> Ok(#(http_gun.with_destination(gun, policy), False))
+    None -> {
+      let settings =
+        gun_config.default()
+        |> gun_config.with_destination(policy)
+        |> gun_config.with_connect_timeout(config.connect_timeout)
+        |> gun_config.with_request_timeout(gun_config.After(config.timeout))
+        |> gun_config.with_max_response_body_bytes(config.max_response_bytes)
+      let settings = case config.ca_cert_file {
+        Some(path) -> gun_config.with_trust(settings, gun_config.CustomCa(path))
+        None -> settings
+      }
+      let settings = case config.label {
+        Some(label) -> gun_config.with_label(settings, label)
+        None -> settings
+      }
+      case http_gun.start(settings) {
+        Ok(gun) -> Ok(#(gun, True))
+        Error(http_gun.InvalidConfig(_)) -> Error(InvalidConfig(Url))
+        Error(_) -> Error(ConnectFailed)
+      }
+    }
+  })
+  let scheme = case secure {
+    True -> http.Https
+    False -> http.Http
+  }
+  let build = fn(out: Outgoing, accept: String) {
+    let extra = case config.headers {
+      Some(headers) -> headers()
+      None -> []
+    }
+    let base =
+      request.new()
+      |> request.set_method(http.Post)
+      |> request.set_scheme(scheme)
+      |> request.set_host(host)
+      |> request.set_port(port)
+      |> request.set_path(path)
+      |> request.set_body(out.body)
+      |> request.set_header("content-type", "application/json")
+      |> request.set_header("accept", accept)
+      |> request.set_header("mcp-protocol-version", protocol_version)
+      |> request.set_header("mcp-method", out.method)
+    let base = case out.name {
+      Some(name) ->
+        request.set_header(base, "mcp-name", uri.percent_encode(name))
+      None -> base
+    }
+    list.fold(extra, base, fn(req, header) {
+      request.set_header(req, string.lowercase(header.0), header.1)
+    })
+  }
+  let view = fn(budget: Budget, timeout: gun_config.Timeout) {
+    let view = http_gun.with_timeout(gun, timeout)
+    let view = case budget.deadline {
+      Some(deadline) -> http_gun.with_deadline(view, deadline)
+      None -> view
+    }
+    let view = case budget.cancellation {
+      Some(token) -> http_gun.with_cancellation(view, token)
+      None -> view
+    }
+    case budget.correlation {
+      Some(correlation) -> http_gun.with_correlation(view, correlation)
+      None -> view
+    }
+  }
+  Ok(
+    Peer(
+      send: fn(out, budget) {
+        let client =
+          view(
+            budget,
+            gun_config.After(duration.milliseconds(budget.timeout_ms)),
+          )
+          |> http_gun.with_body_limit(budget.max_bytes, http_gun.Fail)
+        case http_gun.send(client, build(out, "application/json")) {
+          Ok(buffered) ->
+            Ok(Incoming(
+              buffered.response.status,
+              buffered.response.body,
+              www_authenticate(buffered.response.headers),
+            ))
+          Error(failure) -> Error(gun_failure(failure, budget.max_bytes))
+        }
+      },
+      listen: fn(out, budget) {
+        let client = view(budget, gun_config.Infinity)
+        case http_gun.open(client, build(out, "text/event-stream")) {
+          Error(failure) -> Error(gun_failure(failure, budget.max_bytes))
+          Ok(response) ->
+            case response.status {
+              200 -> Ok(sse_stream(response.body, budget.max_bytes))
+              status -> {
+                let collected = body.collect(response.body, budget.max_bytes)
+                body.close(response.body)
+                case collected {
+                  Ok(collected) ->
+                    Error(
+                      status_error(Incoming(
+                        status,
+                        collected.bytes,
+                        www_authenticate(response.headers),
+                      )),
+                    )
+                  Error(failure) ->
+                    Error(gun_failure(failure, budget.max_bytes))
+                }
+              }
+            }
+        }
+      },
+      close: fn() {
+        case owned {
+          True -> http_gun.stop(gun)
+          False -> Nil
+        }
+      },
     ),
   )
 }
 
-/// Selects a CA certificate file for HTTPS. Plain HTTP rejects this setting.
-pub fn with_ca_cert_file(
-  config: HttpClientConfig,
-  ca_cert_file: String,
-) -> HttpClientConfig {
-  HttpClientConfig(..config, ca_cert_file: Some(ca_cert_file))
+fn www_authenticate(headers: List(#(String, String))) -> Option(String) {
+  list.key_find(headers, "www-authenticate") |> option.from_result
 }
 
-/// Advertises only methods the application will handle itself.
-pub fn with_input_methods(
-  config: HttpClientConfig,
-  methods: List(InputMethod),
-) -> HttpClientConfig {
-  HttpClientConfig(..config, input_methods: methods)
-}
-
-pub fn with_listing_limits(
-  config: HttpClientConfig,
-  limits: ListingLimits,
-) -> HttpClientConfig {
-  HttpClientConfig(..config, listing_limits: limits)
-}
-
-/// Connects using the URL-derived settings and optional explicit CA.
-pub fn connect_http(config: HttpClientConfig) -> Result(Client, ClientError) {
-  case valid_listing_limits(config.listing_limits) {
-    False -> Error(InvalidClientConfiguration)
-    True ->
-      connect_with_ca_option(
-        config.connection,
-        config.ca_cert_file,
-        config.input_methods,
-        config.listing_limits,
-      )
+fn gun_failure(failure: gun_error.Failure, limit: Int) -> Error {
+  let evidence = case gun_error.evidence(failure) {
+    gun_error.NotSent -> NotSent
+    gun_error.MaybeSent -> MaybeSent
+  }
+  case gun_error.kind(failure) {
+    gun_error.InvalidInput -> InvalidConfig(Headers)
+    gun_error.Refused -> Refused
+    gun_error.TimedOut -> TimedOut(evidence)
+    gun_error.TooLarge -> ResponseTooLarge(limit)
+    gun_error.CancelledLocally -> Cancelled(evidence)
+    gun_error.Network ->
+      case evidence {
+        NotSent -> ConnectFailed
+        _ -> ConnectionClosed(evidence)
+      }
+    gun_error.Unavailable | gun_error.Misuse | gun_error.Playback ->
+      ConnectionClosed(evidence)
   }
 }
 
-/// Configuration for a local stdio client process.
-pub type StdioConfig {
-  StdioConfig(
-    executable: String,
-    args: List(String),
-    timeout_ms: Int,
-    max_response_bytes: Int,
-    input_methods: List(InputMethod),
-    listing_limits: ListingLimits,
+// Server-sent events: blank-line separated, `data:` lines joined, comments
+// and other fields ignored.
+fn sse_stream(stream: body.Body, limit: Int) -> Stream {
+  let buffer = process.new_subject()
+  process.send(buffer, <<>>)
+  Stream(
+    next: fn(wait_ms) {
+      let assert Ok(pending) = process.receive(buffer, 0)
+      let #(event, rest, outcome) = next_event(stream, pending, wait_ms, limit)
+      process.send(buffer, rest)
+      case outcome {
+        Error(error) -> Error(error)
+        Ok(Nil) -> Ok(event)
+      }
+    },
+    close: fn() { body.close(stream) },
   )
 }
 
-/// Bounded local stdio defaults; callers can update the public record by name.
-pub fn stdio_config(executable: String, args: List(String)) -> StdioConfig {
-  StdioConfig(executable, args, 30_000, 1_048_576, [], default_listing_limits())
-}
-
-/// Opaque owner-bound HTTP or local stdio client.
-pub opaque type Client {
-  Client(
-    transport: ClientTransport,
-    path: String,
-    timeout_ms: Int,
-    max_response_bytes: Int,
-    input_methods: List(InputMethod),
-    listing_limits: ListingLimits,
-  )
-}
-
-type ClientTransport {
-  HttpTransport(process.Pid)
-  StdioTransport(stdio_client.Client)
-}
-
-pub type ClientError {
-  InvalidClientConfiguration
-  ConnectionFailed(String)
-}
-
-pub type ServerInfo {
-  ServerInfo(name: String, version: String)
-}
-
-/// Capabilities and server identity discovered from a live peer.
-pub type Discovery {
-  Discovery(
-    server_info: Option(ServerInfo),
-    supported_versions: List(String),
-    capabilities: Dynamic,
-  )
-}
-
-pub type IconTheme {
-  IconLight
-  IconDark
-}
-
-pub type Icon {
-  Icon(
-    src: String,
-    mime_type: Option(String),
-    sizes: Option(List(String)),
-    theme: Option(IconTheme),
-  )
-}
-
-pub type Annotations {
-  Annotations(
-    audience: Option(List(content.Role)),
-    priority: Option(Float),
-    last_modified: Option(String),
-  )
-}
-
-/// A typed tool declaration received from a peer. Schema documents remain
-/// ordinary Gleam JSON values because peers may use arbitrary JSON Schema.
-pub type ToolDeclaration {
-  ToolDeclaration(
-    name: String,
-    title: Option(String),
-    description: Option(String),
-    input_schema: json.Json,
-    output_schema: Option(json.Json),
-    annotations: Option(tool.ToolAnnotations),
-    icons: Option(List(Icon)),
-    meta: Option(json.Json),
-  )
-}
-
-/// A typed resource declaration received from a peer.
-pub type ResourceDeclaration {
-  ResourceDeclaration(
-    uri: String,
-    name: String,
-    title: Option(String),
-    description: Option(String),
-    mime_type: Option(String),
-    size: Option(Int),
-    annotations: Option(Annotations),
-    icons: Option(List(Icon)),
-    meta: Option(json.Json),
-  )
-}
-
-/// A typed resource-template declaration received from a peer.
-pub type ResourceTemplateDeclaration {
-  ResourceTemplateDeclaration(
-    uri_template: String,
-    name: String,
-    title: Option(String),
-    description: Option(String),
-    mime_type: Option(String),
-    annotations: Option(Annotations),
-    icons: Option(List(Icon)),
-    meta: Option(json.Json),
-  )
-}
-
-/// A typed prompt declaration received from a peer.
-pub type PromptDeclaration {
-  PromptDeclaration(
-    name: String,
-    title: Option(String),
-    description: Option(String),
-    arguments: List(prompts.PromptArgument),
-    icons: Option(List(Icon)),
-    meta: Option(json.Json),
-  )
-}
-
-/// The outcomes of a typed tool call remain distinct at the client boundary.
-pub type ToolCallOutcome(output) {
-  StructuredSuccess(output, content: List(content.ContentBlock))
-  ContentOnlySuccess(content: List(content.ContentBlock))
-  InputRequired(
-    continuation: ToolContinuation(output),
-    requests: Dict(String, tool.InputRequest),
-  )
-  ToolFailure(content: List(content.ContentBlock))
-  ProtocolFailure(reason: String)
-  TransportFailure(reason: TransportError)
-  InputEncodingFailure
-  InvalidInputResponses
-}
-
-/// Transport failures are classified before diagnostics are rendered.
-pub type TransportError {
-  ConnectionClosed
-  RequestCancelled
-  RequestTimedOut
-  ResponseLimitExceeded
-  TransportFault(String)
-}
-
-/// Content-only calls have no structured output codec.
-pub type ContentCallOutcome {
-  ContentSuccess(List(content.ContentBlock))
-  ContentToolFailure(List(content.ContentBlock))
-  ContentInputRequired(
-    continuation: ContentContinuation,
-    requests: Dict(String, tool.InputRequest),
-  )
-  ContentProtocolFailure(String)
-  ContentTransportFailure(TransportError)
-  ContentInputEncodingFailure
-  UnexpectedStructuredContent
-  ContentInvalidInputResponses
-}
-
-/// A paused call owns its originating connection, arguments, and output decoder.
-pub opaque type ToolContinuation(output) {
-  ToolContinuation(
-    client: Client,
-    name: String,
-    arguments: json.Json,
-    request_state: Option(String),
-    requests: Dict(String, tool.InputRequest),
-    decode_output: fn(blueprint_value.Value) -> Result(output, String),
-  )
-}
-
-pub opaque type ContentContinuation {
-  ContentContinuation(
-    client: Client,
-    name: String,
-    arguments: json.Json,
-    request_state: Option(String),
-    requests: Dict(String, tool.InputRequest),
-  )
-}
-
-/// A correlated notification received on one live subscriptions/listen stream.
-pub type SubscriptionNotification {
-  ResourceUpdated(uri: String)
-  ToolsListChanged
-  ResourcesListChanged
-  PromptsListChanged
-}
-
-/// An HTTP subscription stream owned by one Gun connection.
-pub opaque type Subscription {
-  HttpSubscription(
-    reader: process.Pid,
-    request_id: String,
-    notifications: SubscriptionFilter,
-  )
-  StdioSubscription(
-    client: stdio_client.Client,
-    request_id: String,
-    notifications: SubscriptionFilter,
-    max_response_bytes: Int,
-  )
-}
-
-@external(erlang, "relay_gun_ffi", "open")
-fn ffi_open(
-  host: String,
-  port: Int,
-  secure: Bool,
-  timeout_ms: Int,
-) -> Result(process.Pid, String)
-
-@external(erlang, "relay_gun_ffi", "open_with_ca")
-fn ffi_open_with_ca(
-  host: String,
-  port: Int,
-  secure: Bool,
-  ca_cert_file: String,
-  timeout_ms: Int,
-) -> Result(process.Pid, String)
-
-@external(erlang, "relay_gun_ffi", "request")
-fn ffi_request(
-  pid: process.Pid,
-  path: String,
-  body: BitArray,
-  method: String,
-  name: String,
-  version: String,
-  timeout_ms: Int,
-  max_response_bytes: Int,
-) -> Result(#(Int, BitArray), String)
-
-@external(erlang, "relay_gun_ffi", "request_typed")
-fn ffi_request_typed(
-  pid: process.Pid,
-  path: String,
-  body: BitArray,
-  method: String,
-  name: String,
-  version: String,
-  timeout_ms: Int,
-  max_response_bytes: Int,
-) -> Result(#(Int, BitArray), TransportError)
-
-@external(erlang, "relay_gun_ffi", "open_sse")
-fn ffi_open_sse(
-  pid: process.Pid,
-  path: String,
-  body: BitArray,
-  version: String,
-  timeout_ms: Int,
-  max_buffered_bytes: Int,
-) -> Result(process.Pid, String)
-
-@external(erlang, "relay_gun_ffi", "next_sse")
-fn ffi_next_sse(
-  reader: process.Pid,
-  timeout_ms: Int,
-) -> Result(BitArray, String)
-
-@external(erlang, "relay_gun_ffi", "close_sse")
-fn ffi_close_sse(reader: process.Pid) -> Nil
-
-@external(erlang, "relay_gun_ffi", "close")
-fn ffi_close(pid: process.Pid) -> Nil
-
-@external(erlang, "relay_gun_ffi", "unique_integer")
-fn ffi_unique_integer() -> Int
-
-fn connect_with_ca_option(
-  config: ClientConfig,
-  ca_cert_file: Option(String),
-  input_methods: List(InputMethod),
-  listing_limits: ListingLimits,
-) -> Result(Client, ClientError) {
-  case
-    string.trim(config.host) != ""
-    && config.port > 0
-    && config.port < 65_536
-    && string.starts_with(config.path, "/")
-    && config.timeout_ms > 0
-    && config.max_response_bytes > 0
-    && valid_ca_configuration(config.secure, ca_cert_file)
-  {
-    False -> Error(InvalidClientConfiguration)
-    True ->
-      case open_connection(config, ca_cert_file) {
-        Ok(pid) ->
-          Ok(Client(
-            transport: HttpTransport(pid),
-            path: config.path,
-            timeout_ms: config.timeout_ms,
-            max_response_bytes: config.max_response_bytes,
-            input_methods: input_methods,
-            listing_limits: listing_limits,
-          ))
-        Error(reason) -> Error(ConnectionFailed(reason))
+fn next_event(
+  stream: body.Body,
+  pending: BitArray,
+  wait_ms: Int,
+  limit: Int,
+) -> #(Option(BitArray), BitArray, Result(Nil, Error)) {
+  case split_event(pending) {
+    Some(#(event, rest)) ->
+      case event_data(event) {
+        Some(data) -> #(Some(data), rest, Ok(Nil))
+        None -> next_event(stream, rest, wait_ms, limit)
+      }
+    None ->
+      case bit_array.byte_size(pending) > limit {
+        True -> #(None, <<>>, Error(ResponseTooLarge(limit)))
+        False ->
+          case body.next_within(stream, duration.milliseconds(wait_ms)) {
+            Ok(None) -> #(None, pending, Ok(Nil))
+            Ok(Some(body.Chunk(chunk))) ->
+              next_event(stream, bit_array.append(pending, chunk), 0, limit)
+            Ok(Some(body.End(_))) -> #(
+              None,
+              pending,
+              Error(ConnectionClosed(Completed)),
+            )
+            Error(failure) -> #(
+              None,
+              pending,
+              Error(gun_failure(failure, limit)),
+            )
+          }
       }
   }
 }
 
-fn valid_ca_configuration(secure: Bool, ca_cert_file: Option(String)) -> Bool {
-  case secure, ca_cert_file {
-    True, None -> True
-    True, Some(path) -> path != ""
-    False, None -> True
-    False, Some(_) -> False
-  }
-}
-
-fn open_connection(
-  config: ClientConfig,
-  ca_cert_file: Option(String),
-) -> Result(process.Pid, String) {
-  case ca_cert_file {
-    Some(path) ->
-      ffi_open_with_ca(
-        config.host,
-        config.port,
-        config.secure,
-        path,
-        config.timeout_ms,
-      )
-    None -> ffi_open(config.host, config.port, config.secure, config.timeout_ms)
-  }
-}
-
-/// Starts a typed client for a local stdio-speaking child process.
-pub fn connect_stdio(config: StdioConfig) -> Result(Client, ClientError) {
-  case
-    config.timeout_ms > 0
-    && config.max_response_bytes > 0
-    && valid_listing_limits(config.listing_limits)
-  {
-    False -> Error(InvalidClientConfiguration)
-    True ->
-      case
-        stdio_client.connect(stdio_client.Config(
-          executable: config.executable,
-          args: config.args,
-          timeout_ms: config.timeout_ms,
-          max_frame_bytes: config.max_response_bytes,
-        ))
-      {
-        Ok(child) ->
-          Ok(Client(
-            transport: StdioTransport(child),
-            path: "",
-            timeout_ms: config.timeout_ms,
-            max_response_bytes: config.max_response_bytes,
-            input_methods: config.input_methods,
-            listing_limits: config.listing_limits,
-          ))
-        Error(reason) -> Error(ConnectionFailed(reason))
-      }
-  }
-}
-
-/// Closes the underlying Gun connection and its in-flight streams.
-pub fn close(client: Client) -> Nil {
-  case client.transport {
-    HttpTransport(pid) -> ffi_close(pid)
-    StdioTransport(child) -> stdio_client.close(child)
-  }
-}
-
-/// Discovers server capabilities and pins use to the retained 2026 revision.
-pub fn discover(client: Client) -> Result(Discovery, String) {
-  let id = request_id()
-  let body = request_envelope(client, id, "server/discover", [])
-  case request(client, body, id, "server/discover", "") {
-    Error(reason) -> Error(reason)
-    Ok(#(status, bytes)) ->
-      case status {
-        200 -> decode_discovery(bytes, id)
-        _ -> Error("server discovery returned HTTP " <> int.to_string(status))
-      }
-  }
-}
-
-/// Performs a raw method call while checking the JSON-RPC version and response ID.
-/// The returned bytes preserve the peer's exact JSON representation.
-pub fn raw_json_call(
-  client: Client,
-  method: String,
-  name: Option(String),
-  params: List(#(String, json.Json)),
-) -> Result(BitArray, String) {
-  let requires_name = case method {
-    "tools/call" | "prompts/get" | "resources/read" -> True
-    _ -> False
-  }
-  case requires_name, name {
-    True, None ->
-      Error(method <> " requires a routing name for MCP header agreement")
-    False, Some(_) -> Error("Mcp-Name is not valid for " <> method)
-    _, _ -> {
-      let id = request_id()
-      let body = request_envelope(client, id, method, params)
-      let name = case name {
-        None -> ""
-        Some(value) -> value
-      }
-      case request(client, body, id, method, name) {
-        Error(reason) -> Error(reason)
-        Ok(#(status, _)) if status != 200 ->
-          Error("raw method call returned HTTP " <> int.to_string(status))
-        Ok(#(_, bytes)) ->
-          validate_jsonrpc_response(bytes, id)
-          |> result.map(fn(_) { bytes })
+fn split_event(pending: BitArray) -> Option(#(String, BitArray)) {
+  case bit_array.to_string(pending) {
+    Error(Nil) -> None
+    Ok(text) -> {
+      let text = string.replace(text, "\r\n", "\n")
+      case string.split_once(text, "\n\n") {
+        Ok(#(event, rest)) -> Some(#(event, bit_array.from_string(rest)))
+        Error(Nil) -> None
       }
     }
   }
 }
 
-/// Traverses all tools/list pages and returns typed declarations.
-pub fn list_tools(client: Client) -> Result(List(ToolDeclaration), String) {
-  case list_json_pages(client, "tools/list", "tools") {
-    Error(reason) -> Error(reason)
-    Ok(items) -> decode_json_items(items, decode_tool_declaration)
+fn event_data(event: String) -> Option(BitArray) {
+  let data =
+    string.split(event, "\n")
+    |> list.filter_map(fn(line) {
+      case string.starts_with(line, "data:") {
+        True -> {
+          let rest = string.drop_start(line, 5)
+          Ok(case string.starts_with(rest, " ") {
+            True -> string.drop_start(rest, 1)
+            False -> rest
+          })
+        }
+        False -> Error(Nil)
+      }
+    })
+  case data {
+    [] -> None
+    lines -> Some(bit_array.from_string(string.join(lines, "\n")))
   }
 }
 
-/// Preserves each remote declaration as checked JSON for raw integrations.
-pub fn list_tools_json(client: Client) -> Result(List(String), String) {
-  list_json_pages(client, "tools/list", "tools")
-}
+// --- stdio -------------------------------------------------------------------
 
-/// Traverses all resources/list pages and returns typed declarations.
-pub fn list_resources(
-  client: Client,
-) -> Result(List(ResourceDeclaration), String) {
-  case list_json_pages(client, "resources/list", "resources") {
-    Error(reason) -> Error(reason)
-    Ok(items) -> decode_json_items(items, decode_resource_declaration)
-  }
-}
-
-/// Preserves each remote declaration as checked JSON for raw integrations.
-pub fn list_resources_json(client: Client) -> Result(List(String), String) {
-  list_json_pages(client, "resources/list", "resources")
-}
-
-/// Traverses all resources/templates/list pages as typed declarations.
-pub fn list_resource_templates(
-  client: Client,
-) -> Result(List(ResourceTemplateDeclaration), String) {
+fn stdio_peer(
+  config: Config,
+  command: fn() -> #(String, List(String)),
+) -> Result(Peer, Error) {
   case
-    list_json_pages(client, "resources/templates/list", "resourceTemplates")
+    stdio_client.connect(
+      command,
+      ms(config.connect_timeout),
+      config.max_response_bytes,
+    )
   {
-    Error(reason) -> Error(reason)
-    Ok(items) -> decode_json_items(items, decode_resource_template_declaration)
+    Error(Nil) -> Error(ConnectFailed)
+    Ok(child) ->
+      Ok(
+        Peer(
+          send: fn(out, budget) {
+            stdio_client.request(
+              child,
+              out.body,
+              out.id,
+              remaining_ms(budget),
+              budget.max_bytes,
+              config.max_pending_calls,
+              fn() { is_cancelled(budget) },
+            )
+            |> result.map(fn(frame) { Incoming(200, frame, None) })
+            |> result.map_error(stdio_failure)
+          },
+          listen: fn(out, budget) {
+            stdio_client.subscribe(
+              child,
+              out.body,
+              out.id,
+              remaining_ms(budget),
+              budget.max_bytes,
+            )
+            |> result.map_error(stdio_failure)
+            |> result.map(fn(acknowledgement) {
+              let first = process.new_subject()
+              process.send(first, Some(acknowledgement))
+              Stream(
+                next: fn(wait_ms) {
+                  case process.receive(first, 0) {
+                    Ok(Some(frame)) -> {
+                      process.send(first, None)
+                      Ok(Some(frame))
+                    }
+                    _ -> {
+                      process.send(first, None)
+                      stdio_client.next_notification(
+                        child,
+                        out.id,
+                        wait_ms,
+                        budget.max_bytes,
+                      )
+                      |> result.map_error(stdio_failure)
+                    }
+                  }
+                },
+                close: fn() { stdio_client.cancel_subscription(child, out.id) },
+              )
+            })
+          },
+          close: fn() { stdio_client.close(child) },
+        ),
+      )
   }
 }
 
-/// Preserves each remote declaration as checked JSON for raw integrations.
-pub fn list_resource_templates_json(
-  client: Client,
-) -> Result(List(String), String) {
-  list_json_pages(client, "resources/templates/list", "resourceTemplates")
-}
-
-/// Traverses all prompts/list pages and returns typed declarations.
-pub fn list_prompts(client: Client) -> Result(List(PromptDeclaration), String) {
-  case list_json_pages(client, "prompts/list", "prompts") {
-    Error(reason) -> Error(reason)
-    Ok(items) -> decode_json_items(items, decode_prompt_declaration)
+fn stdio_failure(failure: stdio_client.Failure) -> Error {
+  case failure {
+    stdio_client.NotRunning -> ConnectionClosed(NotSent)
+    stdio_client.Busy(limit) -> TooManyPendingCalls(limit)
+    stdio_client.TimedOut -> TimedOut(MaybeSent)
+    stdio_client.Exited -> ConnectionClosed(MaybeSent)
+    stdio_client.ClientClosed -> Cancelled(MaybeSent)
+    stdio_client.Cancelled -> Cancelled(MaybeSent)
+    stdio_client.TooLarge(limit) -> ResponseTooLarge(limit)
+    stdio_client.Malformed(detail) -> MalformedResponse(detail)
   }
 }
 
-/// Preserves each remote declaration as checked JSON for raw integrations.
-pub fn list_prompts_json(client: Client) -> Result(List(String), String) {
-  list_json_pages(client, "prompts/list", "prompts")
+// --- in process --------------------------------------------------------------
+
+type RouterMessage {
+  Register(exchange: Int, subject: Subject(runtime.Output), reply: Subject(Nil))
+  Unregister(exchange: Int)
+  Route(output: runtime.Output)
+  StopRouter
 }
 
-type DecodedToolResponse {
-  Completed(Bool, Option(blueprint_value.Value), List(content.ContentBlock))
-  Awaiting(Dict(String, tool.InputRequest), Option(String))
-}
-
-type ToolRequestFailure {
-  ToolTransport(TransportError)
-  ToolProtocol(String)
-}
-
-fn invoke_tool(
-  client: Client,
-  name: String,
-  arguments: json.Json,
-  request_state: Option(String),
-  input_responses: Option(Dict(String, json.Json)),
-) -> Result(DecodedToolResponse, ToolRequestFailure) {
-  let params = [
-    #("name", json.string(name)),
-    #("arguments", arguments),
-  ]
-  let params = case request_state {
-    None -> params
-    Some(state) -> [#("requestState", json.string(state)), ..params]
-  }
-  let params = case input_responses {
-    None -> params
-    Some(responses) -> [
-      #("inputResponses", json.object(dict.to_list(responses))),
-      ..params
-    ]
-  }
-  let id = request_id()
-  let body = request_envelope(client, id, "tools/call", params)
-  case request_typed(client, body, id, "tools/call", name) {
-    Error(failure) -> Error(ToolTransport(failure))
-    Ok(#(status, bytes)) if status != 200 ->
-      case validate_jsonrpc_response(bytes, id) {
-        Ok(_) ->
-          Error(ToolProtocol(
-            "tool call was rejected by the peer (HTTP "
-            <> int.to_string(status)
-            <> ")",
-          ))
-        Error(_) ->
-          Error(
-            ToolTransport(TransportFault(
-              "tool call returned HTTP " <> int.to_string(status),
-            )),
-          )
-      }
-    Ok(#(_, bytes)) ->
-      case decode_tool_response(bytes, id, client.max_response_bytes) {
-        Error(reason) -> Error(ToolProtocol(reason))
-        Ok(Awaiting(requests, state)) ->
-          case input_requests_supported(requests, client.input_methods) {
-            True -> Ok(Awaiting(requests, state))
-            False ->
-              Error(ToolProtocol("tool requested an undeclared input method"))
+fn in_process_peer(
+  srv: Server(context),
+  context: context,
+  max_frame_bytes: Int,
+) -> Result(Peer, Nil) {
+  use router <- result.try(
+    actor.new(dict.new())
+    |> actor.on_message(fn(routes, message) {
+      case message {
+        Register(exchange, subject, reply) -> {
+          process.send(reply, Nil)
+          actor.continue(dict.insert(routes, exchange, subject))
+        }
+        Unregister(exchange) -> actor.continue(dict.delete(routes, exchange))
+        Route(output) -> {
+          let exchange = case output {
+            runtime.OutputWrite(exchange, _) | runtime.OutputClose(exchange) ->
+              reducer.exchange_id_to_int(exchange)
           }
-        Ok(completed) -> Ok(completed)
+          case dict.get(routes, exchange) {
+            Ok(subject) -> process.send(subject, output)
+            Error(Nil) -> Nil
+          }
+          actor.continue(routes)
+        }
+        StopRouter -> actor.stop()
+      }
+    })
+    |> actor.start
+    |> result.map(fn(started) { started.data })
+    |> result.replace_error(Nil),
+  )
+  use rt <- result.try(
+    runtime.start(
+      srv,
+      runtime.config() |> runtime.with_max_frame_bytes(max_frame_bytes),
+      fn(output) {
+        process.send(router, Route(output))
+        Ok(Nil)
+      },
+    )
+    |> result.replace_error(Nil),
+  )
+  let open = fn(out: Outgoing, budget: Budget) {
+    let exchange = reducer.new_exchange_id()
+    let outputs = process.new_subject()
+    let _ =
+      process.call(router, waiting: 5000, sending: Register(
+        reducer.exchange_id_to_int(exchange),
+        outputs,
+        _,
+      ))
+    case
+      runtime.send_frame(rt, exchange, context, out.body, budget.correlation)
+    {
+      Ok(Nil) -> Ok(#(exchange, outputs))
+      Error(runtime.FrameTooLarge(..)) | Error(runtime.FrameTooDeep(..)) -> {
+        process.send(router, Unregister(reducer.exchange_id_to_int(exchange)))
+        Error(InvalidArguments("the request exceeds the server's frame limits"))
+      }
+      Error(_) -> {
+        process.send(router, Unregister(reducer.exchange_id_to_int(exchange)))
+        Error(ConnectionClosed(NotSent))
+      }
+    }
+  }
+  Ok(
+    Peer(
+      send: fn(out, budget) {
+        use #(exchange, outputs) <- result.try(open(out, budget))
+        let deadline = monotonic_ms() + remaining_ms(budget)
+        let outcome = await_frame(outputs, budget, deadline)
+        case outcome {
+          Error(_) -> runtime.exchange_closed(rt, exchange)
+          Ok(_) -> Nil
+        }
+        process.send(router, Unregister(reducer.exchange_id_to_int(exchange)))
+        result.map(outcome, fn(frame) { Incoming(200, frame, None) })
+      },
+      listen: fn(out, budget) {
+        use #(exchange, outputs) <- result.map(open(out, budget))
+        Stream(
+          next: fn(wait_ms) {
+            case process.receive(outputs, wait_ms) {
+              Error(Nil) -> Ok(None)
+              Ok(runtime.OutputWrite(_, bytes)) -> Ok(Some(bytes))
+              Ok(runtime.OutputClose(_)) -> Error(ConnectionClosed(Completed))
+            }
+          },
+          close: fn() {
+            runtime.exchange_closed(rt, exchange)
+            process.send(
+              router,
+              Unregister(reducer.exchange_id_to_int(exchange)),
+            )
+          },
+        )
+      },
+      close: fn() {
+        runtime.stop(rt)
+        process.send(router, StopRouter)
+      },
+    ),
+  )
+}
+
+@external(erlang, "relay_ffi", "monotonic_time_ms")
+fn monotonic_ms() -> Int
+
+fn await_frame(
+  outputs: Subject(runtime.Output),
+  budget: Budget,
+  deadline: Int,
+) -> Result(BitArray, Error) {
+  let left = deadline - monotonic_ms()
+  case left <= 0, is_cancelled(budget) {
+    _, True -> Error(Cancelled(MaybeSent))
+    True, _ -> Error(TimedOut(MaybeSent))
+    False, False ->
+      case process.receive(outputs, int.min(left, 50)) {
+        Error(Nil) -> await_frame(outputs, budget, deadline)
+        Ok(runtime.OutputWrite(_, bytes)) ->
+          case v2026.is_response_frame(bytes) {
+            True -> Ok(bytes)
+            False -> await_frame(outputs, budget, deadline)
+          }
+        Ok(runtime.OutputClose(_)) -> Error(ConnectionClosed(MaybeSent))
       }
   }
 }
 
-fn decode_typed_output(
-  output_codec: Codec(output),
-  value: blueprint_value.Value,
-) -> Result(output, String) {
-  codec.decode(output_codec, value)
-  |> result.map_error(fn(_) {
-    "structured content did not match the output codec"
+// --- requests ----------------------------------------------------------------
+
+@external(erlang, "relay_ffi", "unique_integer")
+fn unique_integer() -> Int
+
+fn new_id() -> String {
+  "relay-" <> int.to_string(unique_integer())
+}
+
+fn input_capabilities(methods: List(tool.InputMethod)) -> json.Json {
+  json.object(
+    list.flatten([
+      case list.contains(methods, tool.Elicitation) {
+        True -> [#("elicitation", json.object([]))]
+        False -> []
+      },
+      case list.contains(methods, tool.Sampling) {
+        True -> [#("sampling", json.object([]))]
+        False -> []
+      },
+      case list.contains(methods, tool.Roots) {
+        True -> [#("roots", json.object([]))]
+        False -> []
+      },
+    ]),
+  )
+}
+
+fn envelope(
+  client: Client,
+  id: String,
+  method: String,
+  params: List(#(String, json.Json)),
+) -> BitArray {
+  let meta =
+    json.object([
+      #(
+        "io.modelcontextprotocol/protocolVersion",
+        json.string(protocol_version),
+      ),
+      #(
+        "io.modelcontextprotocol/clientCapabilities",
+        input_capabilities(client.config.input_methods),
+      ),
+    ])
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("id", json.string(id)),
+    #("method", json.string(method)),
+    #("params", json.object([#("_meta", meta), ..params])),
+  ])
+  |> json.to_string
+  |> bit_array.from_string
+}
+
+type Response {
+  Response(result: Dynamic, body: BitArray)
+}
+
+fn request(
+  client: Client,
+  method: String,
+  name: Option(String),
+  params: List(#(String, json.Json)),
+) -> Result(Response, Error) {
+  let id = new_id()
+  let started = monotonic_ms()
+  let outcome =
+    client.peer.send(
+      Outgoing(envelope(client, id, method, params), id, method, name),
+      budget(client),
+    )
+    |> result.try(interpret(_, id))
+  let call_outcome = case outcome {
+    Error(_) -> telemetry.CallFailed
+    Ok(response) ->
+      case method {
+        "tools/call" -> tool_call_outcome(response.result)
+        _ -> telemetry.CallCompleted
+      }
+  }
+  emit.client_call(
+    int.max(0, monotonic_ms() - started),
+    telemetry.ClientCallMeta(
+      method: method,
+      tool: case method {
+        "tools/call" -> name
+        _ -> None
+      },
+      outcome: call_outcome,
+      correlation: client.correlation,
+      client: client.config.label,
+    ),
+  )
+  outcome
+}
+
+fn tool_call_outcome(result: Dynamic) -> telemetry.CallOutcome {
+  case
+    decode.run(result, decode.at(["resultType"], decode.string)),
+    decode.run(result, decode.at(["isError"], decode.bool))
+  {
+    Ok("input_required"), _ -> telemetry.CallInputRequired
+    _, Ok(True) -> telemetry.CallToolFailed
+    _, _ -> telemetry.CallCompleted
+  }
+}
+
+fn interpret(incoming: Incoming, id: String) -> Result(Response, Error) {
+  let parsed =
+    bit_array.to_string(incoming.body)
+    |> result.try(fn(text) {
+      json.parse(text, decode.dynamic) |> result.replace_error(Nil)
+    })
+  case parsed {
+    Error(Nil) -> Error(status_error(incoming))
+    Ok(message) ->
+      case
+        decode.run(message, decode.at(["jsonrpc"], decode.string)),
+        decode.run(message, decode.at(["id"], decode.string))
+      {
+        Ok("2.0"), Ok(found) if found == id ->
+          case decode.run(message, decode.at(["error"], rpc_error_decoder())) {
+            Ok(error) -> Error(error)
+            Error(_) ->
+              case
+                incoming.status,
+                decode.run(message, decode.at(["result"], decode.dynamic))
+              {
+                200, Ok(result) -> Ok(Response(result, incoming.body))
+                200, Error(_) ->
+                  Error(MalformedResponse("the response has no result"))
+                _, _ -> Error(status_error(incoming))
+              }
+          }
+        _, _ ->
+          case incoming.status {
+            200 -> Error(MalformedResponse("the response is not correlated"))
+            _ -> Error(status_error(incoming))
+          }
+      }
+  }
+}
+
+fn status_error(incoming: Incoming) -> Error {
+  case incoming.status {
+    200 -> MalformedResponse("the response was not valid JSON-RPC")
+    status ->
+      case
+        bit_array.to_string(incoming.body)
+        |> result.try(fn(text) {
+          json.parse(text, decode.at(["error"], rpc_error_decoder()))
+          |> result.replace_error(Nil)
+        })
+      {
+        Ok(error) -> error
+        Error(Nil) -> HttpStatus(status, incoming.www_authenticate)
+      }
+  }
+}
+
+fn rpc_error_decoder() -> Decoder(Error) {
+  use code <- decode.field("code", decode.int)
+  use message <- decode.field("message", decode.string)
+  use data <- decode.optional_field(
+    "data",
+    None,
+    decode.optional(value.decoder()),
+  )
+  decode.success(RpcError(code, message, data))
+}
+
+fn decode_result(response: Response, decoder: Decoder(a)) -> Result(a, Error) {
+  decode.run(response.result, decoder)
+  |> result.map_error(fn(errors) {
+    MalformedResponse(case errors {
+      [decode.DecodeError(expected, _, path), ..] ->
+        "expected " <> expected <> " at " <> string.join(path, ".")
+      [] -> "the result did not match the expected shape"
+    })
   })
 }
 
-fn call_encoded_tool(
-  client: Client,
-  name: String,
-  arguments: json.Json,
-  request_state: Option(String),
-  input_responses: Option(Dict(String, json.Json)),
-  decode_output: fn(blueprint_value.Value) -> Result(output, String),
-) -> ToolCallOutcome(output) {
-  case invoke_tool(client, name, arguments, request_state, input_responses) {
-    Error(ToolTransport(failure)) -> TransportFailure(failure)
-    Error(ToolProtocol(reason)) -> ProtocolFailure(reason)
-    Ok(Awaiting(requests, state)) ->
-      InputRequired(
-        ToolContinuation(
-          client,
-          name,
-          arguments,
-          state,
-          requests,
-          decode_output,
-        ),
-        requests,
-      )
-    Ok(Completed(True, _, blocks)) -> ToolFailure(blocks)
-    Ok(Completed(False, None, blocks)) -> ContentOnlySuccess(blocks)
-    Ok(Completed(False, Some(value), blocks)) ->
-      case decode_output(value) {
-        Ok(output) -> StructuredSuccess(output, blocks)
-        Error(reason) -> ProtocolFailure(reason)
+// An exact value from the response body: numbers keep their digits.
+fn exact(
+  response: Response,
+  path: List(String),
+) -> Result(Option(Value), Error) {
+  let limits =
+    value.default_limits()
+    |> value.with_max_bytes(bit_array.byte_size(response.body) + 1)
+  case value.parse_bits(response.body, limits) {
+    Error(_) -> Error(MalformedResponse("the response is not valid JSON"))
+    Ok(root) -> Ok(at(root, path))
+  }
+}
+
+fn at(found: Value, path: List(String)) -> Option(Value) {
+  case path {
+    [] -> Some(found)
+    [key, ..rest] ->
+      case found {
+        value.Object(members) ->
+          case list.key_find(members, key) {
+            Ok(child) -> at(child, rest)
+            Error(Nil) -> None
+          }
+        _ -> None
       }
   }
 }
 
-/// Calls a tool using the same admitted native contract used at registration.
-pub fn call_definition(
+// --- discovery ---------------------------------------------------------------
+
+/// The server's name and version.
+pub type ServerInfo {
+  ServerInfo(name: String, version: String)
+}
+
+/// What `server/discover` returned. `capabilities` is the server's
+/// capabilities object; read it with `has_capability` or by pattern. Read
+/// fields by label.
+pub type Discovery {
+  Discovery(
+    server_info: Option(ServerInfo),
+    supported_versions: List(String),
+    capabilities: Value,
+    instructions: Option(String),
+  )
+}
+
+/// Whether the server advertised a top-level capability, such as `"tools"`
+/// or `"completions"`.
+pub fn has_capability(discovery: Discovery, name: String) -> Bool {
+  case discovery.capabilities {
+    value.Object(members) -> list.key_find(members, name) |> result.is_ok
+    _ -> False
+  }
+}
+
+/// Asks the server what it supports. Fails with `UnsupportedVersion` when
+/// it does not support `2026-07-28`.
+pub fn discover(client: Client) -> Result(Discovery, Error) {
+  use response <- result.try(request(client, "server/discover", None, []))
+  use discovery <- result.try(
+    decode_result(response, {
+      use supported <- decode.field(
+        "supportedVersions",
+        decode.list(decode.string),
+      )
+      use capabilities <- decode.field("capabilities", value.decoder())
+      use instructions <- wire.optional_string_field("instructions")
+      use server_info <- decode.optional_field(
+        "_meta",
+        None,
+        decode.optional_field(
+          "io.modelcontextprotocol/serverInfo",
+          None,
+          decode.optional({
+            use name <- decode.field("name", decode.string)
+            use version <- decode.field("version", decode.string)
+            decode.success(ServerInfo(name, version))
+          }),
+          decode.success,
+        ),
+      )
+      decode.success(Discovery(
+        server_info,
+        supported,
+        capabilities,
+        instructions,
+      ))
+    }),
+  )
+  case list.contains(discovery.supported_versions, protocol_version) {
+    True -> Ok(discovery)
+    False -> Error(UnsupportedVersion(discovery.supported_versions))
+  }
+}
+
+// --- tools -------------------------------------------------------------------
+
+/// How a tool call ended, when the server answered it.
+pub type ToolResult(output) {
+  /// The tool succeeded; `content` holds its content blocks.
+  Succeeded(output: output, content: List(ContentBlock))
+  /// The tool failed and said why in `content`; nothing went wrong in the
+  /// protocol.
+  ToolFailed(content: List(ContentBlock), structured: Option(Value))
+  /// The tool needs answers first: handle each request and `resume`.
+  InputRequired(
+    continuation: Continuation(output),
+    requests: Dict(String, tool.InputRequest),
+  )
+}
+
+/// A paused call: its client, arguments and output decoder. The client must
+/// stay open until the call ends.
+pub opaque type Continuation(output) {
+  Continuation(
+    client: Client,
+    name: String,
+    arguments: json.Json,
+    request_state: Option(String),
+    keys: List(String),
+    decode_output: fn(Option(Value), List(ContentBlock)) ->
+      Result(output, String),
+  )
+}
+
+/// Calls a tool with the definition the server registered: encodes the
+/// input with its codec and decodes the structured output.
+pub fn call(
   client: Client,
   definition: tool.Definition(input, output),
   input: input,
-) -> ToolCallOutcome(output) {
-  case encode(tool.definition_input_codec(definition), input) {
-    Error(_) -> InputEncodingFailure
+) -> Result(ToolResult(output), Error) {
+  case codec.encode(definition.input, input) {
+    Error(error) -> Error(InvalidArguments(codec.describe_encode_error(error)))
     Ok(arguments) ->
-      call_encoded_tool(
+      invoke(
         client,
-        tool.definition_name(definition) |> tool.tool_name_to_string,
-        v2026.value_to_json(arguments),
+        definition.info.name,
+        wire.value_to_json(arguments),
         None,
         None,
-        fn(value) {
-          decode_typed_output(tool.definition_output_codec(definition), value)
-        },
+        output_decoder(definition.output),
       )
   }
 }
 
-/// Calls a discovered declaration with exact Blueprint JSON arguments and
-/// exact structured output. The application can forward a parsed provider tool
-/// call without inventing a native input codec or losing numeric precision.
+fn output_decoder(
+  output: core.Output(output),
+) -> fn(Option(Value), List(ContentBlock)) -> Result(output, String) {
+  case output {
+    core.ContentOnly(from_content, _) -> fn(_, blocks) {
+      Ok(from_content(blocks))
+    }
+    core.Structured(output_codec, _) -> fn(structured, _) {
+      case structured {
+        None -> Error("the result has no structured content")
+        Some(found) ->
+          codec.decode(output_codec, found)
+          |> result.map_error(fn(error) {
+            "the structured content does not match the output codec: "
+            <> codec.describe_decode_error(error)
+          })
+      }
+    }
+  }
+}
+
+/// Calls a tool known from `list_tools` with exact JSON arguments, which
+/// must be an object; the output is the exact structured value, or `Null`
+/// for a content-only result.
 pub fn call_discovered(
   client: Client,
-  declaration: ToolDeclaration,
-  arguments: blueprint_value.Value,
-) -> ToolCallOutcome(blueprint_value.Value) {
+  declaration: tool.Declaration,
+  arguments: Value,
+) -> Result(ToolResult(Value), Error) {
   case arguments {
-    blueprint_value.Object(_) ->
-      call_encoded_tool(
+    value.Object(_) ->
+      invoke(
         client,
         declaration.name,
-        v2026.value_to_json(arguments),
+        wire.value_to_json(arguments),
         None,
         None,
-        fn(value) { Ok(value) },
+        fn(structured, _) { Ok(option.unwrap(structured, value.Null)) },
       )
-    _ -> InputEncodingFailure
+    _ -> Error(InvalidArguments("tool arguments must be a JSON object"))
   }
 }
 
-/// Continues only the call that produced this value, with one reply per key.
-pub fn resume_tool(
-  continuation: ToolContinuation(output),
+/// Continues a paused call with one JSON object per request key. Further
+/// rounds may follow.
+pub fn resume(
+  continuation: Continuation(output),
   responses: Dict(String, json.Json),
-) -> ToolCallOutcome(output) {
-  case valid_input_responses(continuation.requests, responses) {
-    False -> InvalidInputResponses
+) -> Result(ToolResult(output), Error) {
+  let keys = dict.keys(responses)
+  case
+    list.length(keys) == list.length(continuation.keys)
+    && list.all(keys, list.contains(continuation.keys, _))
+    && list.all(dict.values(responses), is_object)
+  {
+    False -> Error(InvalidInputResponses)
     True ->
-      call_encoded_tool(
+      invoke(
         continuation.client,
         continuation.name,
         continuation.arguments,
@@ -970,68 +1597,11 @@ pub fn resume_tool(
   }
 }
 
-fn call_encoded_content(
-  client: Client,
-  name: String,
-  arguments: json.Json,
-  request_state: Option(String),
-  input_responses: Option(Dict(String, json.Json)),
-) -> ContentCallOutcome {
-  case invoke_tool(client, name, arguments, request_state, input_responses) {
-    Error(ToolTransport(failure)) -> ContentTransportFailure(failure)
-    Error(ToolProtocol(reason)) -> ContentProtocolFailure(reason)
-    Ok(Awaiting(requests, state)) ->
-      ContentInputRequired(
-        ContentContinuation(client, name, arguments, state, requests),
-        requests,
-      )
-    Ok(Completed(True, _, blocks)) -> ContentToolFailure(blocks)
-    Ok(Completed(False, Some(_), _)) -> UnexpectedStructuredContent
-    Ok(Completed(False, None, blocks)) -> ContentSuccess(blocks)
-  }
-}
-
-/// Calls an admitted content-only tool without requiring an output codec.
-pub fn call_content_definition(
-  client: Client,
-  definition: tool.ContentDefinition(input),
-  input: input,
-) -> ContentCallOutcome {
-  case encode(tool.content_definition_input_codec(definition), input) {
-    Error(_) -> ContentInputEncodingFailure
-    Ok(arguments) ->
-      call_encoded_content(
-        client,
-        tool.content_definition_name(definition) |> tool.tool_name_to_string,
-        v2026.value_to_json(arguments),
-        None,
-        None,
-      )
-  }
-}
-
-pub fn resume_content(
-  continuation: ContentContinuation,
-  responses: Dict(String, json.Json),
-) -> ContentCallOutcome {
-  case valid_input_responses(continuation.requests, responses) {
-    False -> ContentInvalidInputResponses
-    True ->
-      call_encoded_content(
-        continuation.client,
-        continuation.name,
-        continuation.arguments,
-        continuation.request_state,
-        Some(responses),
-      )
-  }
-}
-
-fn json_is_object(value: json.Json) -> Bool {
+fn is_object(found: json.Json) -> Bool {
   case
     json.parse(
-      json.to_string(value),
-      dyn_decode.dict(dyn_decode.string, dyn_decode.dynamic),
+      json.to_string(found),
+      decode.dict(decode.string, decode.dynamic),
     )
   {
     Ok(_) -> True
@@ -1039,1596 +1609,697 @@ fn json_is_object(value: json.Json) -> Bool {
   }
 }
 
-fn valid_input_responses(
-  requests: Dict(String, tool.InputRequest),
-  responses: Dict(String, json.Json),
-) -> Bool {
-  let request_entries = dict.to_list(requests)
-  let response_entries = dict.to_list(responses)
-  list.length(request_entries) == list.length(response_entries)
-  && list.all(response_entries, fn(entry) {
-    let #(key, value) = entry
-    dict.has_key(requests, key) && json_is_object(value)
-  })
+fn invoke(
+  client: Client,
+  name: String,
+  arguments: json.Json,
+  request_state: Option(String),
+  responses: Option(Dict(String, json.Json)),
+  decode_output: fn(Option(Value), List(ContentBlock)) -> Result(output, String),
+) -> Result(ToolResult(output), Error) {
+  let params =
+    list.flatten([
+      [#("name", json.string(name)), #("arguments", arguments)],
+      case request_state {
+        Some(state) -> [#("requestState", json.string(state))]
+        None -> []
+      },
+      case responses {
+        Some(responses) -> [
+          #("inputResponses", json.object(dict.to_list(responses))),
+        ]
+        None -> []
+      },
+    ])
+  use response <- result.try(request(client, "tools/call", Some(name), params))
+  use result_type <- result.try(
+    decode_result(response, {
+      use found <- wire.optional_string_field("resultType")
+      decode.success(found)
+    }),
+  )
+  case result_type {
+    Some("input_required") -> {
+      use #(requests, state) <- result.try(
+        decode_result(response, {
+          use requests <- decode.optional_field(
+            "inputRequests",
+            None,
+            decode.optional(decode.dict(
+              decode.string,
+              raw_input_request_decoder(),
+            )),
+          )
+          use state <- wire.optional_string_field("requestState")
+          decode.success(#(requests, state))
+        }),
+      )
+      // The revision requires at least one of the two members.
+      use requests <- result.try(case requests, state {
+        None, None ->
+          Error(MalformedResponse(
+            "an input_required result has no inputRequests or requestState",
+          ))
+        Some(requests), _ -> Ok(requests)
+        None, Some(_) -> Ok(dict.new())
+      })
+      use requests <- result.try(admit_input_requests(client, requests))
+      Ok(InputRequired(
+        Continuation(
+          client,
+          name,
+          arguments,
+          state,
+          dict.keys(requests),
+          decode_output,
+        ),
+        requests,
+      ))
+    }
+    None | Some("complete") -> {
+      use #(blocks, is_error) <- result.try(
+        decode_result(response, {
+          use blocks <- decode.field(
+            "content",
+            decode.list(wire.content_block_decoder()),
+          )
+          use is_error <- decode.optional_field("isError", False, decode.bool)
+          decode.success(#(blocks, is_error))
+        }),
+      )
+      use structured <- result.try(
+        exact(response, ["result", "structuredContent"]),
+      )
+      case is_error {
+        True -> Ok(ToolFailed(blocks, structured))
+        False ->
+          case decode_output(structured, blocks) {
+            Ok(output) -> Ok(Succeeded(output, blocks))
+            Error(detail) -> Error(MalformedResponse(detail))
+          }
+      }
+    }
+    Some(other) -> Error(MalformedResponse("unknown resultType " <> other))
+  }
 }
 
-fn input_requests_supported(
-  requests: Dict(String, tool.InputRequest),
-  supported: List(InputMethod),
-) -> Bool {
+fn raw_input_request_decoder() -> Decoder(#(String, Value)) {
+  use method <- decode.field("method", decode.string)
+  use params <- decode.field("params", value.decoder())
+  decode.success(#(method, params))
+}
+
+fn admit_input_requests(
+  client: Client,
+  requests: Dict(String, #(String, Value)),
+) -> Result(Dict(String, tool.InputRequest), Error) {
   dict.to_list(requests)
-  |> list.all(fn(entry) {
-    let #(_, request) = entry
-    let required = case request.method {
-      "elicitation/create" -> Some(Elicitation)
-      "sampling/createMessage" -> Some(Sampling)
-      "roots/list" -> Some(Roots)
-      _ -> None
+  |> list.try_map(fn(entry) {
+    let #(key, #(method_name, params)) = entry
+    let method = case method_name {
+      "elicitation/create" -> Ok(tool.Elicitation)
+      "sampling/createMessage" -> Ok(tool.Sampling)
+      "roots/list" -> Ok(tool.Roots)
+      _ -> Error(UnsupportedInputRequest(method_name))
     }
-    case required {
-      Some(method) -> list.contains(supported, method)
-      None -> False
+    use method <- result.try(method)
+    case list.contains(client.config.input_methods, method), params {
+      False, _ -> Error(UnsupportedInputRequest(method_name))
+      True, value.Object(_) -> Ok(#(key, tool.InputRequest(method, params)))
+      True, _ ->
+        Error(MalformedResponse("input request params must be an object"))
     }
+  })
+  |> result.map(dict.from_list)
+}
+
+// --- listings ----------------------------------------------------------------
+
+fn pages(
+  client: Client,
+  method: String,
+  collection: String,
+  item: Decoder(a),
+) -> Result(List(a), Error) {
+  page(client, method, collection, item, None, [], [], 0, 0)
+}
+
+fn page(
+  client: Client,
+  method: String,
+  collection: String,
+  item: Decoder(a),
+  cursor: Option(String),
+  seen: List(String),
+  pages: List(List(a)),
+  page_count: Int,
+  item_count: Int,
+) -> Result(List(a), Error) {
+  case page_count >= client.config.max_listing_pages {
+    True -> Error(ListingLimitExceeded(client.config.max_listing_pages))
+    False -> {
+      let params = case cursor {
+        Some(cursor) -> [#("cursor", json.string(cursor))]
+        None -> []
+      }
+      use response <- result.try(request(client, method, None, params))
+      use #(items, next) <- result.try(
+        decode_result(response, {
+          use items <- decode.field(collection, decode.list(item))
+          use next <- wire.optional_string_field("nextCursor")
+          decode.success(#(items, next))
+        }),
+      )
+      let item_count = item_count + list.length(items)
+      let pages = [items, ..pages]
+      case item_count > client.config.max_listing_items, next {
+        True, _ -> Error(ListingLimitExceeded(client.config.max_listing_items))
+        False, None -> Ok(list.flatten(list.reverse(pages)))
+        False, Some(next) ->
+          case list.contains(seen, next) {
+            True -> Error(MalformedResponse("the listing repeated a cursor"))
+            False ->
+              page(
+                client,
+                method,
+                collection,
+                item,
+                Some(next),
+                [next, ..seen],
+                pages,
+                page_count + 1,
+                item_count,
+              )
+          }
+      }
+    }
+  }
+}
+
+fn tool_declaration_decoder() -> Decoder(tool.Declaration) {
+  let hint = fn(key, next) {
+    decode.optional_field(key, None, decode.optional(decode.bool), next)
+  }
+  let annotations = {
+    use title <- wire.optional_string_field("title")
+    use read_only <- hint("readOnlyHint")
+    use destructive <- hint("destructiveHint")
+    use idempotent <- hint("idempotentHint")
+    use open_world <- hint("openWorldHint")
+    decode.success(tool.ToolAnnotations(
+      title,
+      read_only,
+      destructive,
+      idempotent,
+      open_world,
+    ))
+  }
+  use name <- decode.field("name", decode.string)
+  use title <- wire.optional_string_field("title")
+  use description <- wire.optional_string_field("description")
+  use input_schema <- decode.field("inputSchema", value.decoder())
+  use output_schema <- decode.optional_field(
+    "outputSchema",
+    None,
+    decode.optional(value.decoder()),
+  )
+  use annotations <- decode.optional_field(
+    "annotations",
+    tool.ToolAnnotations(None, None, None, None, None),
+    annotations,
+  )
+  use icons <- wire.optional_icons
+  use meta <- wire.optional_meta
+  decode.success(tool.Declaration(
+    name:,
+    title:,
+    description:,
+    input_schema:,
+    output_schema:,
+    annotations:,
+    icons:,
+    meta:,
+  ))
+}
+
+/// Every tool the server lists, across all pages.
+pub fn list_tools(client: Client) -> Result(List(tool.Declaration), Error) {
+  pages(client, "tools/list", "tools", tool_declaration_decoder())
+}
+
+/// Every static resource the server lists.
+pub fn list_resources(
+  client: Client,
+) -> Result(List(resources.Declaration), Error) {
+  pages(client, "resources/list", "resources", {
+    use uri <- decode.field("uri", decode.string)
+    use name <- decode.field("name", decode.string)
+    use title <- wire.optional_string_field("title")
+    use description <- wire.optional_string_field("description")
+    use mime_type <- wire.optional_string_field("mimeType")
+    use size <- decode.optional_field("size", None, decode.optional(decode.int))
+    use annotations <- decode.optional_field(
+      "annotations",
+      None,
+      decode.optional(wire.annotations_decoder()),
+    )
+    use icons <- wire.optional_icons
+    use meta <- wire.optional_meta
+    decode.success(resources.Declaration(
+      uri:,
+      name:,
+      title:,
+      description:,
+      mime_type:,
+      size:,
+      annotations:,
+      icons:,
+      meta:,
+    ))
   })
 }
 
-/// Reads a resource and decodes its text or base64 content.
+/// Every resource template the server lists.
+pub fn list_resource_templates(
+  client: Client,
+) -> Result(List(resources.TemplateDeclaration), Error) {
+  pages(client, "resources/templates/list", "resourceTemplates", {
+    use uri_template <- decode.field("uriTemplate", decode.string)
+    use name <- decode.field("name", decode.string)
+    use title <- wire.optional_string_field("title")
+    use description <- wire.optional_string_field("description")
+    use mime_type <- wire.optional_string_field("mimeType")
+    use annotations <- decode.optional_field(
+      "annotations",
+      None,
+      decode.optional(wire.annotations_decoder()),
+    )
+    use icons <- wire.optional_icons
+    use meta <- wire.optional_meta
+    decode.success(resources.TemplateDeclaration(
+      uri_template:,
+      name:,
+      title:,
+      description:,
+      mime_type:,
+      annotations:,
+      icons:,
+      meta:,
+    ))
+  })
+}
+
+fn prompt_argument_decoder() -> Decoder(prompts.PromptArgument) {
+  use name <- decode.field("name", decode.string)
+  use title <- wire.optional_string_field("title")
+  use description <- wire.optional_string_field("description")
+  use required <- decode.optional_field("required", False, decode.bool)
+  decode.success(prompts.PromptArgument(name:, title:, description:, required:))
+}
+
+/// Every prompt the server lists.
+pub fn list_prompts(
+  client: Client,
+) -> Result(List(prompts.Declaration), Error) {
+  pages(client, "prompts/list", "prompts", {
+    use name <- decode.field("name", decode.string)
+    use title <- wire.optional_string_field("title")
+    use description <- wire.optional_string_field("description")
+    use arguments <- decode.optional_field(
+      "arguments",
+      [],
+      decode.list(prompt_argument_decoder()),
+    )
+    use icons <- wire.optional_icons
+    use meta <- wire.optional_meta
+    decode.success(prompts.Declaration(
+      name:,
+      title:,
+      description:,
+      arguments:,
+      icons:,
+      meta:,
+    ))
+  })
+}
+
+/// Every item of a paginated listing method, such as `"tools/list"` with
+/// collection `"tools"`, as exact JSON values.
+pub fn list_raw(
+  client: Client,
+  method: String,
+  collection: String,
+) -> Result(List(Value), Error) {
+  raw_page(client, method, collection, None, [], [], 0, 0)
+}
+
+fn raw_page(
+  client: Client,
+  method: String,
+  collection: String,
+  cursor: Option(String),
+  seen: List(String),
+  pages: List(List(Value)),
+  page_count: Int,
+  item_count: Int,
+) -> Result(List(Value), Error) {
+  case page_count >= client.config.max_listing_pages {
+    True -> Error(ListingLimitExceeded(client.config.max_listing_pages))
+    False -> {
+      let params = case cursor {
+        Some(cursor) -> [#("cursor", json.string(cursor))]
+        None -> []
+      }
+      use response <- result.try(request(client, method, None, params))
+      use items <- result.try(exact(response, ["result", collection]))
+      use items <- result.try(case items {
+        Some(value.Array(items)) -> Ok(items)
+        _ -> Error(MalformedResponse("the listing has no " <> collection))
+      })
+      use next <- result.try(
+        decode_result(response, {
+          use next <- wire.optional_string_field("nextCursor")
+          decode.success(next)
+        }),
+      )
+      let item_count = item_count + list.length(items)
+      let pages = [items, ..pages]
+      case item_count > client.config.max_listing_items, next {
+        True, _ -> Error(ListingLimitExceeded(client.config.max_listing_items))
+        False, None -> Ok(list.flatten(list.reverse(pages)))
+        False, Some(next) ->
+          case list.contains(seen, next) {
+            True -> Error(MalformedResponse("the listing repeated a cursor"))
+            False ->
+              raw_page(
+                client,
+                method,
+                collection,
+                Some(next),
+                [next, ..seen],
+                pages,
+                page_count + 1,
+                item_count,
+              )
+          }
+      }
+    }
+  }
+}
+
+/// Sends any request method with these params and returns its result object
+/// as an exact JSON value. `tools/call`, `prompts/get` and `resources/read`
+/// need the `name` their routing header carries; other methods take `None`.
+pub fn call_raw(
+  client: Client,
+  method: String,
+  name: Option(String),
+  params: List(#(String, json.Json)),
+) -> Result(Value, Error) {
+  let needs_name = case method {
+    "tools/call" | "prompts/get" | "resources/read" -> True
+    _ -> False
+  }
+  case needs_name, name {
+    True, None -> Error(InvalidArguments(method <> " needs a routing name"))
+    False, Some(_) ->
+      Error(InvalidArguments(method <> " takes no routing name"))
+    _, _ -> {
+      use response <- result.try(request(client, method, name, params))
+      use found <- result.try(exact(response, ["result"]))
+      option.to_result(found, MalformedResponse("the response has no result"))
+    }
+  }
+}
+
+// --- resources, prompts, completion ------------------------------------------
+
+/// Reads a resource.
 pub fn read_resource(
   client: Client,
   uri: String,
-) -> Result(List(content.ResourceContents), String) {
-  use result_value <- result.try(
-    jsonrpc_call_result(client, "resources/read", uri, [
-      #("uri", json.string(uri)),
-    ]),
+) -> Result(List(ResourceContents), Error) {
+  use response <- result.try(
+    request(client, "resources/read", Some(uri), [#("uri", json.string(uri))]),
   )
-  use raw_contents <- result.try(
-    dyn_decode.run(
-      result_value,
-      dyn_decode.at(["contents"], dyn_decode.list(dyn_decode.dynamic)),
-    )
-    |> result.map_error(fn(_) { "resource result is missing its contents" }),
+  decode_result(
+    response,
+    decode.at(["contents"], decode.list(wire.resource_contents_decoder())),
   )
-  decode_resource_contents_list(raw_contents)
 }
 
-/// Fetches a prompt result with string-valued arguments.
+/// Renders a prompt with string arguments.
 pub fn get_prompt(
   client: Client,
   name: String,
   arguments: Dict(String, String),
-) -> Result(prompts.PromptResult, String) {
-  use result_value <- result.try(
-    jsonrpc_call_result(client, "prompts/get", name, [
+) -> Result(prompts.PromptResult, Error) {
+  use response <- result.try(
+    request(client, "prompts/get", Some(name), [
       #("name", json.string(name)),
       #(
         "arguments",
         json.object(
-          list.map(dict.to_list(arguments), fn(pair) {
-            let #(key, value) = pair
-            #(key, json.string(value))
-          }),
+          dict.to_list(arguments)
+          |> list.map(fn(pair) { #(pair.0, json.string(pair.1)) }),
         ),
       ),
     ]),
   )
-  decode_prompt_result(result_value)
-}
-
-/// Requests completions using a typed reference, argument, and optional context.
-pub fn complete(
-  client: Client,
-  reference: completion.CompletionRef,
-  argument: completion.CompletionArgument,
-  context: Option(Dict(String, String)),
-) -> Result(completion.CompletionValues, String) {
-  let fields = [
-    #("ref", completion_ref_to_json(reference)),
-    #(
-      "argument",
-      json.object([
-        #("name", json.string(argument.name)),
-        #("value", json.string(argument.value)),
-      ]),
-    ),
-  ]
-  let fields = case context {
-    None -> fields
-    Some(values) ->
-      list.append(fields, [
-        #(
-          "context",
-          json.object(
-            list.map(dict.to_list(values), fn(pair) {
-              let #(key, value) = pair
-              #(key, json.string(value))
-            }),
-          ),
-        ),
-      ])
-  }
-  use result_value <- result.try(jsonrpc_call_result(
-    client,
-    "completion/complete",
-    "",
-    fields,
-  ))
-  decode_completion_values(result_value)
-}
-
-/// Opens a typed server-notification stream and verifies its acknowledgement.
-pub fn listen(
-  client: Client,
-  requested: SubscriptionFilter,
-) -> Result(Subscription, String) {
-  case client.transport {
-    StdioTransport(child) -> {
-      let id = request_id()
-      let body =
-        v2026.encode_subscriptions_listen_request(RequestString(id), requested)
-        |> json.to_string
-        |> bit_array.from_string
-      case
-        stdio_client.subscribe(
-          child,
-          body,
-          id,
-          client.timeout_ms,
-          client.max_response_bytes,
-        )
-      {
-        Error(reason) ->
-          Error("subscription acknowledgement failed: " <> reason)
-        Ok(bytes) ->
-          case decode_subscription_acknowledgement(bytes, id) {
-            Error(reason) -> Error(reason)
-            Ok(notifications) ->
-              Ok(StdioSubscription(
-                child,
-                id,
-                notifications,
-                client.max_response_bytes,
-              ))
+  decode_result(response, {
+    use description <- wire.optional_string_field("description")
+    use messages <- decode.field(
+      "messages",
+      decode.list({
+        use role <- decode.field("role", {
+          use found <- decode.then(decode.string)
+          case found {
+            "user" -> decode.success(content.UserRole)
+            "assistant" -> decode.success(content.AssistantRole)
+            _ -> decode.failure(content.UserRole, "role")
           }
-      }
-    }
-    HttpTransport(pid) -> {
-      let id = request_id()
-      let body =
-        v2026.encode_subscriptions_listen_request(RequestString(id), requested)
-        |> json.to_string
-        |> bit_array.from_string
-      case
-        ffi_open_sse(
-          pid,
-          client.path,
-          body,
-          protocol_version,
-          client.timeout_ms,
-          client.max_response_bytes,
-        )
-      {
-        Error(reason) -> Error(reason)
-        Ok(reader) ->
-          case ffi_next_sse(reader, client.timeout_ms) {
-            Error(reason) -> {
-              ffi_close_sse(reader)
-              Error("subscription acknowledgement failed: " <> reason)
-            }
-            Ok(bytes) ->
-              case decode_subscription_acknowledgement(bytes, id) {
-                Error(reason) -> {
-                  ffi_close_sse(reader)
-                  Error(reason)
-                }
-                Ok(notifications) ->
-                  Ok(HttpSubscription(reader, id, notifications))
-              }
-          }
-      }
-    }
-  }
-}
-
-/// Returns the notification filter the server confirmed for this stream.
-pub fn acknowledged_notifications(
-  subscription: Subscription,
-) -> SubscriptionFilter {
-  case subscription {
-    HttpSubscription(_, _, notifications) -> notifications
-    StdioSubscription(_, _, notifications, _) -> notifications
-  }
-}
-
-/// Waits for and decodes the next notification from a subscription stream.
-pub fn next_notification(
-  subscription: Subscription,
-  timeout_ms: Int,
-) -> Result(SubscriptionNotification, String) {
-  case timeout_ms > 0 {
-    False -> Error("subscription wait timeout must be positive")
-    True ->
-      case subscription {
-        HttpSubscription(reader, request_id, _) ->
-          case ffi_next_sse(reader, timeout_ms) {
-            Error("timeout") -> Error("subscription notification timed out")
-            Error(reason) -> Error(reason)
-            Ok(bytes) -> decode_subscription_notification(bytes, request_id)
-          }
-        StdioSubscription(child, request_id, _, max_response_bytes) ->
-          case
-            stdio_client.next_notification(
-              child,
-              request_id,
-              timeout_ms,
-              max_response_bytes,
-            )
-          {
-            Error("stdio notification timed out") ->
-              Error("subscription notification timed out")
-            Error(reason) -> Error(reason)
-            Ok(bytes) -> decode_subscription_notification(bytes, request_id)
-          }
-      }
-  }
-}
-
-/// Cancels this stream without closing other requests on the shared connection.
-pub fn close_subscription(subscription: Subscription) -> Nil {
-  case subscription {
-    HttpSubscription(reader, _, _) -> ffi_close_sse(reader)
-    StdioSubscription(child, request_id, _, _) -> {
-      let _ = stdio_client.cancel_subscription(child, request_id)
-      Nil
-    }
-  }
-}
-
-fn decode_subscription_acknowledgement(
-  bytes: BitArray,
-  expected_id: String,
-) -> Result(SubscriptionFilter, String) {
-  use raw <- result.try(subscription_json(bytes))
-  use version <- result.try(string_field(raw, ["jsonrpc"]))
-  use method <- result.try(string_field(raw, ["method"]))
-  case version, method {
-    "2.0", "notifications/subscriptions/acknowledged" -> {
-      use params <- result.try(dynamic_field(raw, ["params"]))
-      use _ <- result.try(validate_subscription_id(params, expected_id))
-      use notifications <- result.try(dynamic_field(params, ["notifications"]))
-      decode_subscription_filter(notifications)
-    }
-    _, _ -> Error("subscription stream did not begin with its acknowledgement")
-  }
-}
-
-fn decode_subscription_notification(
-  bytes: BitArray,
-  expected_id: String,
-) -> Result(SubscriptionNotification, String) {
-  use raw <- result.try(subscription_json(bytes))
-  use version <- result.try(string_field(raw, ["jsonrpc"]))
-  use method <- result.try(string_field(raw, ["method"]))
-  case version {
-    "2.0" -> {
-      use params <- result.try(dynamic_field(raw, ["params"]))
-      use _ <- result.try(validate_subscription_id(params, expected_id))
-      case method {
-        "notifications/resources/updated" ->
-          string_field(params, ["uri"])
-          |> result.map(ResourceUpdated)
-        "notifications/tools/list_changed" -> Ok(ToolsListChanged)
-        "notifications/resources/list_changed" -> Ok(ResourcesListChanged)
-        "notifications/prompts/list_changed" -> Ok(PromptsListChanged)
-        _ -> Error("subscription stream contained an unsupported notification")
-      }
-    }
-    _ -> Error("subscription notification used an unsupported JSON-RPC version")
-  }
-}
-
-fn subscription_json(bytes: BitArray) -> Result(Dynamic, String) {
-  case bit_array.to_string(bytes) {
-    Error(_) -> Error("subscription event was not UTF-8")
-    Ok(raw) ->
-      json.parse(raw, dyn_decode.dynamic)
-      |> result.map_error(fn(_) { "subscription event was not valid JSON" })
-  }
-}
-
-fn dynamic_field(
-  value: Dynamic,
-  path: List(String),
-) -> Result(Dynamic, String) {
-  dyn_decode.run(value, dyn_decode.at(path, dyn_decode.dynamic))
-  |> result.map_error(fn(_) {
-    "subscription event is missing a required object"
+        })
+        use block <- decode.field("content", wire.content_block_decoder())
+        decode.success(prompts.PromptMessage(role, block))
+      }),
+    )
+    use meta <- wire.optional_meta
+    decode.success(prompts.PromptResult(description, messages, meta))
   })
 }
 
-fn validate_subscription_id(
-  params: Dynamic,
-  expected_id: String,
-) -> Result(Nil, String) {
-  use actual_id <- result.try(
-    string_field(params, ["_meta", "io.modelcontextprotocol/subscriptionId"]),
-  )
-  case actual_id == expected_id {
-    True -> Ok(Nil)
-    False ->
-      Error("subscription notification had an uncorrelated subscription ID")
-  }
-}
-
-fn decode_subscription_filter(
-  value: Dynamic,
-) -> Result(SubscriptionFilter, String) {
-  use fields <- result.try(
-    dyn_decode.run(
-      value,
-      dyn_decode.dict(dyn_decode.string, dyn_decode.dynamic),
-    )
-    |> result.map_error(fn(_) { "subscription filter was not an object" }),
-  )
-  use tools_list_changed <- result.try(optional_filter_bool(
-    fields,
-    "toolsListChanged",
-  ))
-  use resources_list_changed <- result.try(optional_filter_bool(
-    fields,
-    "resourcesListChanged",
-  ))
-  use prompts_list_changed <- result.try(optional_filter_bool(
-    fields,
-    "promptsListChanged",
-  ))
-  use resource_subscriptions <- result.try(optional_filter_uris(fields))
-  Ok(SubscriptionFilter(
-    tools_list_changed,
-    resources_list_changed,
-    prompts_list_changed,
-    resource_subscriptions,
-  ))
-}
-
-fn optional_filter_bool(
-  fields: Dict(String, Dynamic),
-  key: String,
-) -> Result(Bool, String) {
-  case dict.get(fields, key) {
-    Error(_) -> Ok(False)
-    Ok(value) ->
-      dyn_decode.run(value, dyn_decode.bool)
-      |> result.map_error(fn(_) { "subscription filter flag was not a boolean" })
-  }
-}
-
-fn optional_filter_uris(
-  fields: Dict(String, Dynamic),
-) -> Result(List(String), String) {
-  case dict.get(fields, "resourceSubscriptions") {
-    Error(_) -> Ok([])
-    Ok(value) ->
-      dyn_decode.run(value, dyn_decode.list(dyn_decode.string))
-      |> result.map_error(fn(_) {
-        "resourceSubscriptions was not a string array"
-      })
-  }
-}
-
-fn request(
+/// Asks the server to complete an argument.
+pub fn complete(
   client: Client,
-  body: BitArray,
-  id: String,
-  method: String,
-  name: String,
-) -> Result(#(Int, BitArray), String) {
-  case client.transport {
-    HttpTransport(pid) ->
-      ffi_request(
-        pid,
-        client.path,
-        body,
-        method,
-        name,
-        protocol_version,
-        client.timeout_ms,
-        client.max_response_bytes,
-      )
-    StdioTransport(child) ->
-      stdio_client.request(
-        child,
-        body,
-        id,
-        client.timeout_ms,
-        client.max_response_bytes,
-      )
-      |> result.map(fn(bytes) { #(200, bytes) })
-  }
-}
-
-fn request_typed(
-  client: Client,
-  body: BitArray,
-  id: String,
-  method: String,
-  name: String,
-) -> Result(#(Int, BitArray), TransportError) {
-  case client.transport {
-    HttpTransport(pid) ->
-      ffi_request_typed(
-        pid,
-        client.path,
-        body,
-        method,
-        name,
-        protocol_version,
-        client.timeout_ms,
-        client.max_response_bytes,
-      )
-    StdioTransport(child) ->
-      stdio_client.request_typed(
-        child,
-        body,
-        id,
-        client.timeout_ms,
-        client.max_response_bytes,
-      )
-      |> result.map(fn(bytes) { #(200, bytes) })
-      |> result.map_error(fn(failure) {
-        case failure {
-          stdio_client.Closed -> ConnectionClosed
-          stdio_client.Cancelled -> RequestCancelled
-          stdio_client.Failed(reason) -> TransportFault(reason)
-        }
-      })
-  }
-}
-
-fn jsonrpc_call_result(
-  client: Client,
-  method: String,
-  name: String,
-  params: List(#(String, json.Json)),
-) -> Result(Dynamic, String) {
-  let id = request_id()
-  let body = request_envelope(client, id, method, params)
-  case request(client, body, id, method, name) {
-    Error(reason) -> Error(reason)
-    Ok(#(status, _)) if status != 200 ->
-      Error(method <> " returned HTTP " <> int.to_string(status))
-    Ok(#(_, bytes)) ->
-      case bit_array.to_string(bytes) {
-        Error(_) -> Error(method <> " response was not UTF-8")
-        Ok(raw) ->
-          case json.parse(raw, dyn_decode.dynamic) {
-            Error(_) -> Error(method <> " response was not valid JSON")
-            Ok(response) -> validate_jsonrpc_result(response, id)
-          }
-      }
-  }
-}
-
-fn completion_ref_to_json(reference: completion.CompletionRef) -> json.Json {
-  case reference {
-    completion.PromptRef(name) ->
+  query: completion.Request,
+) -> Result(completion.Values, Error) {
+  let reference = case query.reference {
+    completion.PromptReference(name) ->
       json.object([
         #("type", json.string("ref/prompt")),
         #("name", json.string(name)),
       ])
-    completion.ResourceRef(uri) ->
+    completion.ResourceReference(uri_template) ->
       json.object([
         #("type", json.string("ref/resource")),
-        #("uri", json.string(uri)),
+        #("uri", json.string(uri_template)),
       ])
   }
-}
-
-fn decode_resource_contents_list(
-  contents: List(Dynamic),
-) -> Result(List(content.ResourceContents), String) {
-  case contents {
-    [] -> Ok([])
-    [raw, ..rest] ->
-      decode_resource_contents(raw)
-      |> result.try(fn(decoded) {
-        decode_resource_contents_list(rest)
-        |> result.map(fn(rest) { [decoded, ..rest] })
-      })
-  }
-}
-
-fn decode_prompt_result(
-  value: Dynamic,
-) -> Result(prompts.PromptResult, String) {
-  use description <- result.try(optional_string_field(value, ["description"]))
-  use raw_messages <- result.try(
-    dyn_decode.run(
-      value,
-      dyn_decode.at(["messages"], dyn_decode.list(dyn_decode.dynamic)),
-    )
-    |> result.map_error(fn(_) { "prompt result is missing its messages" }),
-  )
-  use messages <- result.try(decode_prompt_messages(raw_messages))
-  Ok(prompts.PromptResult(description, messages))
-}
-
-fn decode_prompt_messages(
-  messages: List(Dynamic),
-) -> Result(List(prompts.PromptMessage), String) {
-  case messages {
-    [] -> Ok([])
-    [raw, ..rest] ->
-      decode_prompt_message(raw)
-      |> result.try(fn(decoded) {
-        decode_prompt_messages(rest)
-        |> result.map(fn(rest) { [decoded, ..rest] })
-      })
-  }
-}
-
-fn decode_prompt_message(
-  value: Dynamic,
-) -> Result(prompts.PromptMessage, String) {
-  use role <- result.try(string_field(value, ["role"]))
-  let role = case role {
-    "user" -> Ok(content.UserRole)
-    "assistant" -> Ok(content.AssistantRole)
-    _ -> Error("prompt message has an unknown role")
-  }
-  use role <- result.try(role)
-  use raw_content <- result.try(
-    dyn_decode.run(value, dyn_decode.at(["content"], dyn_decode.dynamic))
-    |> result.map_error(fn(_) { "prompt message is missing its content" }),
-  )
-  use content <- result.try(decode_content_block(raw_content))
-  Ok(prompts.PromptMessage(role, content))
-}
-
-fn decode_completion_values(
-  value: Dynamic,
-) -> Result(completion.CompletionValues, String) {
-  use values <- result.try(
-    dyn_decode.run(
-      value,
-      dyn_decode.at(
-        ["completion", "values"],
-        dyn_decode.list(dyn_decode.string),
+  let context = case dict.to_list(query.context) {
+    [] -> []
+    known -> [
+      #(
+        "context",
+        json.object([
+          #(
+            "arguments",
+            json.object(
+              list.map(known, fn(pair) { #(pair.0, json.string(pair.1)) }),
+            ),
+          ),
+        ]),
       ),
-    )
-    |> result.map_error(fn(_) { "completion result is missing its values" }),
+    ]
+  }
+  use response <- result.try(
+    request(client, "completion/complete", None, [
+      #("ref", reference),
+      #(
+        "argument",
+        json.object([
+          #("name", json.string(query.argument)),
+          #("value", json.string(query.value)),
+        ]),
+      ),
+      ..context
+    ]),
   )
-  use total <- result.try(optional_int_field(value, ["completion", "total"]))
-  use has_more <- result.try(
-    optional_bool_field(value, ["completion", "hasMore"]),
+  decode_result(
+    response,
+    decode.at(["completion"], {
+      use values <- decode.field("values", decode.list(decode.string))
+      use total <- decode.optional_field(
+        "total",
+        None,
+        decode.optional(decode.int),
+      )
+      use has_more <- decode.optional_field(
+        "hasMore",
+        None,
+        decode.optional(decode.bool),
+      )
+      decode.success(completion.Values(values, total, has_more))
+    }),
   )
-  Ok(completion.CompletionValues(values, total, has_more))
 }
 
-fn validate_jsonrpc_response(
-  bytes: BitArray,
-  expected_id: String,
-) -> Result(Nil, String) {
-  case bit_array.to_string(bytes) {
-    Error(_) -> Error("response was not UTF-8")
-    Ok(raw) ->
-      case json.parse(raw, dyn_decode.dynamic) {
-        Error(_) -> Error("response was not valid JSON")
-        Ok(response) -> {
-          let version =
-            dyn_decode.run(
-              response,
-              dyn_decode.at(["jsonrpc"], dyn_decode.string),
-            )
-          let response_id =
-            dyn_decode.run(response, dyn_decode.at(["id"], dyn_decode.string))
-          let result_field =
-            dyn_decode.run(
-              response,
-              dyn_decode.at(["result"], dyn_decode.dynamic),
-            )
-          let error_field =
-            dyn_decode.run(
-              response,
-              dyn_decode.at(["error"], dyn_decode.dynamic),
-            )
-          case version, response_id, result_field, error_field {
-            Ok("2.0"), Ok(actual), Ok(_), Error(_) if actual == expected_id ->
-              Ok(Nil)
-            Ok("2.0"), Ok(actual), Error(_), Ok(_) if actual == expected_id ->
-              Ok(Nil)
-            _, _, _, _ -> Error("malformed or uncorrelated JSON-RPC response")
-          }
+// --- listening ---------------------------------------------------------------
+
+/// An open `subscriptions/listen` stream. Read it from the process that
+/// opened it.
+pub opaque type Subscription {
+  Subscription(stream: Stream, id: String, notifications: List(Notification))
+}
+
+/// Opens a stream for these notifications; `ResourceUpdated(uri)` subscribes
+/// to one resource. Returns once the server acknowledged it.
+pub fn listen(
+  client: Client,
+  notifications: List(Notification),
+) -> Result(Subscription, Error) {
+  let id = new_id()
+  let body =
+    envelope(client, id, "subscriptions/listen", [
+      #("notifications", v2026.filter_to_json(subs.filter_of(notifications))),
+    ])
+  use stream <- result.try(client.peer.listen(
+    Outgoing(body, id, "subscriptions/listen", None),
+    budget(client),
+  ))
+  let wait = remaining_ms(budget(client))
+  case stream.next(wait) {
+    Error(error) -> {
+      stream.close()
+      Error(error)
+    }
+    Ok(None) -> {
+      stream.close()
+      Error(TimedOut(MaybeSent))
+    }
+    Ok(Some(frame)) ->
+      case acknowledgement(frame, id) {
+        Ok(confirmed) -> Ok(Subscription(stream, id, confirmed))
+        Error(error) -> {
+          stream.close()
+          Error(error)
         }
       }
   }
 }
 
-fn validate_jsonrpc_result(
-  response: Dynamic,
-  expected_id: String,
-) -> Result(Dynamic, String) {
-  let version =
-    dyn_decode.run(response, dyn_decode.at(["jsonrpc"], dyn_decode.string))
-  let response_id =
-    dyn_decode.run(response, dyn_decode.at(["id"], dyn_decode.string))
-  let result_field =
-    dyn_decode.run(response, dyn_decode.at(["result"], dyn_decode.dynamic))
-  let error_field =
-    dyn_decode.run(response, dyn_decode.at(["error"], dyn_decode.dynamic))
-  case version, response_id, result_field, error_field {
-    Ok("2.0"), Ok(actual), Ok(result), Error(_) if actual == expected_id ->
-      Ok(result)
-    _, _, _, _ -> Error("malformed or uncorrelated JSON-RPC result")
+/// The notifications the server confirmed for this stream.
+pub fn listening(subscription: Subscription) -> List(Notification) {
+  subscription.notifications
+}
+
+/// Waits at most `wait` for the next notification; `Ok(None)` means none
+/// arrived. The stream stays open after a wait.
+pub fn next_notification(
+  subscription: Subscription,
+  wait: Duration,
+) -> Result(Option(Notification), Error) {
+  case subscription.stream.next(int.max(0, ms(wait))) {
+    Error(error) -> Error(error)
+    Ok(None) -> Ok(None)
+    Ok(Some(frame)) -> notification(frame, subscription.id) |> result.map(Some)
   }
 }
 
-fn decode_tool_response(
-  bytes: BitArray,
-  expected_id: String,
-  max_response_bytes: Int,
-) -> Result(DecodedToolResponse, String) {
-  case bit_array.to_string(bytes) {
-    Error(_) -> Error("tool response was not UTF-8")
-    Ok(raw) ->
-      case json.parse(raw, dyn_decode.dynamic) {
-        Error(_) -> Error("tool response was not valid JSON")
-        Ok(response) ->
-          case validate_jsonrpc_result(response, expected_id) {
-            Error(reason) -> Error(reason)
-            Ok(result_value) -> {
-              case optional_string_field(result_value, ["resultType"]) {
-                Error(reason) -> Error(reason)
-                Ok(Some("input_required")) ->
-                  decode_input_required(result_value)
-                Ok(None) | Ok(Some("complete")) ->
-                  decode_complete_tool_result(
-                    bytes,
-                    result_value,
-                    max_response_bytes,
-                  )
-                Ok(Some(_)) -> Error("tool result has an unknown resultType")
-              }
-            }
-          }
-      }
-  }
+/// Ends the stream; other requests on the client continue.
+pub fn close_subscription(subscription: Subscription) -> Nil {
+  subscription.stream.close()
 }
 
-fn decode_complete_tool_result(
-  bytes: BitArray,
-  result_value: Dynamic,
-  max_response_bytes: Int,
-) -> Result(DecodedToolResponse, String) {
-  let content =
-    dyn_decode.run(
-      result_value,
-      dyn_decode.at(["content"], dyn_decode.list(dyn_decode.dynamic)),
-    )
-  let is_error = optional_bool(result_value, ["isError"], False)
-  case content, is_error {
-    Ok(blocks), Ok(is_error) ->
-      case decode_content_blocks(blocks) {
-        Error(reason) -> Error(reason)
-        Ok(decoded_blocks) ->
-          case
-            decode_structured_content(bytes, result_value, max_response_bytes)
-          {
-            Error(reason) -> Error(reason)
-            Ok(structured) ->
-              Ok(Completed(is_error, structured, decoded_blocks))
-          }
-      }
-    _, _ -> Error("tool result has invalid content or isError")
-  }
-}
-
-fn decode_input_required(
-  result_value: Dynamic,
-) -> Result(DecodedToolResponse, String) {
-  use fields <- result.try(
-    dyn_decode.run(
-      result_value,
-      dyn_decode.dict(dyn_decode.string, dyn_decode.dynamic),
-    )
-    |> result.map_error(fn(_) { "input-required result must be an object" }),
-  )
-  use requests <- result.try(case dict.get(fields, "inputRequests") {
-    Error(_) -> Ok(dict.new())
-    Ok(raw) -> decode_input_requests(raw)
+fn parse_frame(frame: BitArray) -> Result(Dynamic, Error) {
+  bit_array.to_string(frame)
+  |> result.try(fn(text) {
+    json.parse(text, decode.dynamic) |> result.replace_error(Nil)
   })
-  use state <- result.try(optional_string_field(result_value, ["requestState"]))
-  case !dict.has_key(fields, "inputRequests") && state == None {
-    True -> Error("input-required result has no requests or requestState")
-    False -> Ok(Awaiting(requests, state))
-  }
+  |> result.replace_error(MalformedResponse("a stream event is not valid JSON"))
 }
 
-fn decode_input_requests(
-  raw: Dynamic,
-) -> Result(Dict(String, tool.InputRequest), String) {
-  use requests <- result.try(
-    dyn_decode.run(raw, dyn_decode.dict(dyn_decode.string, dyn_decode.dynamic))
-    |> result.map_error(fn(_) { "inputRequests must be an object" }),
+fn subscription_matches(message: Dynamic, id: String) -> Bool {
+  decode.run(
+    message,
+    decode.at(
+      ["params", "_meta", "io.modelcontextprotocol/subscriptionId"],
+      decode.string,
+    ),
   )
-  decode_input_request_entries(dict.to_list(requests), [])
-  |> result.map(dict.from_list)
+  == Ok(id)
 }
 
-fn decode_input_request_entries(
-  entries: List(#(String, Dynamic)),
-  decoded: List(#(String, tool.InputRequest)),
-) -> Result(List(#(String, tool.InputRequest)), String) {
-  case entries {
-    [] -> Ok(decoded)
-    [#(key, raw), ..rest] -> {
-      use method <- result.try(string_field(raw, ["method"]))
-      use params <- result.try(dynamic_field(raw, ["params"]))
-      use params <- result.try(dynamic_to_json(params))
-      case json_is_object(params) {
-        False -> Error("input request params must be an object")
-        True ->
-          decode_input_request_entries(rest, [
-            #(key, tool.InputRequest(method, params)),
-            ..decoded
-          ])
-      }
-    }
-  }
-}
-
-fn optional_bool(
-  value: Dynamic,
-  path: List(String),
-  default: Bool,
-) -> Result(Bool, String) {
-  case dyn_decode.run(value, dyn_decode.at(path, dyn_decode.dynamic)) {
-    Error(_) -> Ok(default)
-    Ok(raw) ->
-      dyn_decode.run(raw, dyn_decode.bool)
-      |> result.map_error(fn(_) { "tool result boolean field is invalid" })
-  }
-}
-
-fn decode_content_blocks(
-  blocks: List(Dynamic),
-) -> Result(List(content.ContentBlock), String) {
-  case blocks {
-    [] -> Ok([])
-    [block, ..rest] ->
-      decode_content_block(block)
-      |> result.try(fn(decoded) {
-        decode_content_blocks(rest)
-        |> result.map(fn(rest) { [decoded, ..rest] })
-      })
-  }
-}
-
-fn decode_content_block(
-  block: Dynamic,
-) -> Result(content.ContentBlock, String) {
-  use block_type <- result.try(string_field(block, ["type"]))
-  case block_type {
-    "text" ->
-      decode_annotations(block)
-      |> result.try(fn(annotations) {
-        string_field(block, ["text"])
-        |> result.map(fn(text) { content.TextContent(text, annotations) })
-      })
-    "image" ->
-      decode_annotations(block)
-      |> result.try(fn(annotations) {
-        use data <- result.try(string_field(block, ["data"]))
-        use mime_type <- result.try(string_field(block, ["mimeType"]))
-        Ok(content.ImageContent(data, mime_type, annotations))
-      })
-    "audio" ->
-      decode_annotations(block)
-      |> result.try(fn(annotations) {
-        use data <- result.try(string_field(block, ["data"]))
-        use mime_type <- result.try(string_field(block, ["mimeType"]))
-        Ok(content.AudioContent(data, mime_type, annotations))
-      })
-    "resource_link" ->
-      decode_resource_link(block)
-      |> result.map(content.ResourceLinkBlock)
-    "resource" ->
-      decode_annotations(block)
-      |> result.try(fn(annotations) {
-        dyn_decode.run(block, dyn_decode.at(["resource"], dyn_decode.dynamic))
-        |> result.map_error(fn(_) { "embedded resource is missing" })
-        |> result.try(fn(resource) {
-          decode_resource_contents(resource)
-          |> result.map(fn(contents) {
-            content.EmbeddedResourceBlock(content.EmbeddedResource(
-              contents,
-              annotations,
-            ))
-          })
-        })
-      })
-    _ -> Error("tool result contains an unsupported content block")
-  }
-}
-
-fn decode_resource_link(
-  value: Dynamic,
-) -> Result(content.ResourceLink, String) {
-  use uri <- result.try(string_field(value, ["uri"]))
-  use name <- result.try(string_field(value, ["name"]))
-  use title <- result.try(optional_string_field(value, ["title"]))
-  use description <- result.try(optional_string_field(value, ["description"]))
-  use mime_type <- result.try(optional_string_field(value, ["mimeType"]))
-  use size <- result.try(optional_int_field(value, ["size"]))
-  use annotations <- result.try(decode_annotations(value))
-  Ok(content.ResourceLink(
-    uri,
-    name,
-    title,
-    description,
-    mime_type,
-    size,
-    annotations,
-  ))
-}
-
-fn decode_resource_contents(
-  value: Dynamic,
-) -> Result(content.ResourceContents, String) {
-  use uri <- result.try(string_field(value, ["uri"]))
-  use mime_type <- result.try(optional_string_field(value, ["mimeType"]))
-  use fields <- result.try(
-    dyn_decode.run(
-      value,
-      dyn_decode.dict(dyn_decode.string, dyn_decode.dynamic),
-    )
-    |> result.map_error(fn(_) { "resource contents must be an object" }),
-  )
-  case dict.get(fields, "text"), dict.get(fields, "blob") {
-    Ok(raw), Error(_) ->
-      dyn_decode.run(raw, dyn_decode.string)
-      |> result.map(content.TextResourceContents(uri, _, mime_type))
-      |> result.map_error(fn(_) { "resource text must be a string" })
-    Error(_), Ok(raw) ->
-      dyn_decode.run(raw, dyn_decode.string)
-      |> result.map(content.BlobResourceContents(uri, _, mime_type))
-      |> result.map_error(fn(_) { "resource blob must be a string" })
-    _, _ -> Error("resource contents must contain exactly one of text or blob")
-  }
-}
-
-fn decode_annotations(
-  value: Dynamic,
-) -> Result(Option(content.Annotations), String) {
+fn acknowledgement(
+  frame: BitArray,
+  id: String,
+) -> Result(List(Notification), Error) {
+  use message <- result.try(parse_frame(frame))
   case
-    dyn_decode.run(value, dyn_decode.at(["annotations"], dyn_decode.dynamic))
+    decode.run(message, decode.at(["method"], decode.string)),
+    subscription_matches(message, id)
   {
-    Error(_) -> Ok(None)
-    Ok(raw) ->
-      decode_annotation_object(raw)
-      |> result.map(Some)
-  }
-}
-
-fn decode_annotation_object(
-  value: Dynamic,
-) -> Result(content.Annotations, String) {
-  use fields <- result.try(
-    dyn_decode.run(
-      value,
-      dyn_decode.dict(dyn_decode.string, dyn_decode.dynamic),
-    )
-    |> result.map_error(fn(_) { "content annotations must be an object" }),
-  )
-  use audience <- result.try(optional_roles(fields, "audience"))
-  use priority <- result.try(optional_float(fields, "priority"))
-  use title <- result.try(optional_string(fields, "title"))
-  use description <- result.try(optional_string(fields, "description"))
-  Ok(content.Annotations(audience, priority, title, description))
-}
-
-fn decode_declaration_annotations(
-  value: Dynamic,
-) -> Result(Option(Annotations), String) {
-  case
-    dyn_decode.run(value, dyn_decode.at(["annotations"], dyn_decode.dynamic))
-  {
-    Error(_) -> Ok(None)
-    Ok(raw) -> {
-      use fields <- result.try(
-        dyn_decode.run(
-          raw,
-          dyn_decode.dict(dyn_decode.string, dyn_decode.dynamic),
-        )
-        |> result.map_error(fn(_) {
-          "declaration annotations must be an object"
+    Ok("notifications/subscriptions/acknowledged"), True ->
+      decode.run(
+        message,
+        decode.at(["params", "notifications"], {
+          let flag = fn(key, next) {
+            decode.optional_field(key, False, decode.bool, next)
+          }
+          use tools <- flag("toolsListChanged")
+          use resources <- flag("resourcesListChanged")
+          use prompts <- flag("promptsListChanged")
+          use uris <- decode.optional_field(
+            "resourceSubscriptions",
+            [],
+            decode.list(decode.string),
+          )
+          decode.success(subs.Filter(tools, resources, prompts, uris))
         }),
       )
-      use audience <- result.try(optional_roles(fields, "audience"))
-      use priority <- result.try(optional_float(fields, "priority"))
-      use last_modified <- result.try(optional_string(fields, "lastModified"))
-      Ok(Some(Annotations(audience, priority, last_modified)))
-    }
-  }
-}
-
-fn decode_tool_annotations(
-  value: Dynamic,
-) -> Result(Option(tool.ToolAnnotations), String) {
-  case
-    dyn_decode.run(value, dyn_decode.at(["annotations"], dyn_decode.dynamic))
-  {
-    Error(_) -> Ok(None)
-    Ok(raw) -> {
-      use fields <- result.try(
-        dyn_decode.run(
-          raw,
-          dyn_decode.dict(dyn_decode.string, dyn_decode.dynamic),
-        )
-        |> result.map_error(fn(_) { "tool annotations must be an object" }),
-      )
-      use title <- result.try(optional_string(fields, "title"))
-      use read_only_hint <- result.try(optional_bool_dict(
-        fields,
-        "readOnlyHint",
+      |> result.map(subs.notifications_of)
+      |> result.replace_error(MalformedResponse(
+        "the acknowledgement has no notification filter",
       ))
-      use destructive_hint <- result.try(optional_bool_dict(
-        fields,
-        "destructiveHint",
-      ))
-      use idempotent_hint <- result.try(optional_bool_dict(
-        fields,
-        "idempotentHint",
-      ))
-      use open_world_hint <- result.try(optional_bool_dict(
-        fields,
-        "openWorldHint",
-      ))
-      Ok(
-        Some(tool.ToolAnnotations(
-          title,
-          read_only_hint,
-          destructive_hint,
-          idempotent_hint,
-          open_world_hint,
-        )),
-      )
-    }
-  }
-}
-
-fn decode_icons(value: Dynamic) -> Result(Option(List(Icon)), String) {
-  case dyn_decode.run(value, dyn_decode.at(["icons"], dyn_decode.dynamic)) {
-    Error(_) -> Ok(None)
-    Ok(raw) -> {
-      use values <- result.try(
-        dyn_decode.run(raw, dyn_decode.list(dyn_decode.dynamic))
-        |> result.map_error(fn(_) { "declaration icons must be an array" }),
-      )
-      decode_icon_values(values)
-      |> result.map(Some)
-    }
-  }
-}
-
-fn decode_icon_values(values: List(Dynamic)) -> Result(List(Icon), String) {
-  case values {
-    [] -> Ok([])
-    [value, ..rest] ->
-      decode_icon(value)
-      |> result.try(fn(icon) {
-        decode_icon_values(rest)
-        |> result.map(fn(decoded_rest) { [icon, ..decoded_rest] })
-      })
-  }
-}
-
-fn decode_icon(value: Dynamic) -> Result(Icon, String) {
-  use src <- result.try(string_field(value, ["src"]))
-  use mime_type <- result.try(optional_string_field(value, ["mimeType"]))
-  use sizes <- result.try(
-    case dyn_decode.run(value, dyn_decode.at(["sizes"], dyn_decode.dynamic)) {
-      Error(_) -> Ok(None)
-      Ok(raw) ->
-        dyn_decode.run(raw, dyn_decode.list(dyn_decode.string))
-        |> result.map(Some)
-        |> result.map_error(fn(_) { "icon sizes must be an array of strings" })
-    },
-  )
-  use theme <- result.try(
-    case dyn_decode.run(value, dyn_decode.at(["theme"], dyn_decode.dynamic)) {
-      Error(_) -> Ok(None)
-      Ok(raw) ->
-        case dyn_decode.run(raw, dyn_decode.string) {
-          Error(_) -> Error("icon theme is invalid")
-          Ok(name) ->
-            case name {
-              "light" -> Ok(Some(IconLight))
-              "dark" -> Ok(Some(IconDark))
-              _ -> Error("icon theme must be light or dark")
-            }
-        }
-    },
-  )
-  Ok(Icon(src, mime_type, sizes, theme))
-}
-
-fn optional_roles(
-  fields: Dict(String, Dynamic),
-  key: String,
-) -> Result(Option(List(content.Role)), String) {
-  case dict.get(fields, key) {
-    Error(_) -> Ok(None)
-    Ok(raw) ->
-      dyn_decode.run(raw, dyn_decode.list(dyn_decode.string))
-      |> result.map_error(fn(_) {
-        "content annotation audience must be an array"
-      })
-      |> result.try(fn(roles) {
-        decode_roles(roles)
-        |> result.map(Some)
-      })
-  }
-}
-
-fn decode_roles(values: List(String)) -> Result(List(content.Role), String) {
-  case values {
-    [] -> Ok([])
-    [value, ..rest] ->
-      case value {
-        "user" ->
-          decode_roles(rest)
-          |> result.map(fn(rest) { [content.UserRole, ..rest] })
-        "assistant" ->
-          decode_roles(rest)
-          |> result.map(fn(rest) { [content.AssistantRole, ..rest] })
-        _ -> Error("content annotation audience has an unknown role")
-      }
-  }
-}
-
-fn optional_float(
-  fields: Dict(String, Dynamic),
-  key: String,
-) -> Result(Option(Float), String) {
-  case dict.get(fields, key) {
-    Error(_) -> Ok(None)
-    Ok(raw) ->
-      dyn_decode.run(raw, dyn_decode.float)
-      |> result.map(Some)
-      |> result.map_error(fn(_) {
-        "content annotation priority must be numeric"
-      })
-  }
-}
-
-fn optional_bool_dict(
-  fields: Dict(String, Dynamic),
-  key: String,
-) -> Result(Option(Bool), String) {
-  case dict.get(fields, key) {
-    Error(_) -> Ok(None)
-    Ok(raw) ->
-      dyn_decode.run(raw, dyn_decode.bool)
-      |> result.map(Some)
-      |> result.map_error(fn(_) { "tool annotation hint must be boolean" })
-  }
-}
-
-fn optional_string(
-  fields: Dict(String, Dynamic),
-  key: String,
-) -> Result(Option(String), String) {
-  case dict.get(fields, key) {
-    Error(_) -> Ok(None)
-    Ok(raw) ->
-      dyn_decode.run(raw, dyn_decode.string)
-      |> result.map(Some)
-      |> result.map_error(fn(_) { "content annotation field must be a string" })
-  }
-}
-
-fn string_field(value: Dynamic, path: List(String)) -> Result(String, String) {
-  dyn_decode.run(value, dyn_decode.at(path, dyn_decode.string))
-  |> result.map_error(fn(_) { "result object is missing a required string" })
-}
-
-fn optional_string_field(
-  value: Dynamic,
-  path: List(String),
-) -> Result(Option(String), String) {
-  case dyn_decode.run(value, dyn_decode.at(path, dyn_decode.dynamic)) {
-    Error(_) -> Ok(None)
-    Ok(raw) ->
-      dyn_decode.run(raw, dyn_decode.string)
-      |> result.map(Some)
-      |> result.map_error(fn(_) { "optional result string is invalid" })
-  }
-}
-
-fn optional_int_field(
-  value: Dynamic,
-  path: List(String),
-) -> Result(Option(Int), String) {
-  case dyn_decode.run(value, dyn_decode.at(path, dyn_decode.dynamic)) {
-    Error(_) -> Ok(None)
-    Ok(raw) ->
-      dyn_decode.run(raw, dyn_decode.int)
-      |> result.map(Some)
-      |> result.map_error(fn(_) { "optional result integer is invalid" })
-  }
-}
-
-fn optional_bool_field(
-  value: Dynamic,
-  path: List(String),
-) -> Result(Option(Bool), String) {
-  case dyn_decode.run(value, dyn_decode.at(path, dyn_decode.dynamic)) {
-    Error(_) -> Ok(None)
-    Ok(raw) ->
-      dyn_decode.run(raw, dyn_decode.bool)
-      |> result.map(Some)
-      |> result.map_error(fn(_) { "optional result boolean is invalid" })
-  }
-}
-
-fn decode_structured_content(
-  bytes: BitArray,
-  result_value: Dynamic,
-  max_response_bytes: Int,
-) -> Result(Option(blueprint_value.Value), String) {
-  case
-    dyn_decode.run(
-      result_value,
-      dyn_decode.at(["structuredContent"], dyn_decode.dynamic),
-    )
-  {
-    Error(_) -> Ok(None)
-    Ok(_) -> {
-      let limits =
-        blueprint_value.default_limits()
-        |> blueprint_value.with_max_bytes(max_response_bytes)
-      case blueprint_value.parse_bits(bytes, limits) {
+    _, _ ->
+      case decode.run(message, decode.at(["error"], rpc_error_decoder())) {
+        Ok(error) -> Error(error)
         Error(_) ->
-          Error("structured tool result contains an invalid JSON value")
-        Ok(root) ->
-          case blueprint_at(root, ["result", "structuredContent"]) {
-            None -> Error("structured tool result is missing its value")
-            Some(value) -> Ok(Some(value))
-          }
-      }
-    }
-  }
-}
-
-fn decode_json_list_page(
-  bytes: BitArray,
-  expected_id: String,
-  collection_key: String,
-) -> Result(#(List(String), Option(String)), String) {
-  case bit_array.to_string(bytes) {
-    Error(_) -> Error("list response was not UTF-8")
-    Ok(raw) ->
-      case json.parse(raw, dyn_decode.dynamic) {
-        Error(_) -> Error("list response was not valid JSON")
-        Ok(response) ->
-          case validate_jsonrpc_result(response, expected_id) {
-            Error(reason) -> Error(reason)
-            Ok(result_value) -> {
-              use items <- result.try(
-                dyn_decode.run(
-                  result_value,
-                  dyn_decode.at(
-                    [collection_key],
-                    dyn_decode.list(dyn_decode.dynamic),
-                  ),
-                )
-                |> result.map_error(fn(_) {
-                  "list response is missing its collection array"
-                }),
-              )
-              use encoded_items <- result.try(dynamic_json_strings(items))
-              use next_cursor <- result.try(
-                optional_string_field(result_value, ["nextCursor"]),
-              )
-              Ok(#(encoded_items, next_cursor))
-            }
-          }
+          Error(MalformedResponse(
+            "the stream did not begin with its acknowledgement",
+          ))
       }
   }
 }
 
-fn dynamic_json_strings(values: List(Dynamic)) -> Result(List(String), String) {
-  case values {
-    [] -> Ok([])
-    [value, ..rest] ->
-      dynamic_to_json(value)
-      |> result.map(json.to_string)
-      |> result.try(fn(encoded) {
-        dynamic_json_strings(rest)
-        |> result.map(fn(encoded_rest) { [encoded, ..encoded_rest] })
-      })
-  }
-}
-
-fn decode_json_items(
-  items: List(String),
-  decoder: fn(Dynamic) -> Result(value, String),
-) -> Result(List(value), String) {
-  case items {
-    [] -> Ok([])
-    [raw, ..rest] ->
-      case json.parse(raw, dyn_decode.dynamic) {
-        Error(_) -> Error("list item was not valid JSON")
-        Ok(value) ->
-          case decoder(value) {
-            Error(reason) -> Error(reason)
-            Ok(decoded) ->
-              decode_json_items(rest, decoder)
-              |> result.map(fn(decoded_rest) { [decoded, ..decoded_rest] })
-          }
+fn notification(frame: BitArray, id: String) -> Result(Notification, Error) {
+  use message <- result.try(parse_frame(frame))
+  case subscription_matches(message, id) {
+    False -> Error(MalformedResponse("a stream event is not correlated"))
+    True ->
+      case decode.run(message, decode.at(["method"], decode.string)) {
+        Ok("notifications/tools/list_changed") ->
+          Ok(subscriptions.ToolsListChanged)
+        Ok("notifications/resources/list_changed") ->
+          Ok(subscriptions.ResourcesListChanged)
+        Ok("notifications/prompts/list_changed") ->
+          Ok(subscriptions.PromptsListChanged)
+        Ok("notifications/resources/updated") ->
+          decode.run(message, decode.at(["params", "uri"], decode.string))
+          |> result.map(subscriptions.ResourceUpdated)
+          |> result.replace_error(MalformedResponse(
+            "a resource update has no uri",
+          ))
+        _ -> Error(MalformedResponse("a stream event has an unknown method"))
       }
-  }
-}
-
-fn decode_tool_declaration(value: Dynamic) -> Result(ToolDeclaration, String) {
-  use name <- result.try(string_field(value, ["name"]))
-  use title <- result.try(optional_string_field(value, ["title"]))
-  use description <- result.try(optional_string_field(value, ["description"]))
-  use raw_input <- result.try(dynamic_field(value, ["inputSchema"]))
-  use input_schema <- result.try(dynamic_to_json(raw_input))
-  use output_schema <- result.try(optional_json_field(value, ["outputSchema"]))
-  use annotations <- result.try(decode_tool_annotations(value))
-  use icons <- result.try(decode_icons(value))
-  use meta <- result.try(optional_json_field(value, ["_meta"]))
-  Ok(ToolDeclaration(
-    name,
-    title,
-    description,
-    input_schema,
-    output_schema,
-    annotations,
-    icons,
-    meta,
-  ))
-}
-
-fn decode_resource_declaration(
-  value: Dynamic,
-) -> Result(ResourceDeclaration, String) {
-  use uri <- result.try(string_field(value, ["uri"]))
-  use name <- result.try(string_field(value, ["name"]))
-  use title <- result.try(optional_string_field(value, ["title"]))
-  use description <- result.try(optional_string_field(value, ["description"]))
-  use mime_type <- result.try(optional_string_field(value, ["mimeType"]))
-  use size <- result.try(optional_int_field(value, ["size"]))
-  use annotations <- result.try(decode_declaration_annotations(value))
-  use icons <- result.try(decode_icons(value))
-  use meta <- result.try(optional_json_field(value, ["_meta"]))
-  Ok(ResourceDeclaration(
-    uri,
-    name,
-    title,
-    description,
-    mime_type,
-    size,
-    annotations,
-    icons,
-    meta,
-  ))
-}
-
-fn decode_resource_template_declaration(
-  value: Dynamic,
-) -> Result(ResourceTemplateDeclaration, String) {
-  use uri_template <- result.try(string_field(value, ["uriTemplate"]))
-  use name <- result.try(string_field(value, ["name"]))
-  use title <- result.try(optional_string_field(value, ["title"]))
-  use description <- result.try(optional_string_field(value, ["description"]))
-  use mime_type <- result.try(optional_string_field(value, ["mimeType"]))
-  use annotations <- result.try(decode_declaration_annotations(value))
-  use icons <- result.try(decode_icons(value))
-  use meta <- result.try(optional_json_field(value, ["_meta"]))
-  Ok(ResourceTemplateDeclaration(
-    uri_template,
-    name,
-    title,
-    description,
-    mime_type,
-    annotations,
-    icons,
-    meta,
-  ))
-}
-
-fn decode_prompt_declaration(
-  value: Dynamic,
-) -> Result(PromptDeclaration, String) {
-  use name <- result.try(string_field(value, ["name"]))
-  use title <- result.try(optional_string_field(value, ["title"]))
-  use description <- result.try(optional_string_field(value, ["description"]))
-  use raw_arguments <- result.try(optional_prompt_arguments(value))
-  use arguments <- result.try(decode_prompt_arguments(raw_arguments))
-  use icons <- result.try(decode_icons(value))
-  use meta <- result.try(optional_json_field(value, ["_meta"]))
-  Ok(PromptDeclaration(name, title, description, arguments, icons, meta))
-}
-
-fn optional_prompt_arguments(value: Dynamic) -> Result(List(Dynamic), String) {
-  use fields <- result.try(
-    dyn_decode.run(
-      value,
-      dyn_decode.dict(dyn_decode.string, dyn_decode.dynamic),
-    )
-    |> result.map_error(fn(_) { "prompt declaration must be an object" }),
-  )
-  case dict.get(fields, "arguments") {
-    Error(_) -> Ok([])
-    Ok(raw) ->
-      dyn_decode.run(raw, dyn_decode.list(dyn_decode.dynamic))
-      |> result.map_error(fn(_) { "prompt declaration arguments are invalid" })
-  }
-}
-
-fn decode_prompt_arguments(
-  values: List(Dynamic),
-) -> Result(List(prompts.PromptArgument), String) {
-  case values {
-    [] -> Ok([])
-    [value, ..rest] -> {
-      use name <- result.try(string_field(value, ["name"]))
-      use description <- result.try(
-        optional_string_field(value, ["description"]),
-      )
-      use required <- result.try(optional_bool_field(value, ["required"]))
-      use title <- result.try(optional_string_field(value, ["title"]))
-      let required = case required {
-        Some(value) -> value
-        None -> False
-      }
-      let argument = prompts.PromptArgument(name, description, required, title)
-      decode_prompt_arguments(rest)
-      |> result.map(fn(decoded_rest) { [argument, ..decoded_rest] })
-    }
-  }
-}
-
-fn optional_json_field(
-  value: Dynamic,
-  path: List(String),
-) -> Result(Option(json.Json), String) {
-  case dyn_decode.run(value, dyn_decode.at(path, dyn_decode.dynamic)) {
-    Error(_) -> Ok(None)
-    Ok(raw) -> dynamic_to_json(raw) |> result.map(Some)
-  }
-}
-
-fn dynamic_to_json(value: Dynamic) -> Result(json.Json, String) {
-  use parsed <- result.try(
-    dyn_decode.run(value, blueprint_value.decoder())
-    |> result.replace_error("JSON value has an unsupported type"),
-  )
-  blueprint_value.to_json(parsed)
-  |> result.replace_error("JSON value has a number without an exact JSON form")
-}
-
-fn blueprint_at(
-  value: blueprint_value.Value,
-  path: List(String),
-) -> Option(blueprint_value.Value) {
-  case path {
-    [] -> Some(value)
-    [key, ..rest] ->
-      case value {
-        blueprint_value.Object(fields) ->
-          case list.key_find(fields, key) {
-            Ok(child) -> blueprint_at(child, rest)
-            Error(_) -> None
-          }
-        _ -> None
-      }
-  }
-}
-
-fn request_id() -> String {
-  "relay-" <> int.to_string(ffi_unique_integer())
-}
-
-fn list_json_pages(
-  client: Client,
-  method: String,
-  collection_key: String,
-) -> Result(List(String), String) {
-  list_json_page(
-    client,
-    method,
-    collection_key,
-    None,
-    dict.new(),
-    [],
-    0,
-    client.listing_limits.max_pages,
-  )
-}
-
-fn list_json_page(
-  client: Client,
-  method: String,
-  collection_key: String,
-  cursor: Option(String),
-  seen_cursors: Dict(String, Bool),
-  reversed_pages: List(List(String)),
-  item_count: Int,
-  remaining_pages: Int,
-) -> Result(List(String), String) {
-  case remaining_pages <= 0 {
-    True -> Error(method <> " exceeded the client page limit")
-    False -> {
-      let params = case cursor {
-        None -> []
-        Some(value) -> [#("cursor", json.string(value))]
-      }
-      let id = request_id()
-      let body = request_envelope(client, id, method, params)
-      case request(client, body, id, method, "") {
-        Error(reason) -> Error(reason)
-        Ok(#(status, _)) if status != 200 ->
-          Error(method <> " returned HTTP " <> int.to_string(status))
-        Ok(#(_, bytes)) ->
-          case decode_json_list_page(bytes, id, collection_key) {
-            Error(reason) -> Error(reason)
-            Ok(#(items, next_cursor)) -> {
-              let item_count = item_count + list.length(items)
-              case item_count > client.listing_limits.max_items {
-                True -> Error(method <> " exceeded the client item limit")
-                False -> {
-                  let reversed_pages = [items, ..reversed_pages]
-                  case next_cursor {
-                    None -> Ok(list.flatten(list.reverse(reversed_pages)))
-                    Some(next) ->
-                      case dict.has_key(seen_cursors, next) {
-                        True -> Error(method <> " cursor repeated")
-                        False ->
-                          list_json_page(
-                            client,
-                            method,
-                            collection_key,
-                            Some(next),
-                            dict.insert(seen_cursors, next, True),
-                            reversed_pages,
-                            item_count,
-                            remaining_pages - 1,
-                          )
-                      }
-                  }
-                }
-              }
-            }
-          }
-      }
-    }
-  }
-}
-
-fn input_capabilities_json(methods: List(InputMethod)) -> json.Json {
-  let fields = []
-  let fields = case list.contains(methods, Elicitation) {
-    True -> [#("elicitation", json.object([])), ..fields]
-    False -> fields
-  }
-  let fields = case list.contains(methods, Sampling) {
-    True -> [#("sampling", json.object([])), ..fields]
-    False -> fields
-  }
-  let fields = case list.contains(methods, Roots) {
-    True -> [#("roots", json.object([])), ..fields]
-    False -> fields
-  }
-  json.object(fields)
-}
-
-fn request_envelope(
-  client: Client,
-  id: String,
-  method: String,
-  params: List(#(String, json.Json)),
-) -> BitArray {
-  let metadata =
-    json.object([
-      #(
-        "io.modelcontextprotocol/protocolVersion",
-        json.string(protocol_version),
-      ),
-      #(
-        "io.modelcontextprotocol/clientCapabilities",
-        input_capabilities_json(client.input_methods),
-      ),
-    ])
-  let params = json.object([#("_meta", metadata), ..params])
-  json.object([
-    #("jsonrpc", json.string("2.0")),
-    #("id", json.string(id)),
-    #("method", json.string(method)),
-    #("params", params),
-  ])
-  |> json.to_string
-  |> bit_array.from_string
-}
-
-fn decode_discovery(
-  bytes: BitArray,
-  expected_id: String,
-) -> Result(Discovery, String) {
-  case bit_array.to_string(bytes) {
-    Error(_) -> Error("server discovery response was not UTF-8")
-    Ok(raw) ->
-      case json.parse(raw, dyn_decode.dynamic) {
-        Error(_) -> Error("server discovery response was not valid JSON")
-        Ok(dynamic) -> {
-          let versions =
-            dyn_decode.run(
-              dynamic,
-              dyn_decode.at(
-                ["result", "supportedVersions"],
-                dyn_decode.list(dyn_decode.string),
-              ),
-            )
-          let wire_version =
-            dyn_decode.run(
-              dynamic,
-              dyn_decode.at(["jsonrpc"], dyn_decode.string),
-            )
-          let response_id =
-            dyn_decode.run(dynamic, dyn_decode.at(["id"], dyn_decode.string))
-          let capabilities =
-            dyn_decode.run(
-              dynamic,
-              dyn_decode.at(["result", "capabilities"], dyn_decode.dynamic),
-            )
-          case versions, capabilities, wire_version, response_id {
-            Ok(supported), Ok(capabilities), Ok("2.0"), Ok(id) ->
-              case
-                id == expected_id && list.contains(supported, protocol_version)
-              {
-                False ->
-                  Error(
-                    "server discovery response was uncorrelated or did not support "
-                    <> protocol_version,
-                  )
-                True ->
-                  Ok(Discovery(
-                    server_info: decode_server_info(dynamic),
-                    supported_versions: supported,
-                    capabilities: capabilities,
-                  ))
-              }
-            _, _, _, _ ->
-              Error("server discovery response is missing required fields")
-          }
-        }
-      }
-  }
-}
-
-fn decode_server_info(dynamic: Dynamic) -> Option(ServerInfo) {
-  let name =
-    dyn_decode.run(
-      dynamic,
-      dyn_decode.at(
-        ["result", "_meta", "io.modelcontextprotocol/serverInfo", "name"],
-        dyn_decode.string,
-      ),
-    )
-  let version =
-    dyn_decode.run(
-      dynamic,
-      dyn_decode.at(
-        ["result", "_meta", "io.modelcontextprotocol/serverInfo", "version"],
-        dyn_decode.string,
-      ),
-    )
-  case name, version {
-    Ok(name), Ok(version) -> Some(ServerInfo(name, version))
-    _, _ -> None
   }
 }

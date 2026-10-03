@@ -1,263 +1,155 @@
 import gleam/bit_array
 import gleam/json
-import gleam/option.{Some}
-import gleeunit
+import gleam/option.{None}
 import gleeunit/should
 import json/blueprint/codec
-import relay/protocol/jsonrpc.{RequestInteger, RequestString}
-import relay/server.{
-  CloseExchange, EmitRequestAdmitted, ExchangeClosed, InvocationFinished,
-  MessageReceived, OutcomeSuccess, StartInvocation, Write,
-}
+import relay/internal/jsonrpc.{RequestInteger, RequestString}
+import relay/reducer.{Admitted, Close, ExchangeClosed, Received, Start, Write}
+import relay/reducer_support as support
+import relay/server.{type Server}
 import relay/test_codec
 import relay/tool
 
-pub fn main() -> Nil {
-  gleeunit.main()
-}
-
-fn sample_registry() -> tool.Registry(String) {
-  let assert Ok(name) = tool.tool_name("echo")
-  let assert Ok(t) = case
-    tool.definition(
-      name,
+fn sample_server() -> Server(String) {
+  server.new([
+    tool.define(
+      "echo",
       test_codec.property("text", codec.string()),
       codec.string(),
     )
-  {
-    Ok(definition) -> {
-      let definition =
-        tool.with_metadata(
-          definition,
-          tool.ToolMetadata(
-            ..tool.empty_metadata(),
-            description: Some("Echoes input"),
-          ),
-        )
-      Ok(
-        tool.handle_with_error_renderer(
-          definition,
-          fn(text: String) { Ok(text) },
-          fn(application_error) {
-            case codec.encode_json(codec.success(Nil), application_error) {
-              Ok(text) -> text
-              Error(_) -> "Tool execution failed."
-            }
-          },
-        ),
-      )
-    }
-    Error(error) -> Error(error)
-  }
-  let assert Ok(reg) = tool.registry([t])
-  reg
-}
-
-fn make_call_frame(id: String, tool: String, arg: String) -> BitArray {
-  json.object([
-    #("jsonrpc", json.string("2.0")),
-    #("id", json.string(id)),
-    #("method", json.string("tools/call")),
-    #(
-      "params",
-      json.object([
-        #("name", json.string(tool)),
-        #("arguments", json.object([#("text", json.string(arg))])),
-        #(
-          "_meta",
-          json.object([
-            #(
-              "io.modelcontextprotocol/protocolVersion",
-              json.string("2026-07-28"),
-            ),
-            #("io.modelcontextprotocol/clientCapabilities", json.object([])),
-          ]),
-        ),
-      ]),
-    ),
+    |> tool.with_description("Echoes input")
+    |> tool.handle(fn(text: String) { Ok(text) }),
   ])
-  |> json.to_string()
-  |> bit_array.from_string()
 }
 
-// Property 1: Reducer determinism - identical sequence of inputs produces identical effects
+fn echo_frame(id: String, arg: String) -> BitArray {
+  support.call(id, "echo", [#("text", json.string(arg))])
+}
+
+// Property 1: Reducer determinism - identical sequences of inputs produce
+// identical effects.
 pub fn reducer_determinism_property_test() {
-  let reg = sample_registry()
-  let s_a = server.server(reg)
-  let s_b = server.server(reg)
+  let srv = sample_server()
+  let s_a = reducer.init(srv)
+  let s_b = reducer.init(srv)
 
-  let ex = server.exchange_id(100)
-  let frame = make_call_frame("det-1", "echo", "hello")
-  let in1 = MessageReceived(ex, "ctx", frame)
+  let ex = reducer.new_exchange_id()
+  let in1 = Received(ex, "ctx", echo_frame("det-1", "hello"), None)
 
-  let #(s_a1, eff_a1) = server.step(s_a, in1)
-  let #(s_b1, eff_b1) = server.step(s_b, in1)
+  let #(s_a1, eff_a1) = reducer.step(s_a, in1)
+  let #(s_b1, eff_b1) = reducer.step(s_b, in1)
 
-  case eff_a1, eff_b1 {
-    [EmitRequestAdmitted(_, _), StartInvocation(inv_a)],
-      [EmitRequestAdmitted(_, _), StartInvocation(inv_b)]
-    -> {
-      server.invocation_exchange(inv_a)
-      |> should.equal(server.invocation_exchange(inv_b))
-      let fin_a = server.perform(inv_a)
-      let fin_b = server.perform(inv_b)
+  let assert [Admitted(adm_a, "tools/call"), Start(inv_a)] = eff_a1
+  let assert [Admitted(adm_b, "tools/call"), Start(inv_b)] = eff_b1
+  adm_a |> should.equal(adm_b)
+  reducer.invocation_exchange(inv_a)
+  |> should.equal(reducer.invocation_exchange(inv_b))
 
-      let #(_s_a2, eff_a2) = server.step(s_a1, fin_a)
-      let #(_s_b2, eff_b2) = server.step(s_b1, fin_b)
-
-      eff_a2 |> should.equal(eff_b2)
-    }
-    _, _ -> should.fail()
-  }
+  let #(_s_a2, eff_a2) =
+    reducer.step(s_a1, reducer.perform(inv_a, support.ignore_progress))
+  let #(_s_b2, eff_b2) =
+    reducer.step(s_b1, reducer.perform(inv_b, support.ignore_progress))
+  eff_a2 |> should.equal(eff_b2)
 }
 
-// Property 2: Exactly one terminal response per exchange
+// Property 2: Exactly one terminal response per exchange.
 pub fn exactly_one_terminal_response_property_test() {
-  let reg = sample_registry()
-  let s0 = server.server(reg)
-  let ex = server.exchange_id(200)
+  let s0 = reducer.init(sample_server())
+  let #(s1, ex, eff1) = support.receive(s0, "ctx", echo_frame("single", "test"))
 
-  let frame = make_call_frame("single-term", "echo", "test")
-  let #(s1, eff1) = server.step(s0, MessageReceived(ex, "ctx", frame))
+  let assert [Admitted(_, _), Start(inv)] = eff1
+  let fin_input = reducer.perform(inv, support.ignore_progress)
 
-  case eff1 {
-    [EmitRequestAdmitted(_, _), StartInvocation(inv)] -> {
-      let inv_id = server.invocation_id(inv)
-      let fin_input =
-        InvocationFinished(
-          inv_id,
-          OutcomeSuccess(
-            codec.encode(codec.string(), "done")
-            |> fn(r) {
-              let assert Ok(v) = r
-              v
-            },
-          ),
-        )
+  let #(s2, eff2) = reducer.step(s1, fin_input)
+  let assert [Write(w_ex, _), Close(c_ex)] = eff2
+  w_ex |> should.equal(ex)
+  c_ex |> should.equal(ex)
 
-      // Step with invocation finished
-      let #(s2, eff2) = server.step(s1, fin_input)
-      // Expect Write and CloseExchange
-      case eff2 {
-        [Write(w_ex, _), CloseExchange(c_ex)] -> {
-          w_ex |> should.equal(ex)
-          c_ex |> should.equal(ex)
-        }
-        _ -> should.fail()
-      }
+  // A second finish of the same invocation produces no effects.
+  let #(_s3, eff3) = reducer.step(s2, fin_input)
+  eff3 |> should.equal([])
 
-      // Late second invocation finish on the same invocation ID produces NO effects
-      let #(_s3, eff3) = server.step(s2, fin_input)
-      eff3 |> should.equal([])
+  // Closing the exchange again produces no effects.
+  let #(_s4, eff4) = reducer.step(s2, ExchangeClosed(ex))
+  eff4 |> should.equal([])
 
-      // Closing exchange again produces NO effects
-      let #(_s4, eff4) = server.step(s2, ExchangeClosed(ex))
-      eff4 |> should.equal([])
-    }
-    _ -> should.fail()
-  }
+  // Nor do a crash or a timeout reported for the finished invocation.
+  let #(_s5, eff5) =
+    reducer.step(s2, reducer.Crashed(reducer.invocation_id(inv)))
+  eff5 |> should.equal([])
+  let #(_s6, eff6) =
+    reducer.step(s2, reducer.TimedOut(reducer.invocation_id(inv)))
+  eff6 |> should.equal([])
 }
 
-// Property 3: No invocation before admission
+// Property 3: No invocation before admission.
 pub fn no_invocation_before_admission_property_test() {
-  let reg = sample_registry()
-  let s0 = server.server(reg)
-  let ex = server.exchange_id(300)
+  let s0 = reducer.init(sample_server())
 
-  // 1. Incomplete/corrupted JSON frame
-  let bad_frame = bit_array.from_string("{\"jsonrpc\":\"2.0\"")
-  let #(_s1, eff1) = server.step(s0, MessageReceived(ex, "ctx", bad_frame))
-  // Must NOT start any invocation; must immediately write error response and close exchange
-  case eff1 {
-    [Write(w_ex, _), CloseExchange(c_ex)] -> {
-      w_ex |> should.equal(ex)
-      c_ex |> should.equal(ex)
-    }
-    _ -> should.fail()
-  }
+  // An incomplete JSON frame is answered and closed without admission.
+  let #(_s1, ex1, eff1) =
+    support.receive(s0, "ctx", bit_array.from_string("{\"jsonrpc\":\"2.0\""))
+  let assert [Write(w_ex, bytes), Close(c_ex)] = eff1
+  w_ex |> should.equal(ex1)
+  c_ex |> should.equal(ex1)
+  support.error_code(bytes) |> should.equal(-32_700)
 
-  // 2. Discover request (does not start an invocation)
-  let disc_frame =
-    json.object([
-      #("jsonrpc", json.string("2.0")),
-      #("id", json.string("disc-prop")),
-      #("method", json.string("server/discover")),
-      #(
-        "params",
-        json.object([
-          #(
-            "_meta",
-            json.object([
-              #(
-                "io.modelcontextprotocol/protocolVersion",
-                json.string("2026-07-28"),
-              ),
-              #("io.modelcontextprotocol/clientCapabilities", json.object([])),
-            ]),
-          ),
-        ]),
-      ),
-    ])
-    |> json.to_string()
-    |> bit_array.from_string()
-
-  let #(_s2, eff2) = server.step(s0, MessageReceived(ex, "ctx", disc_frame))
-  case eff2 {
-    [
-      EmitRequestAdmitted(_, "server/discover"),
-      Write(w_ex, _),
-      CloseExchange(c_ex),
-    ] -> {
-      w_ex |> should.equal(ex)
-      c_ex |> should.equal(ex)
-    }
-    _ -> should.fail()
-  }
+  // A discover request is admitted but starts no invocation.
+  let #(_s2, ex2, eff2) =
+    support.receive(
+      s0,
+      "ctx",
+      support.request(json.string("disc-prop"), "server/discover", []),
+    )
+  let assert [Admitted(a_ex, "server/discover"), Write(w_ex, _), Close(c_ex)] =
+    eff2
+  a_ex |> should.equal(ex2)
+  w_ex |> should.equal(ex2)
+  c_ex |> should.equal(ex2)
 }
 
-// Property 4: No output after terminal state
+// Property 4: No output after the terminal state.
 pub fn no_output_after_terminal_state_property_test() {
-  let reg = sample_registry()
-  let s0 = server.server(reg)
-  let ex = server.exchange_id(400)
+  let s0 = reducer.init(sample_server())
+  let ex = reducer.new_exchange_id()
 
-  // Explicitly close exchange before receiving any frame
-  let #(s1, eff1) = server.step(s0, ExchangeClosed(ex))
+  // Close the exchange before any frame arrives.
+  let #(s1, eff1) = reducer.step(s0, ExchangeClosed(ex))
   eff1 |> should.equal([])
 
-  // Attempt to feed message into already-closed exchange
-  let frame = make_call_frame("late", "echo", "foo")
-  let #(_s2, eff2) = server.step(s1, MessageReceived(ex, "ctx", frame))
-  // Must produce NO output effects
+  // A frame on the closed exchange produces no output.
+  let #(_s2, eff2) =
+    reducer.step(s1, Received(ex, "ctx", echo_frame("late", "foo"), None))
   eff2 |> should.equal([])
 }
 
-// Property 5: ToolName validated opaque invariant
+// Property 5: Tool names are validated when a definition is built.
 pub fn tool_name_invariants_property_test() {
-  // Valid names
-  let assert Ok(n1) = tool.tool_name("valid_name")
-  tool.tool_name_to_string(n1) |> should.equal("valid_name")
+  let input = test_codec.property("text", codec.string())
+  let assert Ok(d1) = tool.try_define("valid_name", input, codec.string())
+  tool.name(d1) |> should.equal("valid_name")
+  let assert Ok(d2) = tool.try_define("my-tool.v1", input, codec.string())
+  tool.name(d2) |> should.equal("my-tool.v1")
+  let assert Ok(d3) = tool.try_define("namespace/tool", input, codec.string())
+  tool.name(d3) |> should.equal("namespace/tool")
 
-  let assert Ok(n2) = tool.tool_name("my-tool.v1")
-  tool.tool_name_to_string(n2) |> should.equal("my-tool.v1")
-
-  let assert Ok(n3) = tool.tool_name("namespace/tool")
-  tool.tool_name_to_string(n3) |> should.equal("namespace/tool")
-
-  // Invalid names: empty, invalid characters, whitespace
-  tool.tool_name("") |> should.be_error()
-  tool.tool_name("has spaces") |> should.be_error()
-  tool.tool_name("tool#bad") |> should.be_error()
-  tool.tool_name("tool@bad") |> should.be_error()
+  tool.try_define("", input, codec.string())
+  |> should.equal(Error(tool.EmptyName))
+  tool.try_define("has spaces", input, codec.string())
+  |> should.equal(Error(tool.InvalidNameCharacter("has spaces", " ")))
+  tool.try_define("tool#bad", input, codec.string())
+  |> should.equal(Error(tool.InvalidNameCharacter("tool#bad", "#")))
+  tool.try_define("tool@bad", input, codec.string())
+  |> should.equal(Error(tool.InvalidNameCharacter("tool@bad", "@")))
 }
 
-// Property 6: RequestId string and int representation
+// Property 6: Request ids keep their string or integer representation.
 pub fn request_id_property_test() {
-  let s_id = RequestString("str-123")
-  let s_json = jsonrpc.request_id_to_json(s_id)
-  json.to_string(s_json) |> should.equal("\"str-123\"")
+  jsonrpc.request_id_to_json(RequestString("str-123"))
+  |> json.to_string
+  |> should.equal("\"str-123\"")
 
-  let i_id = RequestInteger(456)
-  let i_json = jsonrpc.request_id_to_json(i_id)
-  json.to_string(i_json) |> should.equal("456")
+  jsonrpc.request_id_to_json(RequestInteger(456))
+  |> json.to_string
+  |> should.equal("456")
 }

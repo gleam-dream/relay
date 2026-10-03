@@ -1,43 +1,24 @@
-//// The notification filter a client sends with `subscriptions/listen`.
+//// The notifications a `subscriptions/listen` stream delivers.
 ////
-//// `SubscriptionFilter` selects list-changed notifications for tools, resources
-//// and prompts, and update notifications for named resource URIs.
-//// `filter_supported` drops the kinds a server does not offer. `relay/server`
-//// applies the filter, and `relay/client.listen` sends it.
+//// A server sends a `Notification` with `relay/http.notify`,
+//// `relay/runtime.notify` or the reducer; a client asks for the same values
+//// with `relay/client.listen` and receives them from
+//// `relay/client.next_notification`. A server confirms only the kinds it
+//// offers: a server without resources drops the resource kinds.
+////
+//// ```gleam
+//// import relay/subscriptions.{ResourceUpdated, ToolsListChanged}
+////
+//// pub fn interests() -> List(subscriptions.Notification) {
+////   [ToolsListChanged, ResourceUpdated("file:///notes.txt")]
+//// }
+//// ```
 
-/// The set of notification types a client opts into via subscriptions/listen.
-pub type SubscriptionFilter {
-  SubscriptionFilter(
-    tools_list_changed: Bool,
-    resources_list_changed: Bool,
-    prompts_list_changed: Bool,
-    resource_subscriptions: List(String),
-  )
-}
-
-pub fn empty_filter() -> SubscriptionFilter {
-  SubscriptionFilter(
-    tools_list_changed: False,
-    resources_list_changed: False,
-    prompts_list_changed: False,
-    resource_subscriptions: [],
-  )
-}
-
-/// Filters the requested notification types against the server's actual capabilities.
-pub fn filter_supported(
-  filter: SubscriptionFilter,
-  has_tools: Bool,
-  has_resources: Bool,
-  has_prompts: Bool,
-) -> SubscriptionFilter {
-  SubscriptionFilter(
-    tools_list_changed: filter.tools_list_changed && has_tools,
-    resources_list_changed: filter.resources_list_changed && has_resources,
-    prompts_list_changed: filter.prompts_list_changed && has_prompts,
-    resource_subscriptions: case has_resources {
-      True -> filter.resource_subscriptions
-      False -> []
-    },
-  )
+/// A change a listening client is told about. `ResourceUpdated` names one
+/// resource URI; in a `listen` request it subscribes to that resource.
+pub type Notification {
+  ToolsListChanged
+  ResourcesListChanged
+  PromptsListChanged
+  ResourceUpdated(uri: String)
 }

@@ -1,3 +1,7 @@
+//// The wire codec of the MCP `2026-07-28` revision: request admission and
+//// parsing, HTTP routing fields, and the encoders of every result and
+//// notification the server writes.
+
 import gleam/bit_array
 import gleam/dict.{type Dict}
 import gleam/dynamic.{type Dynamic}
@@ -6,33 +10,18 @@ import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
-import json/blueprint/number
 import json/blueprint/value.{type Value}
-import relay/completion.{
-  type CompletionArgument, type CompletionRef, type CompletionValues,
-  CompletionArgument, PromptRef, ResourceRef,
-}
-import relay/content.{
-  type ContentBlock, type ResourceContents, content_block_to_json,
-  resource_contents_to_json,
-}
-import relay/internal/schema
-import relay/logging.{type LogLevel, parse_level, permits}
-import relay/prompts.{
-  type Prompt, type PromptResult, prompt_message_to_json, prompt_to_json,
-}
-import relay/protocol/jsonrpc.{
+import relay/content.{type ContentBlock, type ResourceContents}
+import relay/internal/core
+import relay/internal/jsonrpc.{
   type ProgressToken, type RequestId, type RpcError, ProgressInteger,
   ProgressString, RequestInteger, RequestString,
 }
-import relay/resources.{
-  type Resource, type ResourceTemplate, resource_template_to_json,
-  resource_to_json,
-}
-import relay/subscriptions.{type SubscriptionFilter}
-import relay/tool.{
-  type InputRequest, type ToolDeclaration, type ToolName, InputRequest,
-}
+import relay/internal/logging.{type LogLevel, parse_level, permits}
+import relay/internal/subscriptions_state.{type Filter, Filter}
+import relay/internal/wire.{value_to_json}
+import relay/subscriptions
+import relay/tool.{type Declaration}
 
 pub type ClientInfo {
   ClientInfo(name: String, version: String)
@@ -62,11 +51,7 @@ pub type Request {
     cursor: Option(String),
   )
   ResourcesRead(id: RequestId, metadata: RequestMetadata, uri: String)
-  SubscriptionsListen(
-    id: RequestId,
-    metadata: RequestMetadata,
-    filter: SubscriptionFilter,
-  )
+  SubscriptionsListen(id: RequestId, metadata: RequestMetadata, filter: Filter)
   PromptsList(id: RequestId, metadata: RequestMetadata, cursor: Option(String))
   PromptsGet(
     id: RequestId,
@@ -79,14 +64,12 @@ pub type Request {
   CompletionComplete(
     id: RequestId,
     metadata: RequestMetadata,
-    reference: CompletionRef,
-    argument: CompletionArgument,
-    context: Option(Dict(String, String)),
+    query: core.CompletionQuery,
   )
   ToolsCall(
     id: RequestId,
     metadata: RequestMetadata,
-    name: ToolName,
+    name: String,
     arguments: Value,
     request_state: Option(String),
     input_responses: Option(Value),
@@ -134,8 +117,14 @@ fn ffi_extract_input_responses_as_blueprint_value(
   raw_bytes: BitArray,
 ) -> Result(Value, Dynamic)
 
-@external(erlang, "relay_ffi", "raw_json")
-fn ffi_raw_json(json_str: String) -> json.Json
+@external(erlang, "relay_ffi", "json_depth_within")
+fn ffi_json_depth_within(bytes: BitArray, max_depth: Int) -> Bool
+
+/// Whether a frame nests objects and arrays at most `max_depth` levels deep.
+/// The check scans bytes and runs before any parsing.
+pub fn depth_within(bytes: BitArray, max_depth: Int) -> Bool {
+  ffi_json_depth_within(bytes, max_depth)
+}
 
 /// Admits and parses an incoming UTF-8 JSON-RPC string message.
 pub fn admit_message(raw_json: String) -> Admission {
@@ -261,6 +250,11 @@ pub fn encode_http_routing_error(bytes: BitArray) -> BitArray {
   |> string_to_bytes
 }
 
+fn string_to_bytes(raw: String) -> BitArray {
+  bit_array.from_string(raw <> "
+")
+}
+
 fn request_id(request: Request) -> RequestId {
   case request {
     Discover(id, _) -> id
@@ -271,7 +265,7 @@ fn request_id(request: Request) -> RequestId {
     SubscriptionsListen(id, _, _) -> id
     PromptsList(id, _, _) -> id
     PromptsGet(id, _, _, _, _, _) -> id
-    CompletionComplete(id, _, _, _, _) -> id
+    CompletionComplete(id, _, _) -> id
     ToolsCall(id, _, _, _, _, _) -> id
   }
 }
@@ -492,9 +486,7 @@ fn parse_subscriptions_listen_params(
   }
 }
 
-fn parse_subscription_filter(
-  dyn: Dynamic,
-) -> Result(subscriptions.SubscriptionFilter, Nil) {
+fn parse_subscription_filter(dyn: Dynamic) -> Result(Filter, Nil) {
   case decode.run(dyn, decode.dict(decode.string, decode.dynamic)) {
     Error(_) -> Error(Nil)
     Ok(filter_dict) -> {
@@ -524,7 +516,7 @@ fn parse_subscription_filter(
             |> result.map_error(fn(_) { Nil })
         },
       )
-      Ok(subscriptions.SubscriptionFilter(
+      Ok(Filter(
         tools_list_changed: tools_list_changed,
         resources_list_changed: resources_list_changed,
         prompts_list_changed: prompts_list_changed,
@@ -671,21 +663,30 @@ fn parse_completion_params(
             parse_completion_reference(ref_dyn),
             parse_completion_argument(argument_dyn)
           {
-            Ok(reference), Ok(argument) -> {
+            Ok(reference), Ok(#(argument_name, argument_value)) -> {
               let context = case dict.get(params, "context") {
-                Error(_) -> Ok(None)
+                Error(_) -> Ok(dict.new())
                 Ok(context_dyn) ->
-                  parse_string_arguments(Ok(context_dyn))
-                  |> result.map(Some)
+                  decode.run(context_dyn, {
+                    use arguments <- decode.optional_field(
+                      "arguments",
+                      dict.new(),
+                      decode.dict(decode.string, decode.string),
+                    )
+                    decode.success(arguments)
+                  })
               }
               case context {
                 Ok(context_values) ->
                   AdmittedRequest(CompletionComplete(
                     id,
                     meta,
-                    reference,
-                    argument,
-                    context_values,
+                    core.CompletionQuery(
+                      reference,
+                      argument_name,
+                      argument_value,
+                      context_values,
+                    ),
                   ))
                 Error(_) -> AdmittedRejected(Some(id), jsonrpc.invalid_params())
               }
@@ -697,7 +698,9 @@ fn parse_completion_params(
   }
 }
 
-fn parse_completion_reference(raw: Dynamic) -> Result(CompletionRef, Nil) {
+fn parse_completion_reference(
+  raw: Dynamic,
+) -> Result(core.CompletionTarget, Nil) {
   case decode.run(raw, decode.dict(decode.string, decode.dynamic)) {
     Error(_) -> Error(Nil)
     Ok(fields) ->
@@ -710,7 +713,7 @@ fn parse_completion_reference(raw: Dynamic) -> Result(CompletionRef, Nil) {
               |> result.map_error(fn(_) { Nil })
               |> result.try(fn(name_dyn) {
                 decode.run(name_dyn, decode.string)
-                |> result.map(PromptRef)
+                |> result.map(core.PromptTarget)
                 |> result.map_error(fn(_) { Nil })
               })
             Ok("ref/resource") ->
@@ -718,7 +721,7 @@ fn parse_completion_reference(raw: Dynamic) -> Result(CompletionRef, Nil) {
               |> result.map_error(fn(_) { Nil })
               |> result.try(fn(uri_dyn) {
                 decode.run(uri_dyn, decode.string)
-                |> result.map(ResourceRef)
+                |> result.map(core.ResourceTarget)
                 |> result.map_error(fn(_) { Nil })
               })
             _ -> Error(Nil)
@@ -727,11 +730,11 @@ fn parse_completion_reference(raw: Dynamic) -> Result(CompletionRef, Nil) {
   }
 }
 
-fn parse_completion_argument(raw: Dynamic) -> Result(CompletionArgument, Nil) {
+fn parse_completion_argument(raw: Dynamic) -> Result(#(String, String), Nil) {
   let decoder = {
     use name <- decode.field("name", decode.string)
     use value <- decode.field("value", decode.string)
-    decode.success(CompletionArgument(name, value))
+    decode.success(#(name, value))
   }
   decode.run(raw, decoder) |> result.map_error(fn(_) { Nil })
 }
@@ -941,9 +944,9 @@ fn parse_tools_call_params(
           case decode.run(name_dyn, decode.string) {
             Error(_) -> AdmittedRejected(Some(id), jsonrpc.invalid_params())
             Ok(raw_name) ->
-              case tool.tool_name(raw_name) {
-                Error(_) -> AdmittedRejected(Some(id), jsonrpc.invalid_params())
-                Ok(tool_name) -> {
+              case raw_name {
+                "" -> AdmittedRejected(Some(id), jsonrpc.invalid_params())
+                tool_name -> {
                   let args = case dict.get(params_map, "arguments") {
                     Error(_) -> Ok(value.Object([]))
                     Ok(_) -> ffi_extract_arguments_as_blueprint_value(bytes)
@@ -1004,189 +1007,25 @@ fn parse_optional_input_responses(
   }
 }
 
-/// Server info identifying Relay 0.1.0.
-pub fn server_info() -> json.Json {
+// --- encoders ----------------------------------------------------------------
+
+/// The server name and version reported in result metadata.
+pub type Identity {
+  Identity(name: String, version: String)
+}
+
+fn server_info(identity: Identity) -> json.Json {
   json.object([
-    #("name", json.string("relay")),
-    #("version", json.string("0.1.0")),
+    #("name", json.string(identity.name)),
+    #("version", json.string(identity.version)),
   ])
 }
 
-/// Result _meta containing io.modelcontextprotocol/serverInfo.
-pub fn result_meta() -> json.Json {
-  json.object([
-    #("io.modelcontextprotocol/serverInfo", server_info()),
-  ])
-}
-
-/// Encodes discovery response.
-pub fn encode_discovery_response(id: RequestId) -> json.Json {
-  encode_discovery_response_with_capabilities(id, True, False, False, False)
-}
-
-pub fn encode_discovery_response_with_capabilities(
-  id: RequestId,
-  has_tools: Bool,
-  has_resources: Bool,
-  has_prompts: Bool,
-  has_completions: Bool,
-) -> json.Json {
-  let capabilities = []
-  let capabilities = case has_tools {
-    True -> [
-      #("tools", json.object([#("listChanged", json.bool(True))])),
-      ..capabilities
-    ]
-    False -> capabilities
-  }
-  let capabilities = case has_resources {
-    True -> [
-      #(
-        "resources",
-        json.object([
-          #("listChanged", json.bool(True)),
-          #("subscribe", json.bool(True)),
-        ]),
-      ),
-      ..capabilities
-    ]
-    False -> capabilities
-  }
-  let capabilities = case has_prompts {
-    True -> [
-      #("prompts", json.object([#("listChanged", json.bool(True))])),
-      ..capabilities
-    ]
-    False -> capabilities
-  }
-  let capabilities = case has_completions {
-    True -> [#("completions", json.object([])), ..capabilities]
-    False -> capabilities
-  }
-  json.object([
-    #("jsonrpc", json.string("2.0")),
-    #("id", jsonrpc.request_id_to_json(id)),
-    #(
-      "result",
-      json.object([
-        #("cacheScope", json.string("private")),
-        #("capabilities", json.object(capabilities)),
-        #("resultType", json.string("complete")),
-        #("supportedVersions", json.array(["2026-07-28"], json.string)),
-        #("ttlMs", json.int(0)),
-        #("_meta", result_meta()),
-      ]),
-    ),
-  ])
-}
-
-pub fn encode_resources_list_response(
-  id: RequestId,
-  resources: List(Resource),
-  next_cursor: Option(String),
-) -> json.Json {
-  let fields = [#("resources", json.array(resources, resource_to_json))]
-  let fields = with_next_cursor(fields, next_cursor)
-  encode_result(id, json.object(with_cache_fields(fields)))
-}
-
-pub fn encode_resource_templates_list_response(
-  id: RequestId,
-  templates: List(ResourceTemplate),
-  next_cursor: Option(String),
-) -> json.Json {
-  let fields = [
-    #("resourceTemplates", json.array(templates, resource_template_to_json)),
-  ]
-  let fields = with_next_cursor(fields, next_cursor)
-  encode_result(id, json.object(with_cache_fields(fields)))
-}
-
-pub fn encode_resources_read_response(
-  id: RequestId,
-  contents: List(ResourceContents),
-) -> json.Json {
-  encode_result(
-    id,
-    json.object([
-      #("cacheScope", json.string("private")),
-      #("contents", json.array(contents, resource_contents_to_json)),
-      #("resultType", json.string("complete")),
-      #("ttlMs", json.int(0)),
-    ]),
+fn result_meta(identity: Identity) -> #(String, json.Json) {
+  #(
+    "_meta",
+    json.object([#("io.modelcontextprotocol/serverInfo", server_info(identity))]),
   )
-}
-
-pub fn encode_prompts_list_response(
-  id: RequestId,
-  prompts: List(Prompt),
-  next_cursor: Option(String),
-) -> json.Json {
-  let fields = [#("prompts", json.array(prompts, prompt_to_json))]
-  let fields = with_next_cursor(fields, next_cursor)
-  encode_result(id, json.object(with_cache_fields(fields)))
-}
-
-pub fn encode_prompts_get_response(
-  id: RequestId,
-  prompt_result: PromptResult,
-) -> json.Json {
-  let fields = [
-    #("messages", json.array(prompt_result.messages, prompt_message_to_json)),
-  ]
-  let fields = case prompt_result.description {
-    Some(description) -> [#("description", json.string(description)), ..fields]
-    None -> fields
-  }
-  let fields = [#("resultType", json.string("complete")), ..fields]
-  encode_result(id, json.object(fields))
-}
-
-pub fn encode_completion_response(
-  id: RequestId,
-  completion: CompletionValues,
-) -> json.Json {
-  let fields = [#("values", json.array(completion.values, json.string))]
-  let fields = case completion.total {
-    Some(total) -> [#("total", json.int(total)), ..fields]
-    None -> fields
-  }
-  let fields = case completion.has_more {
-    Some(has_more) -> [#("hasMore", json.bool(has_more)), ..fields]
-    None -> fields
-  }
-  encode_result(
-    id,
-    json.object([
-      #("completion", json.object(fields)),
-      #("resultType", json.string("complete")),
-    ]),
-  )
-}
-
-pub fn encode_empty_result(id: RequestId) -> json.Json {
-  encode_result(id, json.object([]))
-}
-
-fn with_next_cursor(
-  fields: List(#(String, json.Json)),
-  cursor: Option(String),
-) -> List(#(String, json.Json)) {
-  case cursor {
-    Some(value) -> list.append(fields, [#("nextCursor", json.string(value))])
-    None -> fields
-  }
-}
-
-fn with_cache_fields(
-  fields: List(#(String, json.Json)),
-) -> List(#(String, json.Json)) {
-  [
-    #("cacheScope", json.string("private")),
-    #("resultType", json.string("complete")),
-    #("ttlMs", json.int(0)),
-    ..fields
-  ]
 }
 
 fn encode_result(id: RequestId, result_json: json.Json) -> json.Json {
@@ -1197,209 +1036,455 @@ fn encode_result(id: RequestId, result_json: json.Json) -> json.Json {
   ])
 }
 
-/// Encodes tools list response.
-pub fn encode_tools_list_response(
-  id: RequestId,
-  tools: List(ToolDeclaration),
-) -> json.Json {
-  encode_tools_list_response_with_cursor(id, tools, None)
-}
-
-pub fn encode_tools_list_response_with_cursor(
-  id: RequestId,
-  tools: List(ToolDeclaration),
-  next_cursor: Option(String),
-) -> json.Json {
-  let tool_items =
-    list.map(tools, fn(decl) {
-      let input_schema = case decl.input_schema_override {
-        Some(raw_schema) -> raw_schema
-        None -> schema.materialize_schema(decl.input_schema)
-      }
-      let fields = [
-        #("name", json.string(tool.tool_name_to_string(decl.name))),
-        #("inputSchema", value_to_json(input_schema)),
-      ]
-      let with_title = case decl.metadata.title {
-        None -> fields
-        Some(t) -> list.append(fields, [#("title", json.string(t))])
-      }
-      let with_desc = case decl.metadata.description {
-        None -> with_title
-        Some(d) -> list.append(with_title, [#("description", json.string(d))])
-      }
-      let with_annotations = case decl.metadata.annotations {
-        None -> with_desc
-        Some(a) ->
-          list.append(with_desc, [
-            #("annotations", tool.tool_annotations_to_json(a)),
-          ])
-      }
-      let with_out_schema = case decl.output_schema {
-        None -> with_annotations
-        Some(s) ->
-          list.append(with_annotations, [
-            #("outputSchema", value_to_json(schema.materialize_schema(s))),
-          ])
-      }
-      json.object(with_out_schema)
-    })
-
-  let result_fields = [
-    #("cacheScope", json.string("private")),
-    #("resultType", json.string("complete")),
-    #("tools", json.array(tool_items, fn(x) { x })),
-    #("ttlMs", json.int(0)),
-    #("_meta", result_meta()),
-  ]
-  let result_fields =
-    list.append(result_fields, with_cursor_fields(next_cursor))
-  json.object([
-    #("jsonrpc", json.string("2.0")),
-    #("id", jsonrpc.request_id_to_json(id)),
-    #("result", json.object(result_fields)),
-  ])
-}
-
-fn with_cursor_fields(cursor: Option(String)) -> List(#(String, json.Json)) {
+fn with_next_cursor(cursor: Option(String)) -> List(#(String, json.Json)) {
   case cursor {
     Some(value) -> [#("nextCursor", json.string(value))]
     None -> []
   }
 }
 
-/// Encodes call success response with structuredContent and text mirror in content.
-pub fn encode_call_success_response(
-  id: RequestId,
-  structured: Value,
-) -> json.Json {
-  let text_mirror = text_mirror_of_value(structured)
-  let content_block =
-    json.object([
-      #("type", json.string("text")),
-      #("text", json.string(text_mirror)),
-    ])
-
-  json.object([
-    #("jsonrpc", json.string("2.0")),
-    #("id", jsonrpc.request_id_to_json(id)),
-    #(
-      "result",
-      json.object([
-        #("content", json.array([content_block], fn(x) { x })),
-        #("resultType", json.string("complete")),
-        #("structuredContent", value_to_json(structured)),
-        #("_meta", result_meta()),
-      ]),
-    ),
-  ])
+fn cache_fields() -> List(#(String, json.Json)) {
+  [
+    #("cacheScope", json.string("private")),
+    #("resultType", json.string("complete")),
+    #("ttlMs", json.int(0)),
+  ]
 }
 
-/// Encodes a tool result with caller-provided rich content and optional structured data.
-pub fn encode_call_content_response(
+pub type Capabilities {
+  Capabilities(tools: Bool, resources: Bool, prompts: Bool, completions: Bool)
+}
+
+/// Encodes the `server/discover` response.
+pub fn encode_discovery_response(
+  id: RequestId,
+  capabilities: Capabilities,
+  identity: Identity,
+  instructions: Option(String),
+) -> json.Json {
+  let advertised =
+    list.flatten([
+      case capabilities.tools {
+        True -> [#("tools", json.object([#("listChanged", json.bool(True))]))]
+        False -> []
+      },
+      case capabilities.resources {
+        True -> [
+          #(
+            "resources",
+            json.object([
+              #("listChanged", json.bool(True)),
+              #("subscribe", json.bool(True)),
+            ]),
+          ),
+        ]
+        False -> []
+      },
+      case capabilities.prompts {
+        True -> [
+          #("prompts", json.object([#("listChanged", json.bool(True))])),
+        ]
+        False -> []
+      },
+      case capabilities.completions {
+        True -> [#("completions", json.object([]))]
+        False -> []
+      },
+    ])
+  encode_result(
+    id,
+    json.object(
+      list.flatten([
+        [
+          #("cacheScope", json.string("private")),
+          #("capabilities", json.object(list.reverse(advertised))),
+        ],
+        wire.optional_string("instructions", instructions),
+        [
+          #("resultType", json.string("complete")),
+          #("supportedVersions", json.array(["2026-07-28"], json.string)),
+          #("ttlMs", json.int(0)),
+          result_meta(identity),
+        ],
+      ]),
+    ),
+  )
+}
+
+fn tool_annotations_json(
+  declaration: Declaration,
+) -> List(#(String, json.Json)) {
+  let annotations = declaration.annotations
+  let hint = fn(key, value) {
+    case value {
+      None -> []
+      Some(flag) -> [#(key, json.bool(flag))]
+    }
+  }
+  let fields =
+    list.flatten([
+      wire.optional_string("title", annotations.title),
+      hint("readOnlyHint", annotations.read_only_hint),
+      hint("destructiveHint", annotations.destructive_hint),
+      hint("idempotentHint", annotations.idempotent_hint),
+      hint("openWorldHint", annotations.open_world_hint),
+    ])
+  case fields {
+    [] -> []
+    _ -> [#("annotations", json.object(fields))]
+  }
+}
+
+pub fn tool_declaration_to_json(declaration: Declaration) -> json.Json {
+  json.object(
+    list.flatten([
+      [
+        #("name", json.string(declaration.name)),
+        #("inputSchema", value_to_json(declaration.input_schema)),
+      ],
+      wire.optional_string("title", declaration.title),
+      wire.optional_string("description", declaration.description),
+      tool_annotations_json(declaration),
+      case declaration.output_schema {
+        None -> []
+        Some(schema) -> [#("outputSchema", value_to_json(schema))]
+      },
+      wire.icons_field(declaration.icons),
+      wire.meta_field(declaration.meta),
+    ]),
+  )
+}
+
+/// Encodes one `tools/list` page.
+pub fn encode_tools_list_response(
+  id: RequestId,
+  tools: List(Declaration),
+  next_cursor: Option(String),
+  identity: Identity,
+) -> json.Json {
+  encode_result(
+    id,
+    json.object(
+      list.flatten([
+        [
+          #("cacheScope", json.string("private")),
+          #("resultType", json.string("complete")),
+          #("tools", json.array(tools, tool_declaration_to_json)),
+          #("ttlMs", json.int(0)),
+          result_meta(identity),
+        ],
+        with_next_cursor(next_cursor),
+      ]),
+    ),
+  )
+}
+
+fn optional_annotations(
+  annotations: Option(content.Annotations),
+) -> List(#(String, json.Json)) {
+  case annotations {
+    None -> []
+    Some(annotations) -> [
+      #("annotations", wire.annotations_to_json(annotations)),
+    ]
+  }
+}
+
+fn resource_to_json(resource: core.Resource(context)) -> json.Json {
+  let #(location, size) = case resource.kind {
+    core.Static(uri) -> #(
+      #("uri", json.string(uri)),
+      wire.optional_int("size", resource.size),
+    )
+    core.Template(uri_template, _) -> #(
+      #("uriTemplate", json.string(uri_template)),
+      [],
+    )
+  }
+  json.object(
+    list.flatten([
+      [location, #("name", json.string(resource.name))],
+      wire.optional_string("title", resource.title),
+      wire.optional_string("description", resource.description),
+      wire.optional_string("mimeType", resource.mime_type),
+      size,
+      optional_annotations(resource.annotations),
+      wire.icons_field(resource.icons),
+      wire.meta_field(resource.meta),
+    ]),
+  )
+}
+
+/// Encodes one `resources/list` page of static resources.
+pub fn encode_resources_list_response(
+  id: RequestId,
+  resources: List(core.Resource(context)),
+  next_cursor: Option(String),
+) -> json.Json {
+  encode_result(
+    id,
+    json.object(
+      list.flatten([
+        cache_fields(),
+        [#("resources", json.array(resources, resource_to_json))],
+        with_next_cursor(next_cursor),
+      ]),
+    ),
+  )
+}
+
+/// Encodes one `resources/templates/list` page.
+pub fn encode_resource_templates_list_response(
+  id: RequestId,
+  templates: List(core.Resource(context)),
+  next_cursor: Option(String),
+) -> json.Json {
+  encode_result(
+    id,
+    json.object(
+      list.flatten([
+        cache_fields(),
+        [#("resourceTemplates", json.array(templates, resource_to_json))],
+        with_next_cursor(next_cursor),
+      ]),
+    ),
+  )
+}
+
+/// Encodes a `resources/read` result.
+pub fn encode_resources_read_response(
+  id: RequestId,
+  contents: List(ResourceContents),
+) -> json.Json {
+  encode_result(
+    id,
+    json.object([
+      #("cacheScope", json.string("private")),
+      #("contents", json.array(contents, wire.resource_contents_to_json)),
+      #("resultType", json.string("complete")),
+      #("ttlMs", json.int(0)),
+    ]),
+  )
+}
+
+fn prompt_to_json(prompt: core.Prompt(context)) -> json.Json {
+  json.object(
+    list.flatten([
+      [
+        #("name", json.string(prompt.name)),
+        #(
+          "arguments",
+          json.array(prompt.arguments, fn(argument) {
+            json.object(
+              list.flatten([
+                [
+                  #("name", json.string(argument.name)),
+                  #("required", json.bool(argument.required)),
+                ],
+                wire.optional_string("title", argument.title),
+                wire.optional_string("description", argument.description),
+              ]),
+            )
+          }),
+        ),
+      ],
+      wire.optional_string("title", prompt.title),
+      wire.optional_string("description", prompt.description),
+      wire.icons_field(prompt.icons),
+      wire.meta_field(prompt.meta),
+    ]),
+  )
+}
+
+/// Encodes one `prompts/list` page.
+pub fn encode_prompts_list_response(
+  id: RequestId,
+  prompts: List(core.Prompt(context)),
+  next_cursor: Option(String),
+) -> json.Json {
+  encode_result(
+    id,
+    json.object(
+      list.flatten([
+        cache_fields(),
+        [#("prompts", json.array(prompts, prompt_to_json))],
+        with_next_cursor(next_cursor),
+      ]),
+    ),
+  )
+}
+
+/// Encodes a `prompts/get` result from the members the prompt encoded.
+pub fn encode_prompts_get_response(
+  id: RequestId,
+  rendered: core.Encoded,
+) -> json.Json {
+  encode_result(
+    id,
+    json.object(
+      list.flatten([
+        [#("resultType", json.string("complete"))],
+        rendered.fields,
+        wire.meta_field(rendered.meta),
+      ]),
+    ),
+  )
+}
+
+/// Encodes a `completion/complete` result around its `completion` object.
+pub fn encode_completion_response(
+  id: RequestId,
+  completion: json.Json,
+) -> json.Json {
+  encode_result(
+    id,
+    json.object([
+      #("completion", completion),
+      #("resultType", json.string("complete")),
+    ]),
+  )
+}
+
+/// Encodes a complete `tools/call` result, a success or an `isError` one.
+pub fn encode_call_response(
   id: RequestId,
   structured: Option(Value),
   blocks: List(ContentBlock),
+  is_error: Bool,
+  identity: Identity,
 ) -> json.Json {
-  let fields = [
-    #("content", json.array(blocks, content_block_to_json)),
-    #("resultType", json.string("complete")),
-    #("_meta", result_meta()),
-  ]
-  let fields = case structured {
-    None -> fields
-    Some(value) ->
-      list.append(fields, [#("structuredContent", value_to_json(value))])
-  }
-  json.object([
-    #("jsonrpc", json.string("2.0")),
-    #("id", jsonrpc.request_id_to_json(id)),
-    #("result", json.object(fields)),
-  ])
-}
-
-/// Encodes call tool error response with isError: true, text in content, and NO structuredContent.
-pub fn encode_call_error_response(
-  id: RequestId,
-  error_message: String,
-) -> json.Json {
-  let content_block =
-    json.object([
-      #("type", json.string("text")),
-      #("text", json.string(error_message)),
-    ])
-
-  json.object([
-    #("jsonrpc", json.string("2.0")),
-    #("id", jsonrpc.request_id_to_json(id)),
-    #(
-      "result",
-      json.object([
-        #("content", json.array([content_block], fn(x) { x })),
-        #("isError", json.bool(True)),
-        #("resultType", json.string("complete")),
-        #("_meta", result_meta()),
+  encode_result(
+    id,
+    json.object(
+      list.flatten([
+        [#("content", json.array(blocks, wire.content_block_to_json))],
+        case is_error {
+          True -> [#("isError", json.bool(True))]
+          False -> []
+        },
+        [#("resultType", json.string("complete"))],
+        case structured {
+          None -> []
+          Some(value) -> [#("structuredContent", value_to_json(value))]
+        },
+        [result_meta(identity)],
       ]),
     ),
-  ])
+  )
 }
 
-/// Encodes a tool result that pauses until the client supplies requested input.
-pub fn encode_tool_input_required_response(
+/// Encodes a result that pauses until the client supplies requested input.
+pub fn encode_input_required_response(
   id: RequestId,
-  input_requests: Dict(String, InputRequest),
+  requests: List(#(String, core.InputRequest)),
   request_state: String,
+  identity: Identity,
 ) -> json.Json {
-  let input_requests =
-    dict.to_list(input_requests)
-    |> list.map(fn(pair) {
-      let #(key, request) = pair
-      let InputRequest(method, params) = request
+  let requests =
+    list.map(requests, fn(entry) {
+      let #(key, core.InputRequest(method, params)) = entry
       #(
         key,
         json.object([
           #("method", json.string(method)),
-          #("params", params),
+          #("params", value_to_json(params)),
         ]),
       )
     })
-  json.object([
-    #("jsonrpc", json.string("2.0")),
-    #("id", jsonrpc.request_id_to_json(id)),
-    #(
-      "result",
-      json.object([
-        #("inputRequests", json.object(input_requests)),
-        #("requestState", json.string(request_state)),
-        #("resultType", json.string("input_required")),
-        #("_meta", result_meta()),
-      ]),
-    ),
-  ])
+  encode_result(
+    id,
+    json.object([
+      #("inputRequests", json.object(requests)),
+      #("requestState", json.string(request_state)),
+      #("resultType", json.string("input_required")),
+      result_meta(identity),
+    ]),
+  )
 }
 
-/// Encodes progress notification.
+/// Encodes a progress notification.
 pub fn encode_progress_notification(
   token: ProgressToken,
-  progress: Int,
+  progress: Float,
+  total: Option(Float),
+  message: Option(String),
 ) -> json.Json {
   json.object([
     #("jsonrpc", json.string("2.0")),
     #("method", json.string("notifications/progress")),
     #(
       "params",
-      json.object([
-        #("progressToken", jsonrpc.progress_token_to_json(token)),
-        #("progress", json.int(progress)),
-      ]),
+      json.object(
+        list.flatten([
+          [
+            #("progressToken", jsonrpc.progress_token_to_json(token)),
+            #("progress", number_json(progress)),
+          ],
+          case total {
+            None -> []
+            Some(total) -> [#("total", number_json(total))]
+          },
+          wire.optional_string("message", message),
+        ]),
+      ),
     ),
   ])
 }
 
-/// Encodes a subscriptions acknowledged notification sent when a listen request is established.
+// A whole float encodes as an integer, so `3.0` reads as `3`.
+fn number_json(number: Float) -> json.Json {
+  let whole = float_truncate(number)
+  case int_to_float(whole) == number {
+    True -> json.int(whole)
+    False -> json.float(number)
+  }
+}
+
+@external(erlang, "erlang", "trunc")
+fn float_truncate(number: Float) -> Int
+
+@external(erlang, "erlang", "float")
+fn int_to_float(number: Int) -> Float
+
+fn subscription_meta(subscription_id: RequestId) -> #(String, json.Json) {
+  #(
+    "_meta",
+    json.object([
+      #(
+        "io.modelcontextprotocol/subscriptionId",
+        jsonrpc.request_id_to_json(subscription_id),
+      ),
+    ]),
+  )
+}
+
+pub fn filter_to_json(filter: Filter) -> json.Json {
+  json.object(
+    list.flatten([
+      case filter.tools_list_changed {
+        True -> [#("toolsListChanged", json.bool(True))]
+        False -> []
+      },
+      case filter.resources_list_changed {
+        True -> [#("resourcesListChanged", json.bool(True))]
+        False -> []
+      },
+      case filter.prompts_list_changed {
+        True -> [#("promptsListChanged", json.bool(True))]
+        False -> []
+      },
+      case filter.resource_subscriptions {
+        [] -> []
+        uris -> [#("resourceSubscriptions", json.array(uris, json.string))]
+      },
+    ]),
+  )
+}
+
+/// Encodes the acknowledgement that opens a `subscriptions/listen` stream.
 pub fn encode_subscriptions_acknowledged_notification(
   subscription_id: RequestId,
-  filter: subscriptions.SubscriptionFilter,
+  filter: Filter,
 ) -> json.Json {
   json.object([
     #("jsonrpc", json.string("2.0")),
@@ -1407,211 +1492,58 @@ pub fn encode_subscriptions_acknowledged_notification(
     #(
       "params",
       json.object([
-        #(
-          "_meta",
-          json.object([
-            #(
-              "io.modelcontextprotocol/subscriptionId",
-              jsonrpc.request_id_to_json(subscription_id),
-            ),
-          ]),
-        ),
-        #("notifications", subscription_filter_to_json(filter)),
+        subscription_meta(subscription_id),
+        #("notifications", filter_to_json(filter)),
       ]),
     ),
   ])
 }
 
-/// Encodes a modern client request to open a subscriptions/listen stream.
-pub fn encode_subscriptions_listen_request(
+/// Encodes one notification on a `subscriptions/listen` stream.
+pub fn encode_stream_notification(
+  subscription_id: RequestId,
+  notification: subscriptions.Notification,
+) -> json.Json {
+  let #(method, fields) = case notification {
+    subscriptions.ToolsListChanged -> #("notifications/tools/list_changed", [])
+    subscriptions.ResourcesListChanged -> #(
+      "notifications/resources/list_changed",
+      [],
+    )
+    subscriptions.PromptsListChanged -> #(
+      "notifications/prompts/list_changed",
+      [],
+    )
+    subscriptions.ResourceUpdated(uri) -> #("notifications/resources/updated", [
+      #("uri", json.string(uri)),
+    ])
+  }
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("method", json.string(method)),
+    #("params", json.object([subscription_meta(subscription_id), ..fields])),
+  ])
+}
+
+/// Encodes the result that ends a `subscriptions/listen` stream.
+pub fn encode_subscriptions_listen_result_response(
   id: RequestId,
-  filter: SubscriptionFilter,
+  identity: Identity,
 ) -> json.Json {
-  json.object([
-    #("jsonrpc", json.string("2.0")),
-    #("id", jsonrpc.request_id_to_json(id)),
-    #("method", json.string("subscriptions/listen")),
-    #(
-      "params",
-      json.object([
-        #(
-          "_meta",
-          json.object([
-            #(
-              "io.modelcontextprotocol/protocolVersion",
-              json.string("2026-07-28"),
-            ),
-            #("io.modelcontextprotocol/clientCapabilities", json.object([])),
-          ]),
-        ),
-        #("notifications", subscription_filter_to_json(filter)),
-      ]),
-    ),
-  ])
-}
-
-fn subscription_filter_to_json(filter: SubscriptionFilter) -> json.Json {
-  let fields = []
-  let fields = case filter.tools_list_changed {
-    True -> [#("toolsListChanged", json.bool(True)), ..fields]
-    False -> fields
-  }
-  let fields = case filter.resources_list_changed {
-    True -> [#("resourcesListChanged", json.bool(True)), ..fields]
-    False -> fields
-  }
-  let fields = case filter.prompts_list_changed {
-    True -> [#("promptsListChanged", json.bool(True)), ..fields]
-    False -> fields
-  }
-  let fields = case filter.resource_subscriptions {
-    [] -> fields
-    uris -> [
-      #("resourceSubscriptions", json.array(uris, json.string)),
-      ..fields
-    ]
-  }
-  json.object(fields)
-}
-
-/// Encodes a resource updated notification delivered on a subscriptions/listen stream.
-pub fn encode_resource_updated_notification(
-  subscription_id: RequestId,
-  uri: String,
-) -> json.Json {
-  json.object([
-    #("jsonrpc", json.string("2.0")),
-    #("method", json.string("notifications/resources/updated")),
-    #(
-      "params",
-      json.object([
-        #(
-          "_meta",
-          json.object([
-            #(
-              "io.modelcontextprotocol/subscriptionId",
-              jsonrpc.request_id_to_json(subscription_id),
-            ),
-          ]),
-        ),
-        #("uri", json.string(uri)),
-      ]),
-    ),
-  ])
-}
-
-/// Encodes a tools list changed notification delivered on a subscriptions/listen stream.
-pub fn encode_tools_list_changed_notification(
-  subscription_id: RequestId,
-) -> json.Json {
-  json.object([
-    #("jsonrpc", json.string("2.0")),
-    #("method", json.string("notifications/tools/list_changed")),
-    #(
-      "params",
-      json.object([
-        #(
-          "_meta",
-          json.object([
-            #(
-              "io.modelcontextprotocol/subscriptionId",
-              jsonrpc.request_id_to_json(subscription_id),
-            ),
-          ]),
-        ),
-      ]),
-    ),
-  ])
-}
-
-/// Encodes a resources list changed notification delivered on a subscriptions/listen stream.
-pub fn encode_resources_list_changed_notification(
-  subscription_id: RequestId,
-) -> json.Json {
-  json.object([
-    #("jsonrpc", json.string("2.0")),
-    #("method", json.string("notifications/resources/list_changed")),
-    #(
-      "params",
-      json.object([
-        #(
-          "_meta",
-          json.object([
-            #(
-              "io.modelcontextprotocol/subscriptionId",
-              jsonrpc.request_id_to_json(subscription_id),
-            ),
-          ]),
-        ),
-      ]),
-    ),
-  ])
-}
-
-/// Encodes a prompts list changed notification delivered on a subscriptions/listen stream.
-pub fn encode_prompts_list_changed_notification(
-  subscription_id: RequestId,
-) -> json.Json {
-  json.object([
-    #("jsonrpc", json.string("2.0")),
-    #("method", json.string("notifications/prompts/list_changed")),
-    #(
-      "params",
-      json.object([
-        #(
-          "_meta",
-          json.object([
-            #(
-              "io.modelcontextprotocol/subscriptionId",
-              jsonrpc.request_id_to_json(subscription_id),
-            ),
-          ]),
-        ),
-      ]),
-    ),
-  ])
-}
-
-/// Encodes a subscriptions/listen result response sent when the server terminates a subscription stream gracefully.
-pub fn encode_subscriptions_listen_result_response(id: RequestId) -> json.Json {
-  json.object([
-    #("jsonrpc", json.string("2.0")),
-    #("id", jsonrpc.request_id_to_json(id)),
-    #(
-      "result",
-      json.object([
-        #("resultType", json.string("complete")),
-        #(
-          "_meta",
-          json.object([
-            #("io.modelcontextprotocol/serverInfo", server_info()),
-            #(
-              "io.modelcontextprotocol/subscriptionId",
-              jsonrpc.request_id_to_json(id),
-            ),
-          ]),
-        ),
-      ]),
-    ),
-  ])
-}
-
-fn text_mirror_of_value(val: Value) -> String {
-  case val {
-    value.String(s) -> s
-    value.Number(n) -> number.to_string(n)
-    value.Bool(True) -> "true"
-    value.Bool(False) -> "false"
-    value.Null -> "null"
-    _ -> value.to_string(val)
-  }
-}
-
-fn string_to_bytes(raw: String) -> BitArray {
-  bit_array.from_string(raw <> "\n")
-}
-
-/// Converts a Blueprint Value into an exact json.Json representation.
-pub fn value_to_json(val: Value) -> json.Json {
-  ffi_raw_json(value.to_string(val))
+  encode_result(
+    id,
+    json.object([
+      #("resultType", json.string("complete")),
+      #(
+        "_meta",
+        json.object([
+          #("io.modelcontextprotocol/serverInfo", server_info(identity)),
+          #(
+            "io.modelcontextprotocol/subscriptionId",
+            jsonrpc.request_id_to_json(id),
+          ),
+        ]),
+      ),
+    ]),
+  )
 }

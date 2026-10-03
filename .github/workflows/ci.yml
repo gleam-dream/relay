@@ -7,7 +7,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: relay
-      # gleam.toml reaches json_blueprint and sinal through ../ path
+      # gleam.toml reaches json_blueprint, sinal and http_gun through ../ path
       # dependencies, so CI checks out each sibling beside relay at the commit
       # recorded in sibling-revisions.txt.
       - name: Read pinned sibling revisions
@@ -15,6 +15,7 @@ jobs:
         run: |
           echo "json_blueprint=$(grep '^json_blueprint=' relay/sibling-revisions.txt | cut -d= -f2)" >> "$GITHUB_OUTPUT"
           echo "sinal=$(grep '^sinal=' relay/sibling-revisions.txt | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+          echo "http_gun=$(grep '^http_gun=' relay/sibling-revisions.txt | cut -d= -f2)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           repository: lostbean/json_blueprint
@@ -29,6 +30,13 @@ jobs:
           ref: ${{ steps.siblings.outputs.sinal }}
           path: sinal
           token: ${{ secrets.SIBLINGS_READ_TOKEN || github.token }}
+      # gleam-dream/http_gun is private too; the same token reads it.
+      - uses: actions/checkout@v4
+        with:
+          repository: gleam-dream/http_gun
+          ref: ${{ steps.siblings.outputs.http_gun }}
+          path: http_gun
+          token: ${{ secrets.SIBLINGS_READ_TOKEN || github.token }}
       - uses: erlef/setup-beam@v1
         with:
           otp-version: "28"
@@ -40,7 +48,7 @@ jobs:
       - run: pip install jsonschema==4.26.0
       - run: gleam deps download
         working-directory: relay
-      - run: gleam format --check src test
+      - run: gleam format --check src test dev
         working-directory: relay
       - run: gleam build --warnings-as-errors
         working-directory: relay

@@ -23,13 +23,14 @@ echo "PASS: MCP 2026-07-28 schema checksum matches ($ACTUAL_SCHEMA_SHA256)"
 
 echo "==> Verifying sibling dependency pins..."
 PINS_FILE="$ROOT/sibling-revisions.txt"
-if [ ! -f "$PINS_FILE" ] || [ "$(wc -l < "$PINS_FILE")" -ne 2 ]; then
-    echo "FAIL: sibling-revisions.txt must contain exactly two pinned revisions" >&2
+if [ ! -f "$PINS_FILE" ] || [ "$(wc -l < "$PINS_FILE")" -ne 3 ]; then
+    echo "FAIL: sibling-revisions.txt must contain exactly three pinned revisions" >&2
     exit 1
 fi
 EXPECTED_BLUEPRINT_HEAD="$(sed -n 's/^json_blueprint=//p' "$PINS_FILE")"
 EXPECTED_SINAL_HEAD="$(sed -n 's/^sinal=//p' "$PINS_FILE")"
-if [[ ! "$EXPECTED_BLUEPRINT_HEAD" =~ ^[0-9a-f]{40}$ ]] || [[ ! "$EXPECTED_SINAL_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+EXPECTED_HTTP_GUN_HEAD="$(sed -n 's/^http_gun=//p' "$PINS_FILE")"
+if [[ ! "$EXPECTED_BLUEPRINT_HEAD" =~ ^[0-9a-f]{40}$ ]] || [[ ! "$EXPECTED_SINAL_HEAD" =~ ^[0-9a-f]{40}$ ]] || [[ ! "$EXPECTED_HTTP_GUN_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
     echo "FAIL: sibling-revisions.txt must contain full lowercase Git commit IDs" >&2
     exit 1
 fi
@@ -66,5 +67,14 @@ if ! grep -q 'version = "0.1.0"' "$ROOT/../sinal/gleam.toml"; then
     exit 1
 fi
 echo "PASS: sinal pin checked (commit $ACTUAL_SINAL_HEAD, version 0.1.0, Apache-2.0)"
+
+# http_gun pin
+ACTUAL_HTTP_GUN_HEAD="$(git -C "$ROOT/../http_gun" rev-parse HEAD)"
+check_sibling_head http_gun "$ACTUAL_HTTP_GUN_HEAD" "$EXPECTED_HTTP_GUN_HEAD"
+if ! grep -q 'version = "0.1.0"' "$ROOT/../http_gun/gleam.toml"; then
+    echo "FAIL: http_gun version is not 0.1.0" >&2
+    exit 1
+fi
+echo "PASS: http_gun pin checked (commit $ACTUAL_HTTP_GUN_HEAD, version 0.1.0, Apache-2.0)"
 
 echo "All committed checksums and pins verified successfully."

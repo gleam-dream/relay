@@ -1,580 +1,384 @@
 import gleam/bit_array
-import gleam/dict
-import gleam/dynamic
+import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
 import gleam/json
+import gleam/list
 import gleam/string
-import gleeunit
-import gleeunit/should
+import gleam/time/duration
+import relay/internal/stdio_frames.{Frame, FrameOversized, InvalidTrailingBytes}
 import relay/runtime
 import relay/server
-import relay/tool
-import relay/transport/stdio.{Frame, FrameOversized, InvalidTrailingBytes}
+import relay/stdio
 
-pub fn main() -> Nil {
-  gleeunit.main()
-}
-
-pub fn stdio_rejects_invalid_settings_before_io_test() {
-  let assert Ok(registry) = tool.registry([])
-  let server = server.server(registry)
-  let bad_chunk =
-    stdio.LocalUnprotectedStdioConfig(
-      ..stdio.default_stdio_config(),
-      chunk_size: 0,
-    )
-  stdio.run_local_unprotected_stdio_server(server, bad_chunk, Nil)
-  |> should.equal(Error(stdio.InvalidChunkSize(0)))
-
-  let bad_runtime =
-    runtime.RuntimeConfig(..runtime.default_config(), invocation_timeout_ms: 0)
-  let config =
-    stdio.LocalUnprotectedStdioConfig(
-      ..stdio.default_stdio_config(),
-      runtime_config: bad_runtime,
-    )
-  stdio.run_local_unprotected_stdio_server(server, config, Nil)
-  |> should.equal(
-    Error(
-      stdio.InvalidRuntimeConfig(runtime.InvalidRuntimeSetting(
-        runtime.InvocationTimeoutMs,
-        0,
-      )),
-    ),
-  )
-}
+const runner = "erl -pa build/dev/erlang/*/ebin -noshell -run relay_stdio_runner main"
 
 @external(erlang, "relay_ffi", "spawn_stdio_child")
-fn ffi_spawn_stdio_child(cmd: String) -> dynamic.Dynamic
+fn spawn_child(cmd: String) -> Dynamic
 
 @external(erlang, "relay_ffi", "spawn_stdio_child_closed_stdout")
-fn ffi_spawn_stdio_child_closed_stdout(cmd: String) -> dynamic.Dynamic
+fn spawn_child_closed_stdout(cmd: String) -> Dynamic
 
 @external(erlang, "relay_ffi", "send_to_child")
-fn ffi_send_to_child(port: dynamic.Dynamic, bytes: BitArray) -> Nil
+fn send_to_child(port: Dynamic, bytes: BitArray) -> Nil
 
 @external(erlang, "relay_ffi", "receive_from_child")
-fn ffi_receive_from_child(
-  port: dynamic.Dynamic,
-  timeout_ms: Int,
-) -> Result(BitArray, Nil)
+fn receive_from_child(port: Dynamic, timeout_ms: Int) -> Result(BitArray, Nil)
 
 @external(erlang, "relay_ffi", "receive_exit_status")
-fn ffi_receive_exit_status(
-  port: dynamic.Dynamic,
-  timeout_ms: Int,
-) -> Result(Int, Nil)
+fn receive_exit_status(port: Dynamic, timeout_ms: Int) -> Result(Int, Nil)
 
 @external(erlang, "relay_ffi", "close_child")
-fn ffi_close_child(port: dynamic.Dynamic) -> Nil
+fn close_child(port: Dynamic) -> Nil
 
-// 1. Framer Unit Tests
+// --- helpers -----------------------------------------------------------------
+
+fn request_line(
+  id: String,
+  method: String,
+  params: List(#(String, json.Json)),
+) -> BitArray {
+  let meta =
+    json.object([
+      #("io.modelcontextprotocol/protocolVersion", json.string("2026-07-28")),
+      #("io.modelcontextprotocol/clientCapabilities", json.object([])),
+    ])
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("id", json.string(id)),
+    #("method", json.string(method)),
+    #("params", json.object([#("_meta", meta), ..params])),
+  ])
+  |> json.to_string
+  |> string.append("\n")
+  |> bit_array.from_string
+}
+
+// Reads from the child until `count` complete lines arrived.
+fn read_lines(child: Dynamic, count: Int) -> List(Dynamic) {
+  collect_lines(child, count, "")
+}
+
+fn collect_lines(child: Dynamic, count: Int, buffer: String) -> List(Dynamic) {
+  let lines =
+    string.split(buffer, "\n")
+    |> list.reverse
+    |> list.drop(1)
+    |> list.reverse
+  case list.length(lines) >= count {
+    True ->
+      list.take(lines, count)
+      |> list.map(fn(line) {
+        let assert Ok(message) = json.parse(line, decode.dynamic)
+        message
+      })
+    False -> {
+      let assert Ok(chunk) = receive_from_child(child, 5000)
+      let assert Ok(text) = bit_array.to_string(chunk)
+      collect_lines(child, count, buffer <> text)
+    }
+  }
+}
+
+fn read_one(child: Dynamic) -> Dynamic {
+  let assert [message] = read_lines(child, 1)
+  message
+}
+
+fn at(message: Dynamic, path: List(String), decoder: decode.Decoder(a)) -> a {
+  let assert Ok(found) = decode.run(message, decode.at(path, decoder))
+  found
+}
+
+// --- configuration -----------------------------------------------------------
+
+pub fn stdio_rejects_invalid_settings_before_io_test() {
+  let service = server.new([])
+  let assert Error(stdio.InvalidChunkSize(0)) =
+    stdio.serve_with(service, Nil, stdio.config() |> stdio.with_chunk_size(0))
+
+  let bad_runtime =
+    runtime.config()
+    |> runtime.with_invocation_timeout(duration.milliseconds(0))
+  let assert Error(stdio.InvalidRuntimeConfig(runtime.InvocationTimeout)) =
+    stdio.serve_with(
+      service,
+      Nil,
+      stdio.config() |> stdio.with_runtime(bad_runtime),
+    )
+
+  let bad_frames = runtime.config() |> runtime.with_max_frame_bytes(0)
+  let assert Error(stdio.InvalidRuntimeConfig(runtime.MaxFrameBytes)) =
+    stdio.serve_with(
+      service,
+      Nil,
+      stdio.config() |> stdio.with_runtime(bad_frames),
+    )
+
+  let assert True = stdio.describe_error(stdio.InvalidChunkSize(0)) != ""
+  let assert "standard input ended in the middle of a frame" =
+    stdio.describe_error(stdio.InvalidTrailingData(<<"x">>))
+}
+
+// --- framer ------------------------------------------------------------------
 
 pub fn framer_single_frame_test() {
-  let f0 = stdio.new_framer(1024)
-  let chunk = bit_array.from_string("{\"jsonrpc\":\"2.0\"}\n")
-  let #(f1, frames) = stdio.feed_framer(f0, chunk)
-
-  case frames {
-    [Frame(line)] -> {
-      line |> should.equal(bit_array.from_string("{\"jsonrpc\":\"2.0\"}"))
-    }
-    _ -> should.fail()
-  }
-
-  let trailing = stdio.finish_framer(f1)
-  trailing |> should.equal([])
+  let #(framer, frames) =
+    stdio_frames.new_framer(1024)
+    |> stdio_frames.feed_framer(<<"{\"jsonrpc\":\"2.0\"}\n">>)
+  let assert [Frame(<<"{\"jsonrpc\":\"2.0\"}">>)] = frames
+  let assert [] = stdio_frames.finish_framer(framer)
 }
 
 pub fn framer_crlf_frame_test() {
-  let f0 = stdio.new_framer(1024)
-  let chunk = bit_array.from_string("{\"jsonrpc\":\"2.0\"}\r\n")
-  let #(f1, frames) = stdio.feed_framer(f0, chunk)
-
-  case frames {
-    [Frame(line)] -> {
-      line |> should.equal(bit_array.from_string("{\"jsonrpc\":\"2.0\"}"))
-    }
-    _ -> should.fail()
-  }
-
-  let trailing = stdio.finish_framer(f1)
-  trailing |> should.equal([])
+  let #(framer, frames) =
+    stdio_frames.new_framer(1024)
+    |> stdio_frames.feed_framer(<<"{\"jsonrpc\":\"2.0\"}\r\n">>)
+  let assert [Frame(<<"{\"jsonrpc\":\"2.0\"}">>)] = frames
+  let assert [] = stdio_frames.finish_framer(framer)
 }
 
 pub fn framer_multiple_frames_in_one_chunk_test() {
-  let f0 = stdio.new_framer(1024)
-  let chunk = bit_array.from_string("line1\nline2\nline3\n")
-  let #(_f1, frames) = stdio.feed_framer(f0, chunk)
-
-  case frames {
-    [Frame(l1), Frame(l2), Frame(l3)] -> {
-      l1 |> should.equal(bit_array.from_string("line1"))
-      l2 |> should.equal(bit_array.from_string("line2"))
-      l3 |> should.equal(bit_array.from_string("line3"))
-    }
-    _ -> should.fail()
-  }
+  let #(_, frames) =
+    stdio_frames.new_framer(1024)
+    |> stdio_frames.feed_framer(<<"line1\nline2\nline3\n">>)
+  let assert [Frame(<<"line1">>), Frame(<<"line2">>), Frame(<<"line3">>)] =
+    frames
 }
 
 pub fn framer_partial_read_test() {
-  let f0 = stdio.new_framer(1024)
-  let chunk1 = bit_array.from_string("{\"jsonrpc\":")
-  let #(f1, frames1) = stdio.feed_framer(f0, chunk1)
-  frames1 |> should.equal([])
-
-  let chunk2 = bit_array.from_string("\"2.0\"}\n")
-  let #(f2, frames2) = stdio.feed_framer(f1, chunk2)
-
-  case frames2 {
-    [Frame(line)] -> {
-      line |> should.equal(bit_array.from_string("{\"jsonrpc\":\"2.0\"}"))
-    }
-    _ -> should.fail()
-  }
-
-  stdio.finish_framer(f2) |> should.equal([])
+  let #(first, frames) =
+    stdio_frames.new_framer(1024)
+    |> stdio_frames.feed_framer(<<"{\"jsonrpc\":">>)
+  let assert [] = frames
+  let #(second, frames) = stdio_frames.feed_framer(first, <<"\"2.0\"}\n">>)
+  let assert [Frame(<<"{\"jsonrpc\":\"2.0\"}">>)] = frames
+  let assert [] = stdio_frames.finish_framer(second)
 }
 
 pub fn framer_utf8_split_across_chunks_test() {
-  let f0 = stdio.new_framer(1024)
-  // "€" in UTF-8 is 3 bytes: 226, 130, 172
-  let euro_p1 = <<226, 130>>
-  let euro_p2 = <<172>>
-
-  let chunk1 =
-    bit_array.append(bit_array.from_string("{\"currency\":\""), euro_p1)
-  let #(f1, frames1) = stdio.feed_framer(f0, chunk1)
-  frames1 |> should.equal([])
-
-  let chunk2 = bit_array.append(euro_p2, bit_array.from_string("\"}\n"))
-  let #(_f2, frames2) = stdio.feed_framer(f1, chunk2)
-
-  case frames2 {
-    [Frame(line)] -> {
-      let assert Ok(str) = bit_array.to_string(line)
-      str |> should.equal("{\"currency\":\"€\"}")
-    }
-    _ -> should.fail()
-  }
+  // "€" is three bytes in UTF-8: 226, 130, 172.
+  let #(first, frames) =
+    stdio_frames.new_framer(1024)
+    |> stdio_frames.feed_framer(<<"{\"currency\":\"":utf8, 226, 130>>)
+  let assert [] = frames
+  let #(_, frames) = stdio_frames.feed_framer(first, <<172, "\"}\n":utf8>>)
+  let assert [Frame(line)] = frames
+  let assert Ok("{\"currency\":\"€\"}") = bit_array.to_string(line)
 }
 
 pub fn framer_oversized_frame_test() {
-  let f0 = stdio.new_framer(10)
-  // Limit is 10 bytes
-  let chunk = bit_array.from_string("this is definitely longer than 10 bytes\n")
-  let #(_f1, frames) = stdio.feed_framer(f0, chunk)
-
-  case frames {
-    [FrameOversized(size, limit)] -> {
-      size |> should.equal(39)
-      limit |> should.equal(10)
-    }
-    _ -> should.fail()
-  }
+  let #(_, frames) =
+    stdio_frames.new_framer(10)
+    |> stdio_frames.feed_framer(<<"this is definitely longer than 10 bytes\n">>)
+  let assert [FrameOversized(39, 10)] = frames
 }
 
 pub fn framer_discards_the_remainder_of_an_oversized_frame_test() {
-  let f0 = stdio.new_framer(3)
-  let #(f1, first) = stdio.feed_framer(f0, bit_array.from_string("abcd"))
-  first |> should.equal([FrameOversized(4, 3)])
-
-  let #(f2, second) =
-    stdio.feed_framer(f1, bit_array.from_string("discard this\nok\n"))
-  second |> should.equal([Frame(bit_array.from_string("ok"))])
-  stdio.finish_framer(f2) |> should.equal([])
+  let #(first, frames) =
+    stdio_frames.new_framer(3)
+    |> stdio_frames.feed_framer(<<"abcd">>)
+  let assert [FrameOversized(4, 3)] = frames
+  let #(second, frames) =
+    stdio_frames.feed_framer(first, <<"discard this\nok\n">>)
+  let assert [Frame(<<"ok">>)] = frames
+  let assert [] = stdio_frames.finish_framer(second)
 }
 
 pub fn framer_incomplete_eof_test() {
-  let f0 = stdio.new_framer(1024)
-  let chunk = bit_array.from_string("incomplete frame without newline")
-  let #(f1, frames) = stdio.feed_framer(f0, chunk)
-  frames |> should.equal([])
-
-  let trailing = stdio.finish_framer(f1)
-  case trailing {
-    [InvalidTrailingBytes(rem)] -> {
-      rem
-      |> should.equal(bit_array.from_string("incomplete frame without newline"))
-    }
-    _ -> should.fail()
-  }
+  let #(framer, frames) =
+    stdio_frames.new_framer(1024)
+    |> stdio_frames.feed_framer(<<"incomplete frame without newline">>)
+  let assert [] = frames
+  let assert [InvalidTrailingBytes(<<"incomplete frame without newline">>)] =
+    stdio_frames.finish_framer(framer)
 }
 
-pub fn writer_failure_is_returned_as_a_typed_terminal_error_test() {
+pub fn writer_failure_is_returned_to_the_caller_test() {
   let assert Ok(writer) =
-    stdio.start_writer(fn(_bytes) { Error(stdio.StdoutBroken("closed pipe")) })
-
-  stdio.write_bytes(writer, bit_array.from_string("response\n"))
-  |> should.equal(Error(stdio.StdoutBroken("closed pipe")))
-
-  stdio.stop_writer(writer)
+    stdio_frames.start_writer(fn(_bytes) { Error("closed pipe") })
+  let assert Error("closed pipe") =
+    stdio_frames.write_bytes(writer, <<"response\n">>)
+  stdio_frames.stop_writer(writer)
 }
 
-pub fn oversized_frame_refusal_write_failure_stops_the_stream_test() {
-  let assert Ok(registry) = tool.registry([])
-  let assert Ok(rt) =
-    runtime.start(
-      server.server(registry),
-      runtime.default_config(),
-      fn(_output) { Ok(Nil) },
-    )
-  let assert Ok(writer) =
-    stdio.start_writer(fn(_bytes) { Error(stdio.StdoutBroken("closed pipe")) })
-  let reader = fn() { stdio.ReadChunk(bit_array.from_string("too-long\n")) }
-
-  stdio.stream_read_loop(rt, Nil, reader, writer, stdio.new_framer(4), 1000)
-  |> should.equal(Error(stdio.StdoutBroken("closed pipe")))
-
-  runtime.stop(rt, 1000)
-  stdio.stop_writer(writer)
-}
-
-// 2. Real Spawned Child Process Tests over OS Pipes
+// --- a spawned child over OS pipes -------------------------------------------
 
 pub fn spawned_child_stdio_server_test() {
-  // Command running our compiled child server
-  let cmd =
-    "erl -pa build/dev/erlang/*/ebin -noshell -run relay_stdio_runner main"
-  let child = ffi_spawn_stdio_child(cmd)
+  let child = spawn_child(runner)
 
-  // 1. Send server/discover
-  let disc_req =
-    json.object([
-      #("jsonrpc", json.string("2.0")),
-      #("id", json.string("disc-child-1")),
-      #("method", json.string("server/discover")),
-      #(
-        "params",
-        json.object([
-          #(
-            "_meta",
-            json.object([
-              #(
-                "io.modelcontextprotocol/protocolVersion",
-                json.string("2026-07-28"),
-              ),
-              #("io.modelcontextprotocol/clientCapabilities", json.object([])),
-            ]),
-          ),
-        ]),
-      ),
-    ])
-    |> json.to_string()
+  send_to_child(child, request_line("disc-child-1", "server/discover", []))
+  let discovery = read_one(child)
+  let assert "disc-child-1" = at(discovery, ["id"], decode.string)
+  let assert "relay" =
+    at(
+      discovery,
+      ["result", "_meta", "io.modelcontextprotocol/serverInfo", "name"],
+      decode.string,
+    )
 
-  ffi_send_to_child(child, bit_array.from_string(disc_req <> "\n"))
+  send_to_child(child, request_line("list-1", "tools/list", []))
+  let names =
+    at(
+      read_one(child),
+      ["result", "tools"],
+      decode.list(decode.at(["name"], decode.string)),
+    )
+  let assert True = list.contains(names, "greet")
+  let assert True = list.contains(names, "fail_tool")
 
-  let assert Ok(resp1_bytes) = ffi_receive_from_child(child, 3000)
-  let assert Ok(resp1_str) = bit_array.to_string(resp1_bytes)
-  let assert Ok(json1) = json.parse(resp1_str, decode.dynamic)
-  let assert Ok(dict1) =
-    decode.run(json1, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(res1_dyn) = dict.get(dict1, "result")
-  let assert Ok(res1_dict) =
-    decode.run(res1_dyn, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(meta_dyn) = dict.get(res1_dict, "_meta")
-  let assert Ok(meta_dict) =
-    decode.run(meta_dyn, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(server_info) =
-    dict.get(meta_dict, "io.modelcontextprotocol/serverInfo")
-  let assert Ok(server_info_dict) =
-    decode.run(server_info, decode.dict(decode.string, decode.string))
-  let assert Ok(name) = dict.get(server_info_dict, "name")
-  name |> should.equal("relay")
+  send_to_child(
+    child,
+    request_line("call-greet", "tools/call", [
+      #("name", json.string("greet")),
+      #("arguments", json.object([#("name", json.string("Bob"))])),
+    ]),
+  )
+  let assert "child-server: hello Bob" =
+    at(read_one(child), ["result", "structuredContent"], decode.string)
 
-  // 2. Send tools/list
-  let list_req =
-    json.object([
-      #("jsonrpc", json.string("2.0")),
-      #("id", json.int(10)),
-      #("method", json.string("tools/list")),
-      #(
-        "params",
-        json.object([
-          #(
-            "_meta",
-            json.object([
-              #(
-                "io.modelcontextprotocol/protocolVersion",
-                json.string("2026-07-28"),
-              ),
-              #("io.modelcontextprotocol/clientCapabilities", json.object([])),
-            ]),
-          ),
-        ]),
-      ),
-    ])
-    |> json.to_string()
+  send_to_child(
+    child,
+    request_line("call-fail", "tools/call", [
+      #("name", json.string("fail_tool")),
+      #("arguments", json.object([#("msg", json.string("boom"))])),
+    ]),
+  )
+  let failure = read_one(child)
+  let assert True = at(failure, ["result", "isError"], decode.bool)
+  let assert ["application error: boom"] =
+    at(
+      failure,
+      ["result", "content"],
+      decode.list(decode.at(["text"], decode.string)),
+    )
 
-  ffi_send_to_child(child, bit_array.from_string(list_req <> "\n"))
-
-  let assert Ok(resp2_bytes) = ffi_receive_from_child(child, 3000)
-  let assert Ok(resp2_str) = bit_array.to_string(resp2_bytes)
-  let assert Ok(json2) = json.parse(resp2_str, decode.dynamic)
-  let assert Ok(dict2) =
-    decode.run(json2, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(_) = dict.get(dict2, "result")
-
-  // 3. Send tools/call for greet (success)
-  let call_req =
-    json.object([
-      #("jsonrpc", json.string("2.0")),
-      #("id", json.string("call-greet")),
-      #("method", json.string("tools/call")),
-      #(
-        "params",
-        json.object([
-          #(
-            "_meta",
-            json.object([
-              #(
-                "io.modelcontextprotocol/protocolVersion",
-                json.string("2026-07-28"),
-              ),
-              #("io.modelcontextprotocol/clientCapabilities", json.object([])),
-            ]),
-          ),
-          #("name", json.string("greet")),
-          #("arguments", json.object([#("name", json.string("Bob"))])),
-        ]),
-      ),
-    ])
-    |> json.to_string()
-
-  ffi_send_to_child(child, bit_array.from_string(call_req <> "\n"))
-
-  let assert Ok(resp3_bytes) = ffi_receive_from_child(child, 3000)
-  let assert Ok(resp3_str) = bit_array.to_string(resp3_bytes)
-  let assert Ok(json3) = json.parse(resp3_str, decode.dynamic)
-  let assert Ok(dict3) =
-    decode.run(json3, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(res3_dyn) = dict.get(dict3, "result")
-  let assert Ok(res3_dict) =
-    decode.run(res3_dyn, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(struct3) = dict.get(res3_dict, "structuredContent")
-  let assert Ok(text3) = decode.run(struct3, decode.string)
-  text3 |> should.equal("child-server: hello Bob")
-
-  // 4. Send tools/call for fail_tool (tool application error)
-  let fail_req =
-    json.object([
-      #("jsonrpc", json.string("2.0")),
-      #("id", json.string("call-fail")),
-      #("method", json.string("tools/call")),
-      #(
-        "params",
-        json.object([
-          #(
-            "_meta",
-            json.object([
-              #(
-                "io.modelcontextprotocol/protocolVersion",
-                json.string("2026-07-28"),
-              ),
-              #("io.modelcontextprotocol/clientCapabilities", json.object([])),
-            ]),
-          ),
-          #("name", json.string("fail_tool")),
-          #("arguments", json.object([#("msg", json.string("boom"))])),
-        ]),
-      ),
-    ])
-    |> json.to_string()
-
-  ffi_send_to_child(child, bit_array.from_string(fail_req <> "\n"))
-
-  let assert Ok(resp4_bytes) = ffi_receive_from_child(child, 3000)
-  let assert Ok(resp4_str) = bit_array.to_string(resp4_bytes)
-  let assert Ok(json4) = json.parse(resp4_str, decode.dynamic)
-  let assert Ok(dict4) =
-    decode.run(json4, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(res4_dyn) = dict.get(dict4, "result")
-  let assert Ok(res4_dict) =
-    decode.run(res4_dyn, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(is_err_dyn) = dict.get(res4_dict, "isError")
-  let assert Ok(is_err) = decode.run(is_err_dyn, decode.bool)
-  is_err |> should.equal(True)
-
-  // Close child cleanly
-  ffi_close_child(child)
+  close_child(child)
 }
 
 pub fn asynchronous_broken_stdout_stops_with_idle_stdin_test() {
-  let cmd =
-    "erl -pa build/dev/erlang/*/ebin -noshell -run relay_stdio_runner main"
-  let child = ffi_spawn_stdio_child_closed_stdout(cmd)
-  let request =
-    "{\"jsonrpc\":\"2.0\",\"id\":\"slow-pipe\",\"method\":\"tools/call\","
-    <> "\"params\":{\"_meta\":{"
-    <> "\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\","
-    <> "\"io.modelcontextprotocol/clientCapabilities\":{}},"
-    <> "\"name\":\"slow\",\"arguments\":{\"ms\":150}}}\n"
-  ffi_send_to_child(child, bit_array.from_string(request))
+  let child = spawn_child_closed_stdout(runner)
+  send_to_child(
+    child,
+    request_line("slow-pipe", "tools/call", [
+      #("name", json.string("slow")),
+      #("arguments", json.object([#("ms", json.int(150))])),
+    ]),
+  )
+  // The input pipe stays open while the delayed handler writes its reply.
+  expect_exit(child, 1)
+}
 
-  // Keep the input pipe open while the delayed handler attempts its response.
-  case ffi_receive_exit_status(child, 1500) {
-    Ok(status) -> {
-      ffi_close_child(child)
-      status |> should.equal(1)
+pub fn oversized_frame_refusal_on_broken_stdout_stops_the_server_test() {
+  let child = spawn_child_closed_stdout(runner)
+  send_to_child(child, bit_array.from_string(string.repeat("x", 1100) <> "\n"))
+  expect_exit(child, 1)
+}
+
+fn expect_exit(child: Dynamic, status: Int) -> Nil {
+  case receive_exit_status(child, 3000) {
+    Ok(found) -> {
+      close_child(child)
+      let assert True = found == status
+      Nil
     }
     Error(_) -> {
-      // Release the child input only after the bounded assertion window so a
-      // failed implementation does not leave a child process behind.
-      ffi_send_to_child(child, bit_array.from_string("close\n"))
-      let _ = ffi_receive_exit_status(child, 2000)
-      ffi_close_child(child)
-      should.fail()
+      // Release the child's input so a failed run leaves no process behind.
+      send_to_child(child, <<"close\n">>)
+      let _ = receive_exit_status(child, 2000)
+      close_child(child)
+      panic as "the stdio server did not stop"
     }
   }
 }
 
 pub fn spawned_child_partial_utf8_across_chunks_test() {
-  let cmd =
-    "erl -pa build/dev/erlang/*/ebin -noshell -run relay_stdio_runner main"
-  let child = ffi_spawn_stdio_child(cmd)
-
-  // Greet tool call containing multi-byte UTF-8 character "€" (3 bytes: 226, 130, 172)
-  // Part 1: up to first 2 bytes of "€"
-  let p1 =
-    bit_array.concat([
-      bit_array.from_string(
-        "{\"jsonrpc\":\"2.0\",\"id\":\"split-utf8\",\"method\":\"tools/call\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{}},\"name\":\"greet\",\"arguments\":{\"name\":\"",
-      ),
-      <<226, 130>>,
+  let child = spawn_child(runner)
+  let line =
+    request_line("split-utf8", "tools/call", [
+      #("name", json.string("greet")),
+      #("arguments", json.object([#("name", json.string("€"))])),
     ])
-  // Part 2: 3rd byte of "€" and remainder of frame
-  let p2 =
-    bit_array.concat([
-      <<172>>,
-      bit_array.from_string("\"}}}\n"),
-    ])
-
-  // Send chunk 1
-  ffi_send_to_child(child, p1)
-  // Send chunk 2
-  ffi_send_to_child(child, p2)
-
-  let assert Ok(resp_bytes) = ffi_receive_from_child(child, 3000)
-  let assert Ok(resp_str) = bit_array.to_string(resp_bytes)
-  let assert Ok(json_val) = json.parse(resp_str, decode.dynamic)
-  let assert Ok(dict_val) =
-    decode.run(json_val, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(res_dyn) = dict.get(dict_val, "result")
-  let assert Ok(res_dict) =
-    decode.run(res_dyn, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(struct_val) = dict.get(res_dict, "structuredContent")
-  let assert Ok(text) = decode.run(struct_val, decode.string)
-  text |> should.equal("child-server: hello €")
-
-  ffi_close_child(child)
+  // Split inside the three bytes of "€".
+  let assert Ok(text) = bit_array.to_string(line)
+  let assert Ok(#(before, after)) = string.split_once(text, "€")
+  send_to_child(child, <<before:utf8, 226, 130>>)
+  send_to_child(child, <<172, after:utf8>>)
+  let assert "child-server: hello €" =
+    at(read_one(child), ["result", "structuredContent"], decode.string)
+  close_child(child)
 }
 
 pub fn spawned_child_multi_frame_chunk_test() {
-  let cmd =
-    "erl -pa build/dev/erlang/*/ebin -noshell -run relay_stdio_runner main"
-  let child = ffi_spawn_stdio_child(cmd)
-
-  let f1 =
-    "{\"jsonrpc\":\"2.0\",\"id\":\"multi-1\",\"method\":\"server/discover\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{}}}}\n"
-  let f2 =
-    "{\"jsonrpc\":\"2.0\",\"id\":\"multi-2\",\"method\":\"tools/list\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{}}}}\n"
-
-  // Send both frames in one OS chunk
-  ffi_send_to_child(child, bit_array.from_string(f1 <> f2))
-
-  // Receive response 1
-  let assert Ok(resp1_bytes) = ffi_receive_from_child(child, 3000)
-  let assert Ok(resp1_str) = bit_array.to_string(resp1_bytes)
-  let assert Ok(json1) = json.parse(resp1_str, decode.dynamic)
-  let assert Ok(dict1) =
-    decode.run(json1, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(id1) = dict.get(dict1, "id")
-  let assert Ok(id1_str) = decode.run(id1, decode.string)
-  id1_str |> should.equal("multi-1")
-
-  // Receive response 2
-  let assert Ok(resp2_bytes) = ffi_receive_from_child(child, 3000)
-  let assert Ok(resp2_str) = bit_array.to_string(resp2_bytes)
-  let assert Ok(json2) = json.parse(resp2_str, decode.dynamic)
-  let assert Ok(dict2) =
-    decode.run(json2, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(id2) = dict.get(dict2, "id")
-  let assert Ok(id2_str) = decode.run(id2, decode.string)
-  id2_str |> should.equal("multi-2")
-
-  ffi_close_child(child)
+  let child = spawn_child(runner)
+  send_to_child(
+    child,
+    bit_array.append(
+      request_line("multi-1", "server/discover", []),
+      request_line("multi-2", "tools/list", []),
+    ),
+  )
+  let assert [first, second] = read_lines(child, 2)
+  let ids = [
+    at(first, ["id"], decode.string),
+    at(second, ["id"], decode.string),
+  ]
+  let assert True =
+    list.contains(ids, "multi-1") && list.contains(ids, "multi-2")
+  close_child(child)
 }
 
 pub fn spawned_child_eof_clean_shutdown_test() {
-  let cmd =
-    "erl -pa build/dev/erlang/*/ebin -noshell -run relay_stdio_runner main </dev/null"
-  let child = ffi_spawn_stdio_child(cmd)
+  // A real /dev/null stdin reaches the server as a clean EOF: exit 0.
+  let child = spawn_child(runner <> " </dev/null")
+  let assert Ok(0) = receive_exit_status(child, 5000)
+  close_child(child)
+}
 
-  // A real /dev/null stdin reaches the server as clean EOF and the VM exits 0.
-  let assert Ok(exit_status) = ffi_receive_exit_status(child, 3000)
-  exit_status |> should.equal(0)
-  ffi_close_child(child)
+pub fn spawned_child_trailing_bytes_at_eof_test() {
+  // Standard input ends in the middle of a frame: InvalidTrailingData.
+  let child = spawn_child("printf 'partial frame' | " <> runner)
+  let assert Ok(3) = receive_exit_status(child, 5000)
+  close_child(child)
 }
 
 pub fn spawned_child_configured_frame_limit_test() {
-  let cmd =
-    "erl -pa build/dev/erlang/*/ebin -noshell -run relay_stdio_runner main"
-  let child = ffi_spawn_stdio_child(cmd)
-  let over_limit = string.repeat("x", 1025)
-  let discover =
-    json.object([
-      #("jsonrpc", json.string("2.0")),
-      #("id", json.string("after-over-limit")),
-      #("method", json.string("server/discover")),
-      #(
-        "params",
-        json.object([
-          #(
-            "_meta",
-            json.object([
-              #(
-                "io.modelcontextprotocol/protocolVersion",
-                json.string("2026-07-28"),
-              ),
-              #("io.modelcontextprotocol/clientCapabilities", json.object([])),
-            ]),
-          ),
-        ]),
-      ),
-    ])
-    |> json.to_string()
-  ffi_send_to_child(
+  let child = spawn_child(runner)
+  send_to_child(
     child,
-    bit_array.concat([
-      bit_array.from_string(over_limit <> "\n"),
-      bit_array.from_string(discover <> "\n"),
-    ]),
+    bit_array.append(
+      bit_array.from_string(string.repeat("x", 1025) <> "\n"),
+      request_line("after-over-limit", "server/discover", []),
+    ),
   )
+  let assert [refusal, discovery] = read_lines(child, 2)
+  let assert -32_600 = at(refusal, ["error", "code"], decode.int)
+  let assert "Frame too large" =
+    at(refusal, ["error", "message"], decode.string)
+  let assert ["2026-07-28"] =
+    at(discovery, ["result", "supportedVersions"], decode.list(decode.string))
+  close_child(child)
+}
 
-  let assert Ok(response_bytes) = ffi_receive_from_child(child, 3000)
-  let assert Ok(response_string) = bit_array.to_string(response_bytes)
-  let assert Ok(response) = json.parse(response_string, decode.dynamic)
-  let assert Ok(response_dict) =
-    decode.run(response, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(error_dyn) = dict.get(response_dict, "error")
-  let assert Ok(error_dict) =
-    decode.run(error_dyn, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(message_dyn) = dict.get(error_dict, "message")
-  let assert Ok(message) = decode.run(message_dyn, decode.string)
-  message |> should.equal("Frame too large")
-
-  let assert Ok(next_response_bytes) = ffi_receive_from_child(child, 3000)
-  let assert Ok(next_response_string) = bit_array.to_string(next_response_bytes)
-  let assert Ok(next_response) =
-    json.parse(next_response_string, decode.dynamic)
-  let assert Ok(next_response_dict) =
-    decode.run(next_response, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(next_result) = dict.get(next_response_dict, "result")
-  let assert Ok(next_result_dict) =
-    decode.run(next_result, decode.dict(decode.string, decode.dynamic))
-  let assert Ok(versions_dyn) = dict.get(next_result_dict, "supportedVersions")
-  let assert Ok(versions) = decode.run(versions_dyn, decode.list(decode.string))
-  versions |> should.equal(["2026-07-28"])
-
-  ffi_close_child(child)
+pub fn spawned_child_too_deep_frame_is_answered_test() {
+  let child = spawn_child(runner)
+  // 20 nested arrays: deeper than the runner's limit of 16, well under its
+  // 1,024-byte frame limit.
+  let deep = string.repeat("[", 20) <> string.repeat("]", 20)
+  let frame =
+    "{\"jsonrpc\":\"2.0\",\"id\":\"deep\",\"method\":\"tools/call\",\"params\":{\"name\":\"greet\",\"arguments\":{\"name\":"
+    <> deep
+    <> "}}}\n"
+  send_to_child(
+    child,
+    bit_array.append(
+      bit_array.from_string(frame),
+      request_line("after-deep", "server/discover", []),
+    ),
+  )
+  let assert [refusal, discovery] = read_lines(child, 2)
+  let assert -32_600 = at(refusal, ["error", "code"], decode.int)
+  let assert "JSON nesting exceeds the configured depth" =
+    at(refusal, ["error", "message"], decode.string)
+  let assert "after-deep" = at(discovery, ["id"], decode.string)
+  close_child(child)
 }

@@ -1,856 +1,859 @@
-//// The OTP actor that owns a `relay/server.Server` and drives it for a
-//// transport.
+//// The OTP actor that owns one connection's `relay/reducer` state and runs
+//// its handlers, for authors of custom transports.
 ////
-//// Use this module to build a custom transport. `start` validates a
-//// `RuntimeConfig` (live exchanges, frame size, invocation timeout and
-//// tombstone retention; `default_config` sets 100, 1 MiB, 30 s and 60 s) and
-//// then calls the transport's write sink with `OutputWrite` and `OutputClose`.
-//// `send_frame` submits a received frame on an exchange, `exchange_closed`
-//// reports a peer disconnect, and the `notify_*`, `register_tool` and
-//// `unregister_tool` functions change the live server. The stdio and HTTP
-//// transports run on this module.
+//// `start(server, config(), sink)` starts the runtime; the transport then
+//// submits each inbound frame with `send_frame` on a fresh
+//// `relay/reducer.ExchangeId`, and the runtime calls `sink` with
+//// `OutputWrite` and `OutputClose` for that exchange. A sink that returns
+//// `Error(Nil)` closes only its exchange. `exchange_closed` reports a peer
+//// disconnect, which cancels that exchange's invocation. `notify`,
+//// `register_tool`, `unregister_tool` and `end_streams` change the live
+//// server. The stdio and HTTP transports run on this module.
+////
+//// Each handler runs in its own unlinked process with a timeout. A
+//// cancelled or timed-out handler first sees its `relay/tool.cancelled`
+//// selector fire; Relay kills it after the cancellation grace period. A
+//// crash becomes the JSON-RPC internal error on its exchange only.
+////
+//// | Setting | Default | Setter |
+//// | --- | --- | --- |
+//// | live exchanges | 100 | `with_max_live_exchanges` |
+//// | frame size | 1 MiB | `with_max_frame_bytes` |
+//// | JSON nesting depth | 64 | `with_max_json_depth` |
+//// | invocation timeout | 30 s | `with_invocation_timeout` |
+//// | cancellation grace | 5 s | `with_cancellation_grace` |
+//// | tombstone retention | 60 s, at most 10,000 | `with_tombstone_retention`, `with_max_tombstones` |
+////
+//// ```gleam
+//// import gleam/option.{None}
+//// import relay/reducer
+//// import relay/runtime
+//// import relay/server
+////
+//// pub fn run(frame: BitArray) {
+////   let assert Ok(rt) =
+////     runtime.start(server.new([]), runtime.config(), fn(output) {
+////       case output {
+////         runtime.OutputWrite(_exchange, _bytes) -> Ok(Nil)
+////         runtime.OutputClose(_exchange) -> Ok(Nil)
+////       }
+////     })
+////   let _ = runtime.send_frame(rt, reducer.new_exchange_id(), Nil, frame, None)
+////   runtime.stop(rt)
+//// }
+//// ```
 
 import gleam/bit_array
+import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
-import relay/protocol/jsonrpc.{type RequestId}
-import relay/server.{type ExchangeId, type InvocationId, type Server}
+import gleam/otp/supervision
+import gleam/result
+import gleam/time/duration.{type Duration}
+import relay/internal/emit
+import relay/internal/protocol/v2026_07_28 as v2026
+import relay/reducer.{type ExchangeId, type Invocation, type InvocationId}
+import relay/server.{type Server}
+import relay/subscriptions.{type Notification}
 import relay/telemetry
-import relay/tool.{type ContextTool, type ToolName}
+import relay/tool.{type Tool}
+import sinal/correlation.{type Correlation}
 
-pub type RuntimeConfig {
-  RuntimeConfig(
+// --- configuration -----------------------------------------------------------
+
+/// Runtime limits. Build it with `config()` and the `with_*` setters;
+/// `start` validates it.
+pub opaque type Config {
+  Config(
     max_live_exchanges: Int,
     max_frame_bytes: Int,
-    invocation_timeout_ms: Int,
-    tombstone_retention_ms: Int,
+    max_json_depth: Int,
+    invocation_timeout: Duration,
+    cancellation_grace: Duration,
+    tombstone_retention: Duration,
+    max_tombstones: Int,
+    label: Option(String),
   )
 }
 
-pub fn default_config() -> RuntimeConfig {
-  RuntimeConfig(
+/// The default limits; see the module table.
+pub fn config() -> Config {
+  Config(
     max_live_exchanges: 100,
     max_frame_bytes: 1_048_576,
-    invocation_timeout_ms: 30_000,
-    tombstone_retention_ms: 60_000,
+    max_json_depth: 64,
+    invocation_timeout: duration.seconds(30),
+    cancellation_grace: duration.seconds(5),
+    tombstone_retention: duration.seconds(60),
+    max_tombstones: 10_000,
+    label: None,
   )
 }
 
-pub type RuntimeError {
-  FrameTooLarge(size: Int, limit: Int)
-  TooManyLiveExchanges(current: Int, limit: Int)
-  RuntimeStopped
+/// How many exchanges may be open at once; a frame beyond it fails with
+/// `TooManyLiveExchanges`.
+pub fn with_max_live_exchanges(config: Config, count: Int) -> Config {
+  Config(..config, max_live_exchanges: count)
 }
 
-pub type RuntimeStartError {
-  InvalidRuntimeConfig(RuntimeConfigError)
+/// The largest frame `send_frame` accepts.
+pub fn with_max_frame_bytes(config: Config, bytes: Int) -> Config {
+  Config(..config, max_frame_bytes: bytes)
+}
+
+/// The deepest object and array nesting a frame may have, checked before
+/// parsing.
+pub fn with_max_json_depth(config: Config, depth: Int) -> Config {
+  Config(..config, max_json_depth: depth)
+}
+
+/// How long a handler may run before the client receives an internal error.
+pub fn with_invocation_timeout(config: Config, timeout: Duration) -> Config {
+  Config(..config, invocation_timeout: timeout)
+}
+
+/// How long a cancelled or timed-out handler may keep running after its
+/// `relay/tool.cancelled` selector fires, before Relay kills it.
+pub fn with_cancellation_grace(config: Config, grace: Duration) -> Config {
+  Config(..config, cancellation_grace: grace)
+}
+
+/// How long a finished or cancelled invocation is remembered, so a late
+/// start or result for it is dropped.
+pub fn with_tombstone_retention(config: Config, retention: Duration) -> Config {
+  Config(..config, tombstone_retention: retention)
+}
+
+/// How many finished or cancelled invocations are remembered at most.
+pub fn with_max_tombstones(config: Config, count: Int) -> Config {
+  Config(..config, max_tombstones: count)
+}
+
+/// The `listener` label in this runtime's telemetry.
+pub fn with_label(config: Config, label: String) -> Config {
+  Config(..config, label: Some(label))
+}
+
+/// The setting `validate` refused.
+pub type ConfigField {
+  MaxLiveExchanges
+  MaxFrameBytes
+  MaxJsonDepth
+  InvocationTimeout
+  CancellationGrace
+  TombstoneRetention
+  MaxTombstones
+}
+
+/// Why `start` failed.
+pub type StartError {
+  /// A setting is out of range: counts, sizes and durations must be
+  /// positive; the grace period may be zero.
+  InvalidConfig(field: ConfigField)
   ActorStartFailed(actor.StartError)
 }
 
-pub type RuntimeConfigField {
-  MaxLiveExchanges
-  MaxFrameBytes
-  InvocationTimeoutMs
-  TombstoneRetentionMs
+/// A one-line description of a start error.
+pub fn describe_start_error(error: StartError) -> String {
+  case error {
+    InvalidConfig(field) ->
+      "invalid Relay runtime setting: "
+      <> field_name(field)
+      <> " is out of range"
+    ActorStartFailed(_) -> "the Relay runtime actor failed to start"
+  }
 }
 
-pub type RuntimeConfigError {
-  InvalidRuntimeSetting(field: RuntimeConfigField, value: Int)
+fn field_name(field: ConfigField) -> String {
+  case field {
+    MaxLiveExchanges -> "max_live_exchanges"
+    MaxFrameBytes -> "max_frame_bytes"
+    MaxJsonDepth -> "max_json_depth"
+    InvocationTimeout -> "invocation_timeout"
+    CancellationGrace -> "cancellation_grace"
+    TombstoneRetention -> "tombstone_retention"
+    MaxTombstones -> "max_tombstones"
+  }
 }
 
-pub type RuntimeOutput {
+/// Checks the settings without starting anything.
+pub fn validate(config: Config) -> Result(Config, StartError) {
+  let ms = duration.to_milliseconds
+  case Nil {
+    _ if config.max_live_exchanges <= 0 -> Error(InvalidConfig(MaxLiveExchanges))
+    _ if config.max_frame_bytes <= 0 -> Error(InvalidConfig(MaxFrameBytes))
+    _ if config.max_json_depth <= 0 -> Error(InvalidConfig(MaxJsonDepth))
+    _ -> {
+      case ms(config.invocation_timeout) > 0 {
+        False -> Error(InvalidConfig(InvocationTimeout))
+        True ->
+          case ms(config.cancellation_grace) >= 0 {
+            False -> Error(InvalidConfig(CancellationGrace))
+            True ->
+              case ms(config.tombstone_retention) > 0 {
+                False -> Error(InvalidConfig(TombstoneRetention))
+                True ->
+                  case config.max_tombstones > 0 {
+                    False -> Error(InvalidConfig(MaxTombstones))
+                    True -> Ok(config)
+                  }
+              }
+          }
+      }
+    }
+  }
+}
+
+/// The largest frame this configuration accepts.
+pub fn max_frame_bytes(config: Config) -> Int {
+  config.max_frame_bytes
+}
+
+/// The invocation timeout of this configuration.
+pub fn invocation_timeout(config: Config) -> Duration {
+  config.invocation_timeout
+}
+
+// --- transport interface -----------------------------------------------------
+
+/// What the runtime asks the transport to do on an exchange.
+pub type Output {
   OutputWrite(exchange: ExchangeId, bytes: BitArray)
   OutputClose(exchange: ExchangeId)
 }
 
-pub fn validate_config(
-  config: RuntimeConfig,
-) -> Result(Nil, RuntimeConfigError) {
-  case config.max_live_exchanges > 0 {
-    False ->
-      Error(InvalidRuntimeSetting(MaxLiveExchanges, config.max_live_exchanges))
-    True ->
-      case config.max_frame_bytes > 0 {
-        False ->
-          Error(InvalidRuntimeSetting(MaxFrameBytes, config.max_frame_bytes))
-        True ->
-          case config.invocation_timeout_ms > 0 {
-            False ->
-              Error(InvalidRuntimeSetting(
-                InvocationTimeoutMs,
-                config.invocation_timeout_ms,
-              ))
-            True ->
-              case config.tombstone_retention_ms > 0 {
-                False ->
-                  Error(InvalidRuntimeSetting(
-                    TombstoneRetentionMs,
-                    config.tombstone_retention_ms,
-                  ))
-                True -> Ok(Nil)
-              }
-          }
-      }
-  }
+/// Why `send_frame` refused a frame. The transport answers the peer.
+pub type FrameError {
+  FrameTooLarge(size: Int, limit: Int)
+  FrameTooDeep(limit: Int)
+  TooManyLiveExchanges(current: Int, limit: Int)
+  RuntimeStopped
 }
 
-type RuntimeMessage(context) {
+/// The messages a runtime actor receives; used to name a supervised one.
+pub opaque type Message(context) {
   ReceiveFrame(
     exchange: ExchangeId,
     context: context,
     bytes: BitArray,
-    reply: Subject(Result(Nil, RuntimeError)),
+    correlation: Option(Correlation),
+    reply: Subject(Result(Nil, FrameError)),
   )
-  WorkerFinished(
-    invocation_id: InvocationId,
-    exchange_id: ExchangeId,
-    outcome: server.InvocationOutcome,
-  )
+  WorkerFinished(id: Int, input: reducer.Input(context))
   WorkerProgress(
-    invocation_id: InvocationId,
-    exchange_id: ExchangeId,
-    value: Int,
+    id: Int,
+    progress: Float,
+    total: Option(Float),
+    message: Option(String),
     reply: Subject(Nil),
   )
-  WorkerCrashed(
-    invocation_id: InvocationId,
-    exchange_id: ExchangeId,
-    reason: String,
-  )
-  WorkerTimeout(invocation_id: InvocationId, exchange_id: ExchangeId)
-  ProcessDownMessage(down: process.Down)
-  ExpireTombstone(invocation_id: InvocationId)
-  NotifyResource(uri: String)
-  NotifyToolsChanged
-  NotifyResourcesChanged
-  NotifyPromptsChanged
-  RegisterDynamicTool(tool: ContextTool(context))
-  UnregisterDynamicTool(name: ToolName)
-  TerminateSubscriptionStream(id: RequestId)
-  ExchangeClosed(exchange: ExchangeId)
+  WorkerTimeout(id: Int)
+  KillAfterGrace(pid: Pid)
+  WorkerDown(down: process.Down)
+  ExpireTombstone(id: Int)
+  Apply(input: reducer.Input(context))
+  PeerClosedExchange(exchange: ExchangeId)
   Close
   Stop(reply: Subject(Nil))
 }
 
-type WorkerHandle {
-  WorkerHandle(
-    invocation_id: InvocationId,
-    exchange_id: ExchangeId,
+/// A running runtime.
+pub opaque type Runtime(context) {
+  Runtime(subject: Subject(Message(context)))
+}
+
+type Worker {
+  Worker(
+    invocation: InvocationId,
     pid: Pid,
     monitor: process.Monitor,
     timer: process.Timer,
     started_at: Int,
+    exchange: Int,
+    method: String,
+    tool: Option(String),
+    correlation: Option(Correlation),
   )
 }
 
-type RuntimeState(context) {
-  RuntimeState(
-    config: RuntimeConfig,
-    server: Server(context),
-    write_sink: fn(RuntimeOutput) -> Result(Nil, Nil),
-    workers: List(WorkerHandle),
-    tombstones: List(InvocationId),
+type State(context) {
+  State(
+    config: Config,
+    reducer: reducer.State(context),
+    sink: fn(Output) -> Result(Nil, Nil),
+    workers: Dict(Int, Worker),
+    // Handlers in their cancellation grace, killed by `stop`.
+    cancelling: List(Pid),
+    tombstones: Dict(Int, Nil),
+    tombstone_order: List(Int),
     live_exchanges: Int,
-    is_closed: Bool,
-    self_subject: Subject(RuntimeMessage(context)),
+    closed: Bool,
+    self: Subject(Message(context)),
+    frame_correlation: Option(Correlation),
   )
-}
-
-pub opaque type Runtime(context) {
-  Runtime(subject: Subject(RuntimeMessage(context)))
 }
 
 @external(erlang, "relay_ffi", "monotonic_time_ms")
-fn ffi_monotonic_time_ms() -> Int
+fn monotonic_ms() -> Int
 
 @external(erlang, "relay_ffi", "rescue_run")
-fn ffi_rescue_run(fun: fn() -> a) -> Result(a, String)
+fn rescue_run(fun: fn() -> a) -> Result(a, String)
 
-/// Starts the authoritative OTP runtime owner.
+/// Starts a runtime linked to the caller.
 pub fn start(
   server: Server(context),
-  config: RuntimeConfig,
-  write_sink: fn(RuntimeOutput) -> Result(Nil, Nil),
-) -> Result(Runtime(context), RuntimeStartError) {
-  case validate_config(config) {
-    Error(error) -> Error(InvalidRuntimeConfig(error))
-    Ok(Nil) -> start_validated(server, config, write_sink)
-  }
+  config: Config,
+  sink: fn(Output) -> Result(Nil, Nil),
+) -> Result(Runtime(context), StartError) {
+  use config <- result.try(validate(config))
+  builder(server, config, sink, None)
+  |> actor.start
+  |> result.map(fn(started) { Runtime(started.data) })
+  |> result.map_error(ActorStartFailed)
 }
 
-fn start_validated(
+/// A child specification for a runtime registered under `name`; find it with
+/// `named`. A restart starts a fresh connection state.
+pub fn supervised(
   server: Server(context),
-  config: RuntimeConfig,
-  write_sink: fn(RuntimeOutput) -> Result(Nil, Nil),
-) -> Result(Runtime(context), RuntimeStartError) {
+  config: Config,
+  sink: fn(Output) -> Result(Nil, Nil),
+  name: process.Name(Message(context)),
+) -> supervision.ChildSpecification(Runtime(context)) {
+  supervision.worker(fn() {
+    case validate(config) {
+      Error(error) -> Error(actor.InitFailed(describe_start_error(error)))
+      Ok(config) ->
+        builder(server, config, sink, Some(name))
+        |> actor.start
+        |> result.map(fn(started) {
+          actor.Started(started.pid, Runtime(started.data))
+        })
+    }
+  })
+}
+
+/// The runtime registered under `name` by `supervised`.
+pub fn named(name: process.Name(Message(context))) -> Runtime(context) {
+  Runtime(process.named_subject(name))
+}
+
+fn builder(
+  server: Server(context),
+  config: Config,
+  sink: fn(Output) -> Result(Nil, Nil),
+  name: Option(process.Name(Message(context))),
+) {
   let builder =
-    actor.new_with_initialiser(5000, fn(self_subject) {
+    actor.new_with_initialiser(5000, fn(self) {
       let selector =
         process.new_selector()
-        |> process.select(for: self_subject)
-        |> process.select_monitors(fn(down) { ProcessDownMessage(down) })
-
-      let state =
-        RuntimeState(
-          config: config,
-          server: server,
-          write_sink: write_sink,
-          workers: [],
-          tombstones: [],
-          live_exchanges: 0,
-          is_closed: False,
-          self_subject: self_subject,
-        )
-
-      actor.initialised(state)
+        |> process.select(for: self)
+        |> process.select_monitors(WorkerDown)
+      State(
+        config: config,
+        reducer: reducer.init(server),
+        sink: sink,
+        workers: dict.new(),
+        cancelling: [],
+        tombstones: dict.new(),
+        tombstone_order: [],
+        live_exchanges: 0,
+        closed: False,
+        self: self,
+        frame_correlation: None,
+      )
+      |> actor.initialised
       |> actor.selecting(selector)
-      |> actor.returning(self_subject)
+      |> actor.returning(self)
       |> Ok
     })
     |> actor.on_message(handle_message)
-
-  case actor.start(builder) {
-    Ok(started) -> Ok(Runtime(started.data))
-    Error(err) -> Error(ActorStartFailed(err))
+  case name {
+    None -> builder
+    Some(name) -> actor.named(builder, name)
   }
 }
 
-/// Synchronously submits a frame to the runtime owner with bound checks.
+const call_timeout = 5000
+
+/// Submits one frame on a fresh exchange, with the context and the
+/// correlation the transport built for it. Returns once the runtime has
+/// admitted or refused the frame; responses arrive through the sink.
 pub fn send_frame(
   runtime: Runtime(context),
   exchange: ExchangeId,
   context: context,
   bytes: BitArray,
-  timeout_ms: Int,
-) -> Result(Nil, RuntimeError) {
+  correlation: Option(Correlation),
+) -> Result(Nil, FrameError) {
   let Runtime(subject) = runtime
-  process.call(subject, waiting: timeout_ms, sending: fn(reply) {
-    ReceiveFrame(exchange, context, bytes, reply)
+  process.call(subject, waiting: call_timeout, sending: fn(reply) {
+    ReceiveFrame(exchange, context, bytes, correlation, reply)
   })
 }
 
-/// Signals the connection is closed.
+/// Reports that the peer closed one exchange; its invocation is cancelled
+/// and nothing more is written to it.
+pub fn exchange_closed(runtime: Runtime(context), exchange: ExchangeId) -> Nil {
+  let Runtime(subject) = runtime
+  process.send(subject, PeerClosedExchange(exchange))
+}
+
+/// Tells every listening stream that asked for this notification.
+pub fn notify(runtime: Runtime(context), notification: Notification) -> Nil {
+  let Runtime(subject) = runtime
+  process.send(subject, Apply(reducer.Notify(notification)))
+}
+
+/// Registers a tool and tells listening streams the tool list changed. A
+/// duplicate name is ignored.
+pub fn register_tool(runtime: Runtime(context), tool: Tool(context)) -> Nil {
+  let Runtime(subject) = runtime
+  process.send(subject, Apply(reducer.RegisterTool(tool)))
+}
+
+/// Removes a tool and tells listening streams when it existed.
+pub fn unregister_tool(runtime: Runtime(context), name: String) -> Nil {
+  let Runtime(subject) = runtime
+  process.send(subject, Apply(reducer.UnregisterTool(name)))
+}
+
+/// Ends every open `subscriptions/listen` stream with its result.
+pub fn end_streams(runtime: Runtime(context)) -> Nil {
+  let Runtime(subject) = runtime
+  process.send(subject, Apply(reducer.EndStreams))
+}
+
+/// Closes the connection: cancels every invocation and refuses new frames.
 pub fn close(runtime: Runtime(context)) -> Nil {
   let Runtime(subject) = runtime
   process.send(subject, Close)
 }
 
-/// Reports that one transport exchange closed while other exchanges remain live.
-pub fn exchange_closed(runtime: Runtime(context), exchange: ExchangeId) -> Nil {
+/// Closes the connection, kills every handler and stops the actor. Waits at
+/// most 5 s.
+pub fn stop(runtime: Runtime(context)) -> Nil {
   let Runtime(subject) = runtime
-  process.send(subject, ExchangeClosed(exchange))
+  let reply = process.new_subject()
+  process.send(subject, Stop(reply))
+  let _ = process.receive(reply, call_timeout)
+  Nil
 }
 
-/// Stops the runtime actor gracefully.
-pub fn stop(runtime: Runtime(context), timeout_ms: Int) -> Nil {
-  let Runtime(subject) = runtime
-  process.call(subject, waiting: timeout_ms, sending: Stop)
-}
-
-/// Notifies that a resource has changed, sending notifications to all active subscribers.
-pub fn notify_resource_updated(runtime: Runtime(context), uri: String) -> Nil {
-  let Runtime(subject) = runtime
-  process.send(subject, NotifyResource(uri))
-}
-
-/// Notifies that the list of available tools has changed.
-pub fn notify_tools_list_changed(runtime: Runtime(context)) -> Nil {
-  let Runtime(subject) = runtime
-  process.send(subject, NotifyToolsChanged)
-}
-
-/// Notifies that the list of available resources has changed.
-pub fn notify_resources_list_changed(runtime: Runtime(context)) -> Nil {
-  let Runtime(subject) = runtime
-  process.send(subject, NotifyResourcesChanged)
-}
-
-/// Notifies that the list of available prompts has changed.
-pub fn notify_prompts_list_changed(runtime: Runtime(context)) -> Nil {
-  let Runtime(subject) = runtime
-  process.send(subject, NotifyPromptsChanged)
-}
-
-/// Dynamically registers a new tool and notifies subscribers if tools list changed.
-pub fn register_tool(
-  runtime: Runtime(context),
-  tool: ContextTool(context),
-) -> Nil {
-  let Runtime(subject) = runtime
-  process.send(subject, RegisterDynamicTool(tool))
-}
-
-/// Dynamically unregisters a tool by name and notifies subscribers if tools list changed.
-pub fn unregister_tool(runtime: Runtime(context), name: ToolName) -> Nil {
-  let Runtime(subject) = runtime
-  process.send(subject, UnregisterDynamicTool(name))
-}
-
-/// Gracefully terminates a subscription stream by JSON-RPC request ID.
-pub fn terminate_subscription(runtime: Runtime(context), id: RequestId) -> Nil {
-  let Runtime(subject) = runtime
-  process.send(subject, TerminateSubscriptionStream(id))
-}
+// --- actor -------------------------------------------------------------------
 
 fn handle_message(
-  state: RuntimeState(context),
-  msg: RuntimeMessage(context),
-) -> actor.Next(RuntimeState(context), RuntimeMessage(context)) {
-  case msg {
-    ReceiveFrame(exchange, context, bytes, reply) -> {
-      case state.is_closed {
-        True -> {
-          process.send(reply, Error(RuntimeStopped))
-          actor.continue(state)
-        }
-        False -> {
-          let byte_size = bit_array.byte_size(bytes)
-          case byte_size > state.config.max_frame_bytes {
-            True -> {
-              telemetry.emit_frame_rejected(
-                server.exchange_id_to_int(exchange),
-                "frame exceeds configured limit",
-              )
-              process.send(
-                reply,
-                Error(FrameTooLarge(byte_size, state.config.max_frame_bytes)),
-              )
-              actor.continue(state)
-            }
-            False -> {
-              case server.exchange_is_known(state.server, exchange) {
-                True -> {
-                  process.send(reply, Ok(Nil))
-                  actor.continue(state)
-                }
-                False -> {
-                  case state.live_exchanges >= state.config.max_live_exchanges {
-                    True -> {
-                      telemetry.emit_frame_rejected(
-                        server.exchange_id_to_int(exchange),
-                        "live exchanges exceed configured limit",
-                      )
-                      process.send(
-                        reply,
-                        Error(TooManyLiveExchanges(
-                          state.live_exchanges,
-                          state.config.max_live_exchanges,
-                        )),
-                      )
-                      actor.continue(state)
-                    }
-                    False -> {
-                      let st_inc =
-                        RuntimeState(
-                          ..state,
-                          live_exchanges: state.live_exchanges + 1,
-                        )
-                      let #(next_server, effects) =
-                        server.step(
-                          st_inc.server,
-                          server.MessageReceived(exchange, context, bytes),
-                        )
-                      let next_st =
-                        interpret_effects(
-                          RuntimeState(..st_inc, server: next_server),
-                          effects,
-                        )
-                      process.send(reply, Ok(Nil))
-                      actor.continue(next_st)
-                    }
-                  }
-                }
-              }
-            }
-          }
+  state: State(context),
+  message: Message(context),
+) -> actor.Next(State(context), Message(context)) {
+  case message {
+    ReceiveFrame(exchange, context, bytes, correlation, reply) -> {
+      let #(state, result) =
+        receive_frame(state, exchange, context, bytes, correlation)
+      process.send(reply, result)
+      actor.continue(state)
+    }
+    WorkerProgress(id, progress, total, text, reply) -> {
+      let state = case dict.get(state.workers, id) {
+        Error(Nil) -> state
+        Ok(worker) ->
+          apply(
+            state,
+            reducer.Progressed(worker.invocation, progress, total, text),
+          )
+      }
+      process.send(reply, Nil)
+      actor.continue(state)
+    }
+    WorkerFinished(id, input) -> actor.continue(finish_worker(state, id, input))
+    WorkerTimeout(id) ->
+      case dict.get(state.workers, id) {
+        Error(Nil) -> actor.continue(state)
+        Ok(worker) -> {
+          emit.invocation_crashed(crash_meta(
+            state,
+            id,
+            worker,
+            telemetry.HandlerTimedOut,
+          ))
+          let state = cancel_worker(state, id, worker)
+          actor.continue(apply(state, reducer.TimedOut(worker.invocation)))
         }
       }
+    KillAfterGrace(pid) -> {
+      process.kill(pid)
+      let cancelling = list.filter(state.cancelling, fn(p) { p != pid })
+      actor.continue(State(..state, cancelling: cancelling))
     }
-
-    WorkerProgress(inv_id, ex_id, value, reply) -> {
-      let next_st = handle_worker_progress(state, inv_id, ex_id, value)
-      process.send(reply, Nil)
-      actor.continue(next_st)
-    }
-
-    WorkerFinished(inv_id, ex_id, outcome) -> {
-      let next_st = handle_worker_finished(state, inv_id, ex_id, outcome)
-      actor.continue(next_st)
-    }
-
-    WorkerCrashed(inv_id, ex_id, reason) -> {
-      let next_st = handle_worker_crashed(state, inv_id, ex_id, reason)
-      actor.continue(next_st)
-    }
-
-    WorkerTimeout(inv_id, ex_id) -> {
-      let next_st = handle_worker_timeout(state, inv_id, ex_id)
-      actor.continue(next_st)
-    }
-
-    ProcessDownMessage(down) -> {
-      let next_st = handle_process_down(state, down)
-      actor.continue(next_st)
-    }
-
-    ExpireTombstone(inv_id) -> {
-      let next_st = handle_expire_tombstone(state, inv_id)
-      actor.continue(next_st)
-    }
-
-    NotifyResource(uri) -> {
-      let #(next_server, effects) =
-        server.step(state.server, server.NotifyResourceUpdated(uri))
-      let next_st =
-        interpret_effects(RuntimeState(..state, server: next_server), effects)
-      actor.continue(next_st)
-    }
-
-    NotifyToolsChanged -> {
-      let #(next_server, effects) =
-        server.step(state.server, server.NotifyToolsListChanged)
-      let next_st =
-        interpret_effects(RuntimeState(..state, server: next_server), effects)
-      actor.continue(next_st)
-    }
-
-    NotifyResourcesChanged -> {
-      let #(next_server, effects) =
-        server.step(state.server, server.NotifyResourcesListChanged)
-      let next_st =
-        interpret_effects(RuntimeState(..state, server: next_server), effects)
-      actor.continue(next_st)
-    }
-
-    NotifyPromptsChanged -> {
-      let #(next_server, effects) =
-        server.step(state.server, server.NotifyPromptsListChanged)
-      let next_st =
-        interpret_effects(RuntimeState(..state, server: next_server), effects)
-      actor.continue(next_st)
-    }
-
-    RegisterDynamicTool(tool) -> {
-      let #(next_server, effects) =
-        server.step(state.server, server.RegisterTool(tool))
-      let next_st =
-        interpret_effects(RuntimeState(..state, server: next_server), effects)
-      actor.continue(next_st)
-    }
-
-    UnregisterDynamicTool(name) -> {
-      let #(next_server, effects) =
-        server.step(state.server, server.UnregisterTool(name))
-      let next_st =
-        interpret_effects(RuntimeState(..state, server: next_server), effects)
-      actor.continue(next_st)
-    }
-
-    TerminateSubscriptionStream(id) -> {
-      let #(next_server, effects) =
-        server.step(state.server, server.TerminateSubscription(id))
-      let next_st =
-        interpret_effects(RuntimeState(..state, server: next_server), effects)
-      actor.continue(next_st)
-    }
-
-    ExchangeClosed(exchange) -> actor.continue(close_exchange(state, exchange))
-
-    Close -> {
-      let next_st = handle_close(state)
-      actor.continue(next_st)
-    }
-
+    WorkerDown(process.ProcessDown(monitor: _, pid: pid, reason: reason)) ->
+      case find_worker_by_pid(state.workers, pid), reason {
+        // A worker that exits normally has already sent its result.
+        Ok(_), process.Normal -> actor.continue(state)
+        Ok(#(id, worker)), _ -> {
+          emit.invocation_crashed(crash_meta(
+            state,
+            id,
+            worker,
+            telemetry.HandlerCrashed,
+          ))
+          let state = remove_worker(state, id, worker)
+          actor.continue(apply(state, reducer.Crashed(worker.invocation)))
+        }
+        Error(Nil), _ -> actor.continue(state)
+      }
+    WorkerDown(_) -> actor.continue(state)
+    ExpireTombstone(id) ->
+      actor.continue(
+        State(
+          ..state,
+          tombstones: dict.delete(state.tombstones, id),
+          tombstone_order: list.filter(state.tombstone_order, fn(t) { t != id }),
+        ),
+      )
+    Apply(input) -> actor.continue(apply(state, input))
+    PeerClosedExchange(exchange) ->
+      actor.continue(apply(state, reducer.ExchangeClosed(exchange)))
+    Close -> actor.continue(close_all(state))
     Stop(reply) -> {
-      let _ = handle_close(state)
+      // close_all moves every worker into its cancellation grace; the grace
+      // timers die with this actor, so kill every handler still running.
+      let state = close_all(state)
+      list.each(state.cancelling, process.kill)
       process.send(reply, Nil)
       actor.stop()
     }
   }
 }
 
-fn interpret_effects(
-  state: RuntimeState(context),
-  effects: List(server.ServerEffect(context)),
-) -> RuntimeState(context) {
-  list.fold(effects, state, fn(st, eff) {
-    case eff {
-      server.Write(ex, bytes) -> {
-        case st.write_sink(OutputWrite(ex, bytes)) {
-          Ok(Nil) -> st
-          Error(Nil) -> close_exchange(st, ex)
-        }
-      }
-      server.StartInvocation(inv) -> {
-        start_invocation(st, inv)
-      }
-      server.CancelInvocation(inv_id) -> {
-        cancel_invocation(st, inv_id)
-      }
-      server.CloseExchange(ex) -> {
-        telemetry.emit_exchange_closed(server.exchange_id_to_int(ex))
-        let _ = st.write_sink(OutputClose(ex))
-        RuntimeState(..st, live_exchanges: int.max(0, st.live_exchanges - 1))
-      }
-      server.SendProgress(_ex, _token, _val) -> {
-        st
-      }
-      server.EmitRequestAdmitted(ex_id, method) -> {
-        telemetry.emit_request_admitted(
-          server.exchange_id_to_int(ex_id),
-          method,
-        )
-        st
-      }
-      server.Ignore(_) -> st
-    }
-  })
-}
-
-fn close_exchange(
-  state: RuntimeState(context),
+fn receive_frame(
+  state: State(context),
   exchange: ExchangeId,
-) -> RuntimeState(context) {
-  let #(next_server, effects) =
-    server.step(state.server, server.ExchangeClosed(exchange))
-  interpret_effects(RuntimeState(..state, server: next_server), effects)
-}
-
-fn start_invocation(
-  state: RuntimeState(context),
-  inv: server.Invocation(context),
-) -> RuntimeState(context) {
-  let inv_id = server.invocation_id(inv)
-  let ex_id = server.invocation_exchange(inv)
-  case state.is_closed, list.contains(state.tombstones, inv_id) {
-    True, _ | False, True -> state
-    False, False ->
-      case find_worker(state.workers, inv_id) {
-        Some(_) -> state
-        None -> {
-          let now = ffi_monotonic_time_ms()
-          let inv_id_int = server.invocation_id_to_int(inv_id)
-          let ex_id_int = server.exchange_id_to_int(ex_id)
-          telemetry.emit_invocation_started(
-            ex_id_int,
-            inv_id_int,
-            server.invocation_method(inv),
-          )
-
-          let self_subj = state.self_subject
-          let inv =
-            server.invocation_with_progress(inv, fn(value) {
-              process.call_forever(self_subj, fn(reply) {
-                WorkerProgress(inv_id, ex_id, value, reply)
-              })
-            })
-          let timer =
-            process.send_after(
-              self_subj,
-              state.config.invocation_timeout_ms,
-              WorkerTimeout(inv_id, ex_id),
-            )
-
-          let worker_pid =
-            process.spawn_unlinked(fn() {
-              let res = ffi_rescue_run(fn() { server.perform(inv) })
-              case res {
-                Ok(server.InvocationFinished(_, outcome)) -> {
-                  process.send(
-                    self_subj,
-                    WorkerFinished(inv_id, ex_id, outcome),
-                  )
-                }
-                Error(reason) -> {
-                  process.send(self_subj, WorkerCrashed(inv_id, ex_id, reason))
-                }
-                _ -> {
-                  process.send(
-                    self_subj,
-                    WorkerCrashed(inv_id, ex_id, "unknown worker return"),
-                  )
-                }
-              }
-            })
-
-          let worker_mon = process.monitor(worker_pid)
-          let handle =
-            WorkerHandle(
-              invocation_id: inv_id,
-              exchange_id: ex_id,
-              pid: worker_pid,
-              monitor: worker_mon,
-              timer: timer,
-              started_at: now,
-            )
-          RuntimeState(..state, workers: [handle, ..state.workers])
-        }
-      }
-  }
-}
-
-fn cancel_invocation(
-  state: RuntimeState(context),
-  inv_id: server.InvocationId,
-) -> RuntimeState(context) {
-  case find_worker(state.workers, inv_id) {
-    None -> RuntimeState(..state, tombstones: [inv_id, ..state.tombstones])
-    Some(handle) -> {
-      let _ = process.cancel_timer(handle.timer)
-      let _ = process.demonitor_process(handle.monitor)
-      process.kill(handle.pid)
-      telemetry.emit_invocation_cancelled(server.invocation_id_to_int(inv_id))
-      let new_workers = remove_worker(state.workers, inv_id)
-      let new_tombstones = [inv_id, ..state.tombstones]
-      process.send_after(
-        state.self_subject,
-        state.config.tombstone_retention_ms,
-        ExpireTombstone(inv_id),
-      )
-      RuntimeState(..state, workers: new_workers, tombstones: new_tombstones)
+  context: context,
+  bytes: BitArray,
+  correlation: Option(Correlation),
+) -> #(State(context), Result(Nil, FrameError)) {
+  let size = bit_array.byte_size(bytes)
+  let exchange_int = reducer.exchange_id_to_int(exchange)
+  let config = state.config
+  case Nil {
+    _ if state.closed -> #(state, Error(RuntimeStopped))
+    _ if size > config.max_frame_bytes -> {
+      emit.frame_rejected(exchange_int, telemetry.FrameTooLarge, config.label)
+      #(state, Error(FrameTooLarge(size, config.max_frame_bytes)))
     }
-  }
-}
-
-fn handle_worker_progress(
-  state: RuntimeState(context),
-  inv_id: server.InvocationId,
-  _ex_id: server.ExchangeId,
-  value: Int,
-) -> RuntimeState(context) {
-  case
-    list.contains(state.tombstones, inv_id),
-    find_worker(state.workers, inv_id)
-  {
-    True, _ | _, None -> state
-    False, Some(_) -> {
-      let #(next_server, effects) =
-        server.step(state.server, server.InvocationProgress(inv_id, value))
-      interpret_effects(RuntimeState(..state, server: next_server), effects)
-    }
-  }
-}
-
-fn handle_worker_finished(
-  state: RuntimeState(context),
-  inv_id: server.InvocationId,
-  ex_id: server.ExchangeId,
-  outcome: server.InvocationOutcome,
-) -> RuntimeState(context) {
-  case list.contains(state.tombstones, inv_id) {
-    True -> state
-    False ->
-      case find_worker(state.workers, inv_id) {
-        None -> state
-        Some(handle) -> {
-          let _ = process.cancel_timer(handle.timer)
-          let _ = process.demonitor_process(handle.monitor)
-          let now = ffi_monotonic_time_ms()
-          let duration = int.max(0, now - handle.started_at)
-          let status_str = case outcome {
-            server.OutcomeSuccess(_) -> "success"
-            server.OutcomeContentSuccess(_) -> "success"
-            server.OutcomeStructuredContentSuccess(_, _) -> "success"
-            _ -> "error"
-          }
-          telemetry.emit_invocation_completed(
-            server.exchange_id_to_int(ex_id),
-            server.invocation_id_to_int(inv_id),
-            duration,
-            status_str,
+    _ ->
+      case v2026.depth_within(bytes, config.max_json_depth) {
+        False -> {
+          emit.frame_rejected(
+            exchange_int,
+            telemetry.NestingTooDeep,
+            config.label,
           )
-          let new_workers = remove_worker(state.workers, inv_id)
-          let new_tombstones = [inv_id, ..state.tombstones]
-          process.send_after(
-            state.self_subject,
-            state.config.tombstone_retention_ms,
-            ExpireTombstone(inv_id),
-          )
-          let st_cleaned =
-            RuntimeState(
-              ..state,
-              workers: new_workers,
-              tombstones: new_tombstones,
-            )
-          let #(next_server, effects) =
-            server.step(
-              st_cleaned.server,
-              server.InvocationFinished(inv_id, outcome),
-            )
-          interpret_effects(
-            RuntimeState(..st_cleaned, server: next_server),
-            effects,
-          )
+          #(state, Error(FrameTooDeep(config.max_json_depth)))
         }
-      }
-  }
-}
-
-fn handle_worker_crashed(
-  state: RuntimeState(context),
-  inv_id: server.InvocationId,
-  _ex_id: server.ExchangeId,
-  reason: String,
-) -> RuntimeState(context) {
-  case list.contains(state.tombstones, inv_id) {
-    True -> state
-    False ->
-      case find_worker(state.workers, inv_id) {
-        None -> state
-        Some(handle) -> {
-          let _ = process.cancel_timer(handle.timer)
-          let _ = process.demonitor_process(handle.monitor)
-          telemetry.emit_invocation_crashed(
-            server.invocation_id_to_int(inv_id),
-            reason,
-          )
-          let new_workers = remove_worker(state.workers, inv_id)
-          let new_tombstones = [inv_id, ..state.tombstones]
-          process.send_after(
-            state.self_subject,
-            state.config.tombstone_retention_ms,
-            ExpireTombstone(inv_id),
-          )
-          let st_cleaned =
-            RuntimeState(
-              ..state,
-              workers: new_workers,
-              tombstones: new_tombstones,
-            )
-          let outcome =
-            server.OutcomeInternalError("Internal error: handler crashed")
-          let #(next_server, effects) =
-            server.step(
-              st_cleaned.server,
-              server.InvocationFinished(inv_id, outcome),
-            )
-          interpret_effects(
-            RuntimeState(..st_cleaned, server: next_server),
-            effects,
-          )
-        }
-      }
-  }
-}
-
-fn handle_worker_timeout(
-  state: RuntimeState(context),
-  inv_id: server.InvocationId,
-  _ex_id: server.ExchangeId,
-) -> RuntimeState(context) {
-  case find_worker(state.workers, inv_id) {
-    None -> state
-    Some(handle) -> {
-      let _ = process.demonitor_process(handle.monitor)
-      process.kill(handle.pid)
-      telemetry.emit_invocation_crashed(
-        server.invocation_id_to_int(inv_id),
-        "timeout",
-      )
-      let new_workers = remove_worker(state.workers, inv_id)
-      let new_tombstones = [inv_id, ..state.tombstones]
-      process.send_after(
-        state.self_subject,
-        state.config.tombstone_retention_ms,
-        ExpireTombstone(inv_id),
-      )
-      let st_cleaned =
-        RuntimeState(..state, workers: new_workers, tombstones: new_tombstones)
-      let outcome = server.OutcomeInternalError("Invocation timed out")
-      let #(next_server, effects) =
-        server.step(
-          st_cleaned.server,
-          server.InvocationFinished(inv_id, outcome),
-        )
-      interpret_effects(
-        RuntimeState(..st_cleaned, server: next_server),
-        effects,
-      )
-    }
-  }
-}
-
-fn handle_process_down(
-  state: RuntimeState(context),
-  down: process.Down,
-) -> RuntimeState(context) {
-  case down {
-    process.ProcessDown(monitor, pid, reason) -> {
-      case find_worker_by_monitor_or_pid(state.workers, monitor, pid) {
-        None -> state
-        Some(handle) -> {
-          case reason {
-            process.Normal -> state
-            _ ->
-              handle_worker_crashed(
-                state,
-                handle.invocation_id,
-                handle.exchange_id,
-                "process exited abnormally",
+        True ->
+          case state.live_exchanges >= config.max_live_exchanges {
+            True -> {
+              emit.frame_rejected(
+                exchange_int,
+                telemetry.TooManyExchanges,
+                config.label,
               )
+              #(
+                state,
+                Error(TooManyLiveExchanges(
+                  state.live_exchanges,
+                  config.max_live_exchanges,
+                )),
+              )
+            }
+            False -> {
+              let #(next, effects) =
+                reducer.step(
+                  state.reducer,
+                  reducer.Received(exchange, context, bytes, correlation),
+                )
+              // The reducer drops a frame on an exchange it already knows
+              // without effects; only an admitted exchange holds a slot.
+              let live = case effects {
+                [] -> state.live_exchanges
+                _ -> state.live_exchanges + 1
+              }
+              let state =
+                State(
+                  ..state,
+                  reducer: next,
+                  live_exchanges: live,
+                  frame_correlation: correlation,
+                )
+              let state = list.fold(effects, state, interpret)
+              #(State(..state, frame_correlation: None), Ok(Nil))
+            }
           }
+      }
+  }
+}
+
+fn apply(
+  state: State(context),
+  input: reducer.Input(context),
+) -> State(context) {
+  let #(next, effects) = reducer.step(state.reducer, input)
+  list.fold(effects, State(..state, reducer: next), interpret)
+}
+
+fn interpret(
+  state: State(context),
+  effect: reducer.Effect(context),
+) -> State(context) {
+  case effect {
+    reducer.Write(exchange, bytes) ->
+      case state.sink(OutputWrite(exchange, bytes)) {
+        Ok(Nil) -> state
+        Error(Nil) -> apply(state, reducer.ExchangeClosed(exchange))
+      }
+    reducer.Close(exchange) -> {
+      emit.exchange_closed(
+        reducer.exchange_id_to_int(exchange),
+        state.config.label,
+      )
+      let _ = state.sink(OutputClose(exchange))
+      State(..state, live_exchanges: int.max(0, state.live_exchanges - 1))
+    }
+    reducer.Start(invocation) -> start_worker(state, invocation)
+    reducer.Cancel(invocation) -> {
+      let id = reducer.invocation_id_to_int(invocation)
+      case dict.get(state.workers, id) {
+        Error(Nil) -> remember(state, id)
+        Ok(worker) -> {
+          emit.invocation_cancelled(telemetry.InvocationCancelledMeta(
+            invocation_id: id,
+            method: worker.method,
+            tool: worker.tool,
+            correlation: worker.correlation,
+            listener: state.config.label,
+          ))
+          cancel_worker(state, id, worker)
         }
       }
     }
-    _ -> state
+    reducer.Admitted(exchange, method) -> {
+      emit.request_admitted(
+        reducer.exchange_id_to_int(exchange),
+        method,
+        state.frame_correlation,
+        state.config.label,
+      )
+      state
+    }
   }
 }
 
-fn handle_expire_tombstone(
-  state: RuntimeState(context),
-  inv_id: server.InvocationId,
-) -> RuntimeState(context) {
-  let new_tombstones = list.filter(state.tombstones, fn(id) { id != inv_id })
-  RuntimeState(..state, tombstones: new_tombstones)
-}
-
-fn handle_close(state: RuntimeState(context)) -> RuntimeState(context) {
-  list.each(state.workers, fn(w) {
-    let _ = process.cancel_timer(w.timer)
-    let _ = process.demonitor_process(w.monitor)
-    process.kill(w.pid)
-    telemetry.emit_invocation_cancelled(server.invocation_id_to_int(
-      w.invocation_id,
-    ))
-  })
-  RuntimeState(..state, workers: [], is_closed: True)
-}
-
-fn find_worker(
-  workers: List(WorkerHandle),
-  target: InvocationId,
-) -> Option(WorkerHandle) {
-  case workers {
-    [] -> None
-    [w, ..rest] ->
-      case w.invocation_id == target {
-        True -> Some(w)
-        False -> find_worker(rest, target)
+fn start_worker(
+  state: State(context),
+  invocation: Invocation(context),
+) -> State(context) {
+  let id = reducer.invocation_id_to_int(reducer.invocation_id(invocation))
+  case
+    state.closed
+    || dict.has_key(state.tombstones, id)
+    || dict.has_key(state.workers, id)
+  {
+    True -> state
+    False -> {
+      let exchange =
+        reducer.exchange_id_to_int(reducer.invocation_exchange(invocation))
+      let method = reducer.invocation_method(invocation)
+      let tool = reducer.invocation_tool(invocation)
+      let correlation = reducer.invocation_correlation(invocation)
+      emit.invocation_started(telemetry.InvocationStartedMeta(
+        exchange_id: exchange,
+        invocation_id: id,
+        method: method,
+        tool: tool,
+        correlation: correlation,
+        listener: state.config.label,
+      ))
+      let self = state.self
+      let report = fn(progress, total, message) {
+        let _ =
+          process.call(self, waiting: call_timeout, sending: fn(reply) {
+            WorkerProgress(id, progress, total, message, reply)
+          })
+        Nil
       }
+      let invocation_id = reducer.invocation_id(invocation)
+      let pid =
+        process.spawn_unlinked(fn() {
+          let input = case
+            rescue_run(fn() { reducer.perform(invocation, report) })
+          {
+            Ok(input) -> input
+            Error(_) -> reducer.Crashed(invocation_id)
+          }
+          process.send(self, WorkerFinished(id, input))
+        })
+      let monitor = process.monitor(pid)
+      let timer =
+        process.send_after(
+          self,
+          duration.to_milliseconds(state.config.invocation_timeout),
+          WorkerTimeout(id),
+        )
+      let worker =
+        Worker(
+          invocation: invocation_id,
+          pid: pid,
+          monitor: monitor,
+          timer: timer,
+          started_at: monotonic_ms(),
+          exchange: exchange,
+          method: method,
+          tool: tool,
+          correlation: correlation,
+        )
+      State(..state, workers: dict.insert(state.workers, id, worker))
+    }
   }
 }
 
-fn find_worker_by_monitor_or_pid(
-  workers: List(WorkerHandle),
-  monitor: process.Monitor,
-  pid: Pid,
-) -> Option(WorkerHandle) {
-  case workers {
-    [] -> None
-    [w, ..rest] ->
-      case w.monitor == monitor || w.pid == pid {
-        True -> Some(w)
-        False -> find_worker_by_monitor_or_pid(rest, monitor, pid)
+fn finish_worker(
+  state: State(context),
+  id: Int,
+  input: reducer.Input(context),
+) -> State(context) {
+  case dict.get(state.workers, id) {
+    Error(Nil) -> state
+    Ok(worker) -> {
+      let state = remove_worker(state, id, worker)
+      case input {
+        reducer.Finished(_, outcome) ->
+          emit.invocation_completed(
+            int.max(0, monotonic_ms() - worker.started_at),
+            telemetry.InvocationCompletedMeta(
+              exchange_id: worker.exchange,
+              invocation_id: id,
+              method: worker.method,
+              tool: worker.tool,
+              status: reducer.outcome_status(outcome),
+              correlation: worker.correlation,
+              listener: state.config.label,
+            ),
+          )
+        _ ->
+          emit.invocation_crashed(crash_meta(
+            state,
+            id,
+            worker,
+            telemetry.HandlerCrashed,
+          ))
       }
+      apply(state, input)
+    }
   }
+}
+
+fn crash_meta(
+  state: State(context),
+  id: Int,
+  worker: Worker,
+  reason: telemetry.CrashReason,
+) -> telemetry.InvocationCrashedMeta {
+  telemetry.InvocationCrashedMeta(
+    invocation_id: id,
+    method: worker.method,
+    tool: worker.tool,
+    reason: reason,
+    correlation: worker.correlation,
+    listener: state.config.label,
+  )
 }
 
 fn remove_worker(
-  workers: List(WorkerHandle),
-  target: InvocationId,
-) -> List(WorkerHandle) {
-  list.filter(workers, fn(w) { w.invocation_id != target })
+  state: State(context),
+  id: Int,
+  worker: Worker,
+) -> State(context) {
+  let _ = process.cancel_timer(worker.timer)
+  let _ = process.demonitor_process(worker.monitor)
+  remember(State(..state, workers: dict.delete(state.workers, id)), id)
+}
+
+// Signals the handler, then kills it after the grace period.
+fn cancel_worker(
+  state: State(context),
+  id: Int,
+  worker: Worker,
+) -> State(context) {
+  reducer.signal_cancelled(worker.pid, worker.invocation)
+  let grace = duration.to_milliseconds(state.config.cancellation_grace)
+  case grace <= 0 {
+    True -> process.kill(worker.pid)
+    False -> {
+      let _ = process.send_after(state.self, grace, KillAfterGrace(worker.pid))
+      Nil
+    }
+  }
+  remove_worker(
+    State(..state, cancelling: [worker.pid, ..state.cancelling]),
+    id,
+    worker,
+  )
+}
+
+fn remember(state: State(context), id: Int) -> State(context) {
+  case dict.has_key(state.tombstones, id) {
+    True -> state
+    False -> {
+      let _ =
+        process.send_after(
+          state.self,
+          duration.to_milliseconds(state.config.tombstone_retention),
+          ExpireTombstone(id),
+        )
+      let order = [id, ..state.tombstone_order]
+      let tombstones = dict.insert(state.tombstones, id, Nil)
+      case list.length(order) > state.config.max_tombstones {
+        False -> State(..state, tombstones: tombstones, tombstone_order: order)
+        True -> {
+          let #(kept, dropped) = list.split(order, state.config.max_tombstones)
+          State(
+            ..state,
+            tombstones: dict.drop(tombstones, dropped),
+            tombstone_order: kept,
+          )
+        }
+      }
+    }
+  }
+}
+
+fn close_all(state: State(context)) -> State(context) {
+  let state =
+    dict.fold(state.workers, state, fn(state, id, worker) {
+      emit.invocation_cancelled(telemetry.InvocationCancelledMeta(
+        invocation_id: id,
+        method: worker.method,
+        tool: worker.tool,
+        correlation: worker.correlation,
+        listener: state.config.label,
+      ))
+      cancel_worker(state, id, worker)
+    })
+  State(..state, closed: True)
+}
+
+fn find_worker_by_pid(
+  workers: Dict(Int, Worker),
+  pid: Pid,
+) -> Result(#(Int, Worker), Nil) {
+  dict.to_list(workers)
+  |> list.find(fn(entry) {
+    let #(_, worker) = entry
+    worker.pid == pid
+  })
 }
