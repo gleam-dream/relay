@@ -654,13 +654,13 @@ pub fn verifier_decision_and_handler_share_the_request_correlation_test() {
   response.status |> should.equal(200)
   let assert Ok(question) = correlation.from_string("question-9")
   process.receive(seen, 1000) |> should.equal(Ok(question))
-  process.receive(decided, 1000) |> should.equal(Ok(Some(question)))
+  process.receive(decided, 1000) |> should.equal(Ok(question))
   string.contains(testing.body_text(response), "question-9") |> should.be_true
 
   let response = http.handle(handler, bearer(call("whoami"), "alice-token"))
   response.status |> should.equal(200)
   let assert Ok(minted) = process.receive(seen, 1000)
-  process.receive(decided, 1000) |> should.equal(Ok(Some(minted)))
+  process.receive(decided, 1000) |> should.equal(Ok(minted))
   string.contains(testing.body_text(response), correlation.to_string(minted))
   |> should.be_true
 
@@ -671,6 +671,6 @@ pub fn verifier_decision_and_handler_share_the_request_correlation_test() {
   http.handle(handler, refused).status |> should.equal(401)
   let assert Ok(refused_correlation) = correlation.from_string("question-10")
   process.receive(seen, 1000) |> should.equal(Ok(refused_correlation))
-  process.receive(decided, 1000) |> should.equal(Ok(Some(refused_correlation)))
+  process.receive(decided, 1000) |> should.equal(Ok(refused_correlation))
   let assert Ok(Nil) = sinal.detach(attachment)
 }

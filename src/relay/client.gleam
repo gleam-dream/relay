@@ -734,10 +734,13 @@ pub fn with_idempotency_key(client: Client, key: String) -> Client {
 
 // A view without a correlation gets a fresh one per request, so the
 // client's events and the server's always share one.
-fn call_correlation(client: Client) -> Client {
+fn call_correlation(client: Client) -> #(Client, Correlation) {
   case client.correlation {
-    Some(_) -> client
-    None -> Client(..client, correlation: Some(correlation.unique()))
+    Some(found) -> #(client, found)
+    None -> {
+      let minted = correlation.unique()
+      #(Client(..client, correlation: Some(minted)), minted)
+    }
   }
 }
 
@@ -1363,7 +1366,7 @@ fn request(
   params: List(#(String, json.Json)),
 ) -> Result(Response, Error) {
   use Nil <- result.try(check_idempotency_key(client))
-  let client = call_correlation(client)
+  let #(client, call) = call_correlation(client)
   let id = new_id()
   let started = monotonic_ms()
   let outcome =
@@ -1389,7 +1392,7 @@ fn request(
         _ -> None
       },
       outcome: call_outcome,
-      correlation: client.correlation,
+      correlation: call,
       client: client.config.label,
     ),
   )
@@ -2269,7 +2272,7 @@ pub fn listen(
   notifications: List(Notification),
 ) -> Result(Subscription, Error) {
   use Nil <- result.try(check_idempotency_key(client))
-  let client = call_correlation(client)
+  let #(client, _) = call_correlation(client)
   let id = new_id()
   let body =
     envelope(client, id, "subscriptions/listen", [

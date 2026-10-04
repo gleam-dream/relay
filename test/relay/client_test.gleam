@@ -631,7 +631,7 @@ pub fn correlation_reaches_the_handler_and_client_telemetry_test() {
     "tools/call",
     Some("whoami"),
     telemetry.CallCompleted,
-    Some(_),
+    _,
     Some("correlated-client"),
   ) = first
   // The untagged view minted the correlation the server saw.
@@ -639,7 +639,7 @@ pub fn correlation_reaches_the_handler_and_client_telemetry_test() {
     "tools/call",
     Some("whoami"),
     telemetry.CallCompleted,
-    Some(untagged_correlation),
+    untagged_correlation,
     _,
   ) = untagged
   let assert True = correlation.to_string(untagged_correlation) == minted
@@ -647,28 +647,28 @@ pub fn correlation_reaches_the_handler_and_client_telemetry_test() {
     "tools/call",
     Some("fail"),
     telemetry.CallToolFailed,
-    Some(_),
+    _,
     _,
   ) = failed
   let assert telemetry.ClientCallMeta(
     "tools/call",
     Some("ask"),
     telemetry.CallInputRequired,
-    Some(_),
+    _,
     _,
   ) = input
   let assert telemetry.ClientCallMeta(
     "tools/call",
     Some("echo"),
     telemetry.CallFailed,
-    Some(_),
+    _,
     _,
   ) = rpc
   let assert telemetry.ClientCallMeta(
     "server/discover",
     None,
     telemetry.CallCompleted,
-    Some(found),
+    found,
     _,
   ) = discovered
   let assert True = correlation.to_string(found) == correlation.to_string(tag)

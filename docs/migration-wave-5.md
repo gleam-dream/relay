@@ -7,14 +7,15 @@ token issued for another resource.
 
 Breaking changes, each with its section below:
 
-| Item                              | Before                                          | After                                                           |
-| --------------------------------- | ----------------------------------------------- | --------------------------------------------------------------- |
-| `authorization.verifier`          | `verifier(name, fn(BearerToken) -> Result(..))` | `verifier(name, fn(BearerToken, Correlation) -> Result(..))`    |
-| `authorization.admit`             | `admit(verifier, token, protection)`            | `admit(verifier, token, protection, correlation)`               |
-| `tool.correlation`                | `-> Option(Correlation)`                        | `-> Correlation`                                                |
-| `reducer.invocation_correlation`  | `-> Option(Correlation)`                        | `-> Correlation`                                                |
-| `telemetry.ExchangeClosedMeta`    | `ExchangeClosedMeta(exchange_id:, listener:)`   | `ExchangeClosedMeta(exchange_id:, correlation:, listener:)`     |
-| `authorization.VerificationError` | 3 variants                                      | adds `IssuedForAnotherResource` (exhaustive matches add an arm) |
+| Item                                 | Before                                          | After                                                           |
+| ------------------------------------ | ----------------------------------------------- | --------------------------------------------------------------- |
+| `authorization.verifier`             | `verifier(name, fn(BearerToken) -> Result(..))` | `verifier(name, fn(BearerToken, Correlation) -> Result(..))`    |
+| `authorization.admit`                | `admit(verifier, token, protection)`            | `admit(verifier, token, protection, correlation)`               |
+| `tool.correlation`                   | `-> Option(Correlation)`                        | `-> Correlation`                                                |
+| `reducer.invocation_correlation`     | `-> Option(Correlation)`                        | `-> Correlation`                                                |
+| `telemetry.ExchangeClosedMeta`       | `ExchangeClosedMeta(exchange_id:, listener:)`   | `ExchangeClosedMeta(exchange_id:, correlation:, listener:)`     |
+| `correlation` of 9 telemetry records | `correlation: Option(Correlation)`              | `correlation: Correlation` (see `relay/telemetry`)              |
+| `authorization.VerificationError`    | 3 variants                                      | adds `IssuedForAnotherResource` (exhaustive matches add an arm) |
 
 ## The correlation carrier
 
@@ -249,6 +250,34 @@ of an admitted request, `exchange.closed` included, now carries the
 request's correlation; before, a request without `http.with_correlation`
 had none.
 
+### `correlation` is a `Correlation` on every record (breaking)
+
+Every request has a correlation and the client mints one per call, so the
+`correlation` field of these records is `Correlation`, not
+`Option(Correlation)`, and the events write it with
+`sinal/correlation.required_field()`: `RequestAdmittedMeta`,
+`InvocationStartedMeta`, `InvocationCompletedMeta`,
+`InvocationCancelledMeta`, `InvocationCrashedMeta`, `ExchangeClosedMeta`,
+`HttpRejectedMeta`, `AuthorizationDecidedMeta` and `ClientCallMeta`.
+`FrameRejectedMeta` has no correlation field, as before. Relay has no
+listener start or stop event, so no record keeps an `Option`.
+
+```gleam
+// before
+case m.correlation {
+  Some(correlation) -> correlation.to_string(correlation)
+  None -> "-"
+}
+// after
+correlation.to_string(m.correlation)
+```
+
+An `HttpRejectedMeta` for a refusal before the endpoint reads the request
+(a body over the limit or unreadable at the mist layer) carries a fresh
+correlation; one for a 503 over the request or stream cap carries the
+client's `x-correlation-id`, else a fresh one. A handler that reads these
+events with `correlation.field()` still works and sees `Some(..)`.
+
 ## `relay/reducer` and `relay/runtime`
 
 ```gleam
@@ -268,18 +297,21 @@ Grep of `/code/gleam-dream/*/{src,test,integrations,consumers,examples}` and
 `oversight/apps` on 3 October 2026. No package outside the apps and warden's
 recipe check uses the changed items; fabric has no Relay dependency yet.
 
-| Dependent                                                                                                       | Uses                                                                   | Effect                                                                                                                                                                                             |
-| --------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `oversight/apps/tool_hub/src/tool_hub/assistant.gleam:221`                                                      | `option.lazy_unwrap(relay_tool.correlation(call), correlation.unique)` | **breaks** (type): use `relay_tool.correlation(call)`                                                                                                                                              |
-| `oversight/apps/tool_hub/src/tool_hub/assistant.gleam:229`                                                      | `http.with_correlation(fn(_request) { Some(correlation.unique()) })`   | compiles; delete it so the external caller's correlation reaches the assistant server (the default mints one when none is sent)                                                                    |
-| `oversight/apps/tool_hub/src/tool_hub/telemetry.gleam:272`                                                      | `exchange_closed_event` with `ExchangeKey(m.exchange_id)`              | compiles; can key by `m.correlation` now. With the agent's inventory client sending the question's correlation, the inventory server's 12 events and the closed exchanges join the question (TH-7) |
-| `oversight/apps/tool_hub` handler                                                                               | a retried `ask_assistant` starts a second run                          | can derive the run id from `relay_tool.idempotency_key(call)` when the caller uses `client.with_idempotency_key`                                                                                   |
-| `oversight/apps/secure_mcp/src/secure_mcp/tools.gleam:79`                                                       | `tool.correlation(call)` passed as `Option(Correlation)`               | **breaks** (type): pass `tool.correlation(call)` and make `generate_report` take a `Correlation`, or wrap it in `Some`                                                                             |
-| `oversight/apps/secure_mcp/src/secure_mcp/auth.gleam:20`                                                        | `authorization.verifier("warden-jwt", resource.verifier(..))`          | **breaks** (arity): wrap as `fn(token, _correlation) { verify(token) }`, or have warden's `resource.verifier` return a two-argument function                                                       |
-| `oversight/apps/secure_mcp/src/secure_mcp/auth.gleam:44`                                                        | `use token <- authorization.verifier("warden-introspection")`          | **breaks** (arity): `use token, correlation <- ..`, and introspect through `warden.with_correlation(client, correlation)` (SMCP-9)                                                                 |
-| `oversight/apps/secure_mcp/src/secure_mcp/app.gleam:119`                                                        | `http.with_correlation(request_correlation)` reading `x-request-id`    | compiles; when the header is absent the request now uses a client's `x-correlation-id` before minting                                                                                              |
-| `warden/relay_consumer/src/recipe.gleam:20`                                                                     | `authorization.verifier("warden-jwt", resource.verifier(..))`          | **breaks** (arity): as for secure_mcp's `auth.gleam:20`                                                                                                                                            |
-| `warden/relay_consumer/src/recipe.gleam:44`                                                                     | `use token <- authorization.verifier("warden-introspection")`          | **breaks** (arity): `use token, correlation <- ..` with `warden.with_correlation(client, correlation)`                                                                                             |
-| `warden/relay_consumer/test/relay_consumer_test.gleam:47`                                                       | `authorization.admit(verifier, token, protection())`                   | **breaks** (arity): `authorization.admit(verifier, token, protection(), correlation.unique())`                                                                                                     |
-| `warden/README.md:193,217`, `warden/src/warden/resource.gleam:77,101` (doc recipe mirrored into `recipe.gleam`) | the same two verifier forms                                            | the same changes; warden can map its audience failure to `IssuedForAnotherResource`                                                                                                                |
-| `oversight/playground/interface_lab`                                                                            | its own `lab/relay_*` modules and an older Relay API                   | not affected; it does not compile against the wave 4 API either                                                                                                                                    |
+| Dependent                                                                                                       | Uses                                                                                | Effect                                                                                                                                                                                             |
+| --------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `oversight/apps/tool_hub/src/tool_hub/assistant.gleam:221`                                                      | `option.lazy_unwrap(relay_tool.correlation(call), correlation.unique)`              | **breaks** (type): use `relay_tool.correlation(call)`                                                                                                                                              |
+| `oversight/apps/tool_hub/src/tool_hub/assistant.gleam:229`                                                      | `http.with_correlation(fn(_request) { Some(correlation.unique()) })`                | compiles; delete it so the external caller's correlation reaches the assistant server (the default mints one when none is sent)                                                                    |
+| `oversight/apps/tool_hub/src/tool_hub/telemetry.gleam:272`                                                      | `exchange_closed_event` with `ExchangeKey(m.exchange_id)`                           | compiles; can key by `m.correlation` now. With the agent's inventory client sending the question's correlation, the inventory server's 12 events and the closed exchanges join the question (TH-7) |
+| `oversight/apps/tool_hub` handler                                                                               | a retried `ask_assistant` starts a second run                                       | can derive the run id from `relay_tool.idempotency_key(call)` when the caller uses `client.with_idempotency_key`                                                                                   |
+| `oversight/apps/secure_mcp/src/secure_mcp/tools.gleam:79`                                                       | `tool.correlation(call)` passed as `Option(Correlation)`                            | **breaks** (type): pass `tool.correlation(call)` and make `generate_report` take a `Correlation`, or wrap it in `Some`                                                                             |
+| `oversight/apps/secure_mcp/src/secure_mcp/auth.gleam:20`                                                        | `authorization.verifier("warden-jwt", resource.verifier(..))`                       | **breaks** (arity): wrap as `fn(token, _correlation) { verify(token) }`, or have warden's `resource.verifier` return a two-argument function                                                       |
+| `oversight/apps/secure_mcp/src/secure_mcp/auth.gleam:44`                                                        | `use token <- authorization.verifier("warden-introspection")`                       | **breaks** (arity): `use token, correlation <- ..`, and introspect through `warden.with_correlation(client, correlation)` (SMCP-9)                                                                 |
+| `oversight/apps/tool_hub/src/tool_hub/telemetry.gleam:205,217,235,247,259,271,292`                              | `key_of(m.correlation, ..)` with `key_of(Option(Correlation), Key)` on relay events | **breaks** (type): pass `Some(m.correlation)`, or key relay events by `m.correlation` directly                                                                                                     |
+| `oversight/apps/secure_mcp/src/secure_mcp/telemetry.gleam:78,90,102,116,132,143,155,177`                        | `optional(m.correlation)` on relay events                                           | **breaks** (type): `correlation.to_string(m.correlation)`                                                                                                                                          |
+| `fabric/integrations/fabric_relay/src/fabric_relay.gleam:483`                                                   | `Some(relay_tool.correlation(call))` into fabric's own record                       | unaffected: reads no Relay telemetry record                                                                                                                                                        |
+| `oversight/apps/secure_mcp/src/secure_mcp/app.gleam:119`                                                        | `http.with_correlation(request_correlation)` reading `x-request-id`                 | compiles; when the header is absent the request now uses a client's `x-correlation-id` before minting                                                                                              |
+| `warden/relay_consumer/src/recipe.gleam:20`                                                                     | `authorization.verifier("warden-jwt", resource.verifier(..))`                       | **breaks** (arity): as for secure_mcp's `auth.gleam:20`                                                                                                                                            |
+| `warden/relay_consumer/src/recipe.gleam:44`                                                                     | `use token <- authorization.verifier("warden-introspection")`                       | **breaks** (arity): `use token, correlation <- ..` with `warden.with_correlation(client, correlation)`                                                                                             |
+| `warden/relay_consumer/test/relay_consumer_test.gleam:47`                                                       | `authorization.admit(verifier, token, protection())`                                | **breaks** (arity): `authorization.admit(verifier, token, protection(), correlation.unique())`                                                                                                     |
+| `warden/README.md:193,217`, `warden/src/warden/resource.gleam:77,101` (doc recipe mirrored into `recipe.gleam`) | the same two verifier forms                                                         | the same changes; warden can map its audience failure to `IssuedForAnotherResource`                                                                                                                |
+| `oversight/playground/interface_lab`                                                                            | its own `lab/relay_*` modules and an older Relay API                                | not affected; it does not compile against the wave 4 API either                                                                                                                                    |

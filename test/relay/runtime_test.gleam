@@ -883,7 +883,7 @@ pub fn request_admitted_runtime_observation_test() {
   |> should.equal(telemetry.RequestAdmittedMeta(
     exchange_id: reducer.exchange_id_to_int(exchange),
     method: "server/discover",
-    correlation: Some(corr),
+    correlation: corr,
     listener: Some(label),
   ))
 
@@ -893,7 +893,7 @@ pub fn request_admitted_runtime_observation_test() {
   let meta = expect_event(admitted)
   meta.exchange_id |> should.equal(reducer.exchange_id_to_int(uncorrelated))
   // Without a transport or carried correlation the runtime mints one.
-  let assert Some(minted) = meta.correlation
+  let minted = meta.correlation
   let assert True = minted != corr
 
   runtime.stop(rt)
@@ -936,10 +936,10 @@ pub fn carried_meta_correlation_names_the_request_test() {
     )
   let assert Ok(Nil) =
     runtime.send_frame(rt, reducer.new_exchange_id(), "ctx", frame, None)
-  expect_event(admitted).correlation |> should.equal(Some(sent))
-  expect_event(started).correlation |> should.equal(Some(sent))
+  expect_event(admitted).correlation |> should.equal(sent)
+  expect_event(started).correlation |> should.equal(sent)
   process.receive(seen, 1000) |> should.equal(Ok(sent))
-  expect_event(closed).correlation |> should.equal(Some(sent))
+  expect_event(closed).correlation |> should.equal(sent)
 
   runtime.stop(rt)
   let assert Ok(Nil) = sinal.detach(admitted_attachment)
@@ -970,7 +970,7 @@ pub fn carried_meta_correlation_is_validated_test() {
       let frame = carried_discover("i" <> int.to_string(index), carried)
       let assert Ok(Nil) =
         runtime.send_frame(rt, reducer.new_exchange_id(), "ctx", frame, None)
-      let assert Some(minted) = expect_event(admitted).correlation
+      let minted = expect_event(admitted).correlation
       string.length(correlation.to_string(minted)) |> should.equal(32)
     })
 
@@ -983,7 +983,7 @@ pub fn carried_meta_correlation_is_validated_test() {
       carried_discover("longest", json.string(longest)),
       None,
     )
-  let assert Some(kept) = expect_event(admitted).correlation
+  let kept = expect_event(admitted).correlation
   correlation.to_string(kept) |> should.equal(longest)
 
   let transport = correlation.from_key("transport-wins")
@@ -995,7 +995,7 @@ pub fn carried_meta_correlation_is_validated_test() {
       carried_discover("both", json.string("client-value")),
       Some(transport),
     )
-  expect_event(admitted).correlation |> should.equal(Some(transport))
+  expect_event(admitted).correlation |> should.equal(transport)
 
   runtime.stop(rt)
   let assert Ok(Nil) = sinal.detach(attachment)
@@ -1016,7 +1016,7 @@ pub fn invocation_started_metadata_test() {
   meta.exchange_id |> should.equal(reducer.exchange_id_to_int(exchange))
   meta.method |> should.equal("tools/call")
   meta.tool |> should.equal(Some("greet"))
-  meta.correlation |> should.equal(Some(corr))
+  meta.correlation |> should.equal(corr)
   meta.listener |> should.equal(Some(label))
   let _ = expect_write(outputs, exchange)
 
@@ -1050,7 +1050,7 @@ pub fn invocation_completed_status_test() {
     meta.exchange_id |> should.equal(reducer.exchange_id_to_int(exchange))
     meta.method |> should.equal("tools/call")
     meta.tool |> should.equal(Some(tool_name))
-    meta.correlation |> should.equal(Some(corr))
+    meta.correlation |> should.equal(corr)
     meta.status
   }
   let named = json.object([#("name", json.string("Bo"))])
@@ -1077,7 +1077,7 @@ pub fn exchange_closed_telemetry_carries_label_test() {
     runtime.send_frame(rt, exchange, "ctx", discover_frame("c"), None)
   let assert telemetry.ExchangeClosedMeta(
     exchange_id:,
-    correlation: Some(_),
+    correlation: _,
     listener: Some(found),
   ) = expect_event(closed)
   exchange_id |> should.equal(reducer.exchange_id_to_int(exchange))

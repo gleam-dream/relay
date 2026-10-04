@@ -16,7 +16,10 @@ refusals; the
   `reducer.invocation_correlation` return a `Correlation`, not an `Option`:
   a request uses the transport's correlation, else the one the client sent,
   else a fresh one, and every server event of the request carries it.
-  `telemetry.ExchangeClosedMeta` gains `correlation` (TH-7).
+  `telemetry.ExchangeClosedMeta` gains `correlation` (TH-7). The
+  `correlation` field of every telemetry record that has one (request,
+  invocation, exchange, HTTP rejection, authorization and client call) is a
+  `Correlation`, not an `Option`.
 - **Verifiers receive the correlation (wave 5).** `authorization.verifier`
   takes `fn(BearerToken, Correlation)` and `admit` takes the request's
   correlation as a fourth argument, so an introspection call joins the

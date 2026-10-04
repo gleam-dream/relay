@@ -20,8 +20,12 @@
 //// a correlation, and all of its server events, `exchange.closed` included,
 //// carry the same one: the endpoint's `relay/http.with_correlation` value,
 //// else the one the client sent (a Relay client sends its
-//// `relay/client.with_correlation`), else a fresh one. Only a frame the
-//// runtime refuses before admission (`frame.rejected`) has none. Read
+//// `relay/client.with_correlation`), else a fresh one. So every record's
+//// `correlation` field is a `Correlation`, written with
+//// `sinal/correlation.required_field()`; a client event carries the
+//// correlation of its call, which a view without one mints. Only
+//// `frame.rejected`, for a frame refused before admission, has no
+//// correlation field. Read
 //// metadata by label: a later release may add fields. Status and reason
 //// fields are enums, never prose.
 ////
@@ -117,7 +121,7 @@ pub type RequestAdmittedMeta {
   RequestAdmittedMeta(
     exchange_id: Int,
     method: String,
-    correlation: Option(Correlation),
+    correlation: Correlation,
     listener: Option(String),
   )
 }
@@ -129,7 +133,7 @@ pub type InvocationStartedMeta {
     invocation_id: Int,
     method: String,
     tool: Option(String),
-    correlation: Option(Correlation),
+    correlation: Correlation,
     listener: Option(String),
   )
 }
@@ -147,7 +151,7 @@ pub type InvocationCompletedMeta {
     method: String,
     tool: Option(String),
     status: Status,
-    correlation: Option(Correlation),
+    correlation: Correlation,
     listener: Option(String),
   )
 }
@@ -158,7 +162,7 @@ pub type InvocationCancelledMeta {
     invocation_id: Int,
     method: String,
     tool: Option(String),
-    correlation: Option(Correlation),
+    correlation: Correlation,
     listener: Option(String),
   )
 }
@@ -170,7 +174,7 @@ pub type InvocationCrashedMeta {
     method: String,
     tool: Option(String),
     reason: CrashReason,
-    correlation: Option(Correlation),
+    correlation: Correlation,
     listener: Option(String),
   )
 }
@@ -179,7 +183,7 @@ pub type InvocationCrashedMeta {
 pub type ExchangeClosedMeta {
   ExchangeClosedMeta(
     exchange_id: Int,
-    correlation: Option(Correlation),
+    correlation: Correlation,
     listener: Option(String),
   )
 }
@@ -189,7 +193,7 @@ pub type HttpRejectedMeta {
   HttpRejectedMeta(
     status: Int,
     reason: RejectReason,
-    correlation: Option(Correlation),
+    correlation: Correlation,
     listener: Option(String),
   )
 }
@@ -199,7 +203,7 @@ pub type AuthorizationDecidedMeta {
   AuthorizationDecidedMeta(
     verifier: String,
     decision: Decision,
-    correlation: Option(Correlation),
+    correlation: Correlation,
     listener: Option(String),
   )
 }
@@ -215,7 +219,7 @@ pub type ClientCallMeta {
     method: String,
     tool: Option(String),
     outcome: CallOutcome,
-    correlation: Option(Correlation),
+    correlation: Correlation,
     client: Option(String),
   )
 }
@@ -326,7 +330,7 @@ pub fn request_admitted_event() -> Event(Nil, RequestAdmittedMeta) {
     use method <- fields.include(fields.string("method"), get: fn(m) {
       m.method
     })
-    use correlation <- fields.include(correlation.field(), get: fn(m) {
+    use correlation <- fields.include(correlation.required_field(), get: fn(m) {
       m.correlation
     })
     use listener <- fields.include(listener(), get: fn(m) { m.listener })
@@ -353,7 +357,7 @@ pub fn invocation_started_event() -> Event(Nil, InvocationStartedMeta) {
       m.method
     })
     use tool <- fields.include(tool_field(), get: fn(m) { m.tool })
-    use correlation <- fields.include(correlation.field(), get: fn(m) {
+    use correlation <- fields.include(correlation.required_field(), get: fn(m) {
       m.correlation
     })
     use listener <- fields.include(listener(), get: fn(m) { m.listener })
@@ -397,7 +401,7 @@ pub fn invocation_completed_event() -> Event(
       ),
       get: fn(m) { m.status },
     )
-    use correlation <- fields.include(correlation.field(), get: fn(m) {
+    use correlation <- fields.include(correlation.required_field(), get: fn(m) {
       m.correlation
     })
     use listener <- fields.include(listener(), get: fn(m) { m.listener })
@@ -424,7 +428,7 @@ pub fn invocation_cancelled_event() -> Event(Nil, InvocationCancelledMeta) {
       m.method
     })
     use tool <- fields.include(tool_field(), get: fn(m) { m.tool })
-    use correlation <- fields.include(correlation.field(), get: fn(m) {
+    use correlation <- fields.include(correlation.required_field(), get: fn(m) {
       m.correlation
     })
     use listener <- fields.include(listener(), get: fn(m) { m.listener })
@@ -457,7 +461,7 @@ pub fn invocation_crashed_event() -> Event(Nil, InvocationCrashedMeta) {
       ),
       get: fn(m) { m.reason },
     )
-    use correlation <- fields.include(correlation.field(), get: fn(m) {
+    use correlation <- fields.include(correlation.required_field(), get: fn(m) {
       m.correlation
     })
     use listener <- fields.include(listener(), get: fn(m) { m.listener })
@@ -479,7 +483,7 @@ pub fn exchange_closed_event() -> Event(Nil, ExchangeClosedMeta) {
     use exchange_id <- fields.include(fields.int("exchange_id"), get: fn(m) {
       m.exchange_id
     })
-    use correlation <- fields.include(correlation.field(), get: fn(m) {
+    use correlation <- fields.include(correlation.required_field(), get: fn(m) {
       m.correlation
     })
     use listener <- fields.include(listener(), get: fn(m) { m.listener })
@@ -512,7 +516,7 @@ pub fn http_rejected_event() -> Event(Nil, HttpRejectedMeta) {
       ),
       get: fn(m) { m.reason },
     )
-    use correlation <- fields.include(correlation.field(), get: fn(m) {
+    use correlation <- fields.include(correlation.required_field(), get: fn(m) {
       m.correlation
     })
     use listener <- fields.include(listener(), get: fn(m) { m.listener })
@@ -543,7 +547,7 @@ pub fn authorization_decided_event() -> Event(Nil, AuthorizationDecidedMeta) {
       ),
       get: fn(m) { m.decision },
     )
-    use correlation <- fields.include(correlation.field(), get: fn(m) {
+    use correlation <- fields.include(correlation.required_field(), get: fn(m) {
       m.correlation
     })
     use listener <- fields.include(listener(), get: fn(m) { m.listener })
@@ -576,7 +580,7 @@ pub fn client_call_event() -> Event(ClientCallMeasurements, ClientCallMeta) {
       ),
       get: fn(m) { m.outcome },
     )
-    use correlation <- fields.include(correlation.field(), get: fn(m) {
+    use correlation <- fields.include(correlation.required_field(), get: fn(m) {
       m.correlation
     })
     use client <- fields.include(

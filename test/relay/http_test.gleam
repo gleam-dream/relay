@@ -1181,7 +1181,7 @@ pub fn client_correlation_names_the_server_side_of_the_call_test() {
   let names =
     list.map(["admitted", "started", "completed", "closed"], fn(_) {
       let assert Ok(#(name, correlation)) = process.receive(events, 1000)
-      correlation |> should.equal(Some(tag))
+      correlation |> should.equal(tag)
       name
     })
   list.sort(names, string.compare)
@@ -1370,8 +1370,8 @@ pub fn uncorrelated_client_mints_the_call_correlation_test() {
 
   let assert Ok(client.Succeeded(first, _)) = client.call(peer, whoami(), Nil)
   let assert Ok(client.Succeeded(second, _)) = client.call(peer, whoami(), Nil)
-  let assert Ok(Some(first_event)) = process.receive(calls, 1000)
-  let assert Ok(Some(second_event)) = process.receive(calls, 1000)
+  let assert Ok(first_event) = process.receive(calls, 1000)
+  let assert Ok(second_event) = process.receive(calls, 1000)
   correlation.to_string(first_event) |> should.equal(first)
   correlation.to_string(second_event) |> should.equal(second)
   let assert True = first != second

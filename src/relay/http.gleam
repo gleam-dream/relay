@@ -205,7 +205,7 @@ pub fn new_protected(
     emit.authorization_decided(
       authorization.verifier_name(verifier),
       decision(admitted),
-      Some(correlation),
+      correlation,
       label,
     )
     case admitted {
@@ -959,11 +959,21 @@ fn endpoint(
     max_body_bytes: max_body_bytes,
     serve: fn(request, closed) { serve(handler, request, closed, True) },
     body_too_large: fn() {
-      emit.http_rejected(413, telemetry.BodyTooLarge, None, None)
+      emit.http_rejected(
+        413,
+        telemetry.BodyTooLarge,
+        correlation.unique(),
+        None,
+      )
       plain(413, "Request body exceeds the configured limit")
     },
     malformed_body: fn() {
-      emit.http_rejected(400, telemetry.MalformedBody, None, None)
+      emit.http_rejected(
+        400,
+        telemetry.MalformedBody,
+        correlation.unique(),
+        None,
+      )
       plain(400, "Malformed request body")
     },
   )
@@ -997,14 +1007,24 @@ fn serve(
     Error(None) ->
       http_mist.Buffered(plain(503, "Relay HTTP endpoint is unavailable"))
     Error(Some(Overloaded)) -> {
-      emit.http_rejected(503, telemetry.TooManyRequests, None, None)
+      emit.http_rejected(
+        503,
+        telemetry.TooManyRequests,
+        sent_correlation(request),
+        None,
+      )
       http_mist.Buffered(
         plain(503, "Too many concurrent requests")
         |> response.set_header("retry-after", "1"),
       )
     }
     Error(Some(StreamsExhausted)) -> {
-      emit.http_rejected(503, telemetry.TooManyStreams, None, None)
+      emit.http_rejected(
+        503,
+        telemetry.TooManyStreams,
+        sent_correlation(request),
+        None,
+      )
       http_mist.Buffered(
         plain(503, "Too many open subscription streams")
         |> response.set_header("retry-after", "1"),
@@ -1037,7 +1057,7 @@ fn reject(
   config: Config(context),
   status: Int,
   reason: telemetry.RejectReason,
-  correlation: Option(Correlation),
+  correlation: Correlation,
   message: String,
 ) -> http_mist.Reply {
   emit.http_rejected(status, reason, correlation, config.label)
@@ -1052,8 +1072,7 @@ fn serve_leased(
   streaming: Bool,
 ) -> http_mist.Reply {
   let config = lease.config
-  let resolved = request_correlation(config, request)
-  let correlation = Some(resolved)
+  let correlation = request_correlation(config, request)
   case metadata_request(config, request) {
     Some(reply) -> reply
     None ->
@@ -1079,7 +1098,7 @@ fn serve_leased(
                     "Request body exceeds the configured limit",
                   )
                 False ->
-                  case build_context(config, request, resolved) {
+                  case build_context(config, request, correlation) {
                     Error(response) -> http_mist.Buffered(response)
                     Ok(context) ->
                       dispatch(
@@ -1148,12 +1167,17 @@ fn request_correlation(
 ) -> Correlation {
   case config.correlation(request) {
     Some(correlation) -> correlation
-    None ->
-      request.get_header(request, carrier.header)
-      |> option.from_result
-      |> option.then(carrier.parse)
-      |> option.lazy_unwrap(correlation.unique)
+    None -> sent_correlation(request)
   }
+}
+
+// The client's header, else a fresh value: for a refusal before the
+// endpoint's configuration is in hand.
+fn sent_correlation(request: Request(BitArray)) -> Correlation {
+  request.get_header(request, carrier.header)
+  |> option.from_result
+  |> option.then(carrier.parse)
+  |> option.lazy_unwrap(correlation.unique)
 }
 
 fn build_context(
@@ -1172,7 +1196,7 @@ fn build_context(
               emit.http_rejected(
                 response.status,
                 telemetry.Unauthenticated,
-                Some(correlation),
+                correlation,
                 config.label,
               )
             _ -> Nil
@@ -1203,7 +1227,7 @@ fn dispatch(
   lease: Lease(context),
   request: Request(BitArray),
   context: context,
-  correlation: Option(Correlation),
+  correlation: Correlation,
   closed: process.Selector(Nil),
   stream: Bool,
 ) -> http_mist.Reply {
@@ -1272,7 +1296,7 @@ fn run(
   route: v2026.HttpRoute,
   body: BitArray,
   context: context,
-  correlation: Option(Correlation),
+  correlation: Correlation,
   closed: process.Selector(Nil),
   stream: Bool,
 ) -> http_mist.Reply {
@@ -1294,7 +1318,9 @@ fn run(
         Ok(rt) -> {
           let exchange = reducer.new_exchange_id()
           attach_runtime(broker, rt, exchange)
-          case runtime.send_frame(rt, exchange, context, body, correlation) {
+          case
+            runtime.send_frame(rt, exchange, context, body, Some(correlation))
+          {
             Error(runtime.FrameTooDeep(_)) -> {
               finish(broker, rt)
               emit.http_rejected(

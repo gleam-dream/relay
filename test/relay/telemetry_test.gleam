@@ -83,19 +83,14 @@ pub fn request_admitted_observation_test() {
     capture(telemetry.request_admitted_event(), label, fn(m) { m.listener })
   let corr = correlation.from_key("tel-admitted-correlation")
 
-  emit.request_admitted(99, "server/discover", Some(corr), Some(label))
+  emit.request_admitted(99, "server/discover", corr, Some(label))
   received(events).1
   |> should.equal(telemetry.RequestAdmittedMeta(
     exchange_id: 99,
     method: "server/discover",
-    correlation: Some(corr),
+    correlation: corr,
     listener: Some(label),
   ))
-
-  emit.request_admitted(100, "tools/list", None, Some(label))
-  let meta = received(events).1
-  meta.method |> should.equal("tools/list")
-  meta.correlation |> should.equal(None)
 
   let assert Ok(Nil) = sinal.detach(attachment)
 }
@@ -114,7 +109,7 @@ pub fn invocation_lifecycle_observation_test() {
       invocation_id: 10,
       method: "tools/call",
       tool: Some("greet"),
-      correlation: Some(corr),
+      correlation: corr,
       listener: Some(label),
     )
   emit.invocation_started(started)
@@ -134,7 +129,7 @@ pub fn invocation_lifecycle_observation_test() {
         method: "tools/call",
         tool: Some("greet"),
         status: status,
-        correlation: Some(corr),
+        correlation: corr,
         listener: Some(label),
       )
     emit.invocation_completed(25, completed)
@@ -150,7 +145,7 @@ pub fn invocation_lifecycle_observation_test() {
       invocation_id: 11,
       method: "resources/read",
       tool: None,
-      correlation: None,
+      correlation: corr,
       listener: Some(label),
     )
   emit.invocation_started(read)
@@ -168,13 +163,14 @@ pub fn crash_and_cancel_observation_test() {
     capture(telemetry.invocation_crashed_event(), label, fn(m) { m.listener })
   let #(close_attachment, close_events) =
     capture(telemetry.exchange_closed_event(), label, fn(m) { m.listener })
+  let corr = correlation.from_key("tel-crash-correlation")
 
   let cancelled =
     telemetry.InvocationCancelledMeta(
       invocation_id: 55,
       method: "tools/call",
       tool: Some("slow"),
-      correlation: None,
+      correlation: corr,
       listener: Some(label),
     )
   emit.invocation_cancelled(cancelled)
@@ -188,7 +184,7 @@ pub fn crash_and_cancel_observation_test() {
         method: "tools/call",
         tool: Some("slow"),
         reason: reason,
-        correlation: None,
+        correlation: corr,
         listener: Some(label),
       )
     emit.invocation_crashed(crashed)
@@ -196,11 +192,11 @@ pub fn crash_and_cancel_observation_test() {
   })
 
   let closed_correlation = correlation.from_key("closed-exchange")
-  emit.exchange_closed(101, Some(closed_correlation), Some(label))
+  emit.exchange_closed(101, closed_correlation, Some(label))
   received(close_events).1
   |> should.equal(telemetry.ExchangeClosedMeta(
     exchange_id: 101,
-    correlation: Some(closed_correlation),
+    correlation: closed_correlation,
     listener: Some(label),
   ))
 
@@ -231,12 +227,12 @@ pub fn http_and_authorization_observation_test() {
     telemetry.Unauthenticated,
   ]
   |> list.each(fn(reason) {
-    emit.http_rejected(403, reason, Some(corr), Some(label))
+    emit.http_rejected(403, reason, corr, Some(label))
     received(http_events).1
     |> should.equal(telemetry.HttpRejectedMeta(
       status: 403,
       reason: reason,
-      correlation: Some(corr),
+      correlation: corr,
       listener: Some(label),
     ))
   })
@@ -250,12 +246,12 @@ pub fn http_and_authorization_observation_test() {
     telemetry.InsufficientScope,
   ]
   |> list.each(fn(decision) {
-    emit.authorization_decided("test-verifier", decision, None, Some(label))
+    emit.authorization_decided("test-verifier", decision, corr, Some(label))
     received(auth_events).1
     |> should.equal(telemetry.AuthorizationDecidedMeta(
       verifier: "test-verifier",
       decision: decision,
-      correlation: None,
+      correlation: corr,
       listener: Some(label),
     ))
   })
@@ -268,6 +264,7 @@ pub fn client_call_observation_test() {
   let label = "tel-client"
   let #(attachment, events) =
     capture(telemetry.client_call_event(), label, fn(m) { m.client })
+  let corr = correlation.from_key("tel-client-correlation")
 
   [
     telemetry.CallCompleted,
@@ -281,7 +278,7 @@ pub fn client_call_observation_test() {
         method: "tools/call",
         tool: Some("greet"),
         outcome: outcome,
-        correlation: None,
+        correlation: corr,
         client: Some(label),
       )
     emit.client_call(7, meta)

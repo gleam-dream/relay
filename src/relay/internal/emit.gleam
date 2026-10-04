@@ -20,7 +20,7 @@ pub fn frame_rejected(
 pub fn request_admitted(
   exchange_id: Int,
   method: String,
-  correlation: Option(Correlation),
+  correlation: Correlation,
   listener: Option(String),
 ) -> Nil {
   sinal.emit(
@@ -60,7 +60,7 @@ pub fn invocation_crashed(meta: telemetry.InvocationCrashedMeta) -> Nil {
 
 pub fn exchange_closed(
   exchange_id: Int,
-  correlation: Option(Correlation),
+  correlation: Correlation,
   listener: Option(String),
 ) -> Nil {
   sinal.emit(
@@ -73,7 +73,7 @@ pub fn exchange_closed(
 pub fn http_rejected(
   status: Int,
   reason: telemetry.RejectReason,
-  correlation: Option(Correlation),
+  correlation: Correlation,
   listener: Option(String),
 ) -> Nil {
   sinal.emit(
@@ -86,7 +86,7 @@ pub fn http_rejected(
 pub fn authorization_decided(
   verifier: String,
   decision: telemetry.Decision,
-  correlation: Option(Correlation),
+  correlation: Correlation,
   listener: Option(String),
 ) -> Nil {
   sinal.emit(

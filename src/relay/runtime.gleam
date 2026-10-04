@@ -298,7 +298,7 @@ type Worker {
     exchange: Int,
     method: String,
     tool: Option(String),
-    correlation: Option(Correlation),
+    correlation: Correlation,
   )
 }
 
@@ -730,7 +730,10 @@ fn interpret(
       let id = reducer.exchange_id_to_int(exchange)
       emit.exchange_closed(
         id,
-        dict.get(state.exchange_correlations, id) |> option.from_result,
+        // Every admitted exchange has an entry; the fallback keeps the
+        // event total.
+        dict.get(state.exchange_correlations, id)
+          |> result.lazy_unwrap(correlation.unique),
         state.config.label,
       )
       let _ = state.sink(OutputClose(exchange))
@@ -761,7 +764,7 @@ fn interpret(
       emit.request_admitted(
         reducer.exchange_id_to_int(exchange),
         method,
-        state.frame_correlation,
+        option.lazy_unwrap(state.frame_correlation, correlation.unique),
         state.config.label,
       )
       state
@@ -785,7 +788,7 @@ fn start_worker(
         reducer.exchange_id_to_int(reducer.invocation_exchange(invocation))
       let method = reducer.invocation_method(invocation)
       let tool = reducer.invocation_tool(invocation)
-      let correlation = Some(reducer.invocation_correlation(invocation))
+      let correlation = reducer.invocation_correlation(invocation)
       emit.invocation_started(telemetry.InvocationStartedMeta(
         exchange_id: exchange,
         invocation_id: id,
