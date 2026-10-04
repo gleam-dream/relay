@@ -20,12 +20,17 @@ refusals; the
   `correlation` field of every telemetry record that has one (request,
   invocation, exchange, HTTP rejection, authorization and client call) is a
   `Correlation`, not an `Option`.
-- **Every client error carries its call's correlation (wave 5).** Each
-  `client.Error` variant gains a trailing `correlation` field, read with
-  `client.error_correlation(error)`: the view's correlation, else the one
-  minted for the call, so a refused call (`HttpStatus(401, ..)`) joins the
-  server's events and logs. A listing or a `call` and its `resume` share one
-  correlation. Positional patterns add `..`.
+- **`client.Error` is opaque and carries its call's correlation (wave 5).**
+  The failure variants (`HttpStatus`, `RpcError`, `TimedOut`, ...) are the
+  new `client.Reason`, with their original arities; read it with
+  `client.reason(error)`. `client.error_correlation(error)` is the
+  correlation the call was sent with, so a refused call joins the server's
+  events and logs. `kind`, `evidence`, `name`, `describe_error` and
+  `is_retryable` are unchanged. `testing.error(reason)` and
+  `client.new_error(reason, correlation)` build an error for tests. A listing
+  or a `call` and its `resume` share one correlation. Matches change from
+  `Error(HttpStatus(401, _))` to `Error(error)` and
+  `case client.reason(error) { HttpStatus(401, _) -> .. }`.
 - **Verifiers receive the correlation (wave 5).** `authorization.verifier`
   takes `fn(BearerToken, Correlation)` and `admit` takes the request's
   correlation as a fourth argument, so an introspection call joins the

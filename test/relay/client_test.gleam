@@ -17,6 +17,7 @@ import relay/completion
 import relay/content
 import relay/http
 import relay/prompts
+import relay/reason_support
 import relay/resources
 import relay/server
 import relay/subscriptions
@@ -252,74 +253,105 @@ fn runner_property_definition(
 // --- errors ------------------------------------------------------------------
 
 pub fn error_classification_test() {
-  let c = correlation.unique()
   let assert client.Configuration =
-    client.kind(client.InvalidConfig(client.Url, c))
-  let assert client.Unreachable = client.kind(client.ConnectFailed(c))
+    client.kind(testing.error(client.InvalidConfig(client.Url)))
   let assert client.Unreachable =
-    client.kind(client.ConnectionClosed(client.MaybeSent, c))
-  let assert client.Timeout = client.kind(client.TimedOut(client.MaybeSent, c))
+    client.kind(testing.error(client.ConnectFailed))
+  let assert client.Unreachable =
+    client.kind(testing.error(client.ConnectionClosed(client.MaybeSent)))
+  let assert client.Timeout =
+    client.kind(testing.error(client.TimedOut(client.MaybeSent)))
   let assert client.Cancellation =
-    client.kind(client.Cancelled(client.NotSent, c))
-  let assert client.Overloaded = client.kind(client.TooManyPendingCalls(1, c))
-  let assert client.Rejected = client.kind(client.HttpStatus(401, None, c))
+    client.kind(testing.error(client.Cancelled(client.NotSent)))
+  let assert client.Overloaded =
+    client.kind(testing.error(client.TooManyPendingCalls(1)))
+  let assert client.Rejected =
+    client.kind(testing.error(client.HttpStatus(401, None)))
   let assert client.Protocol =
-    client.kind(client.RpcError(-32_602, "x", None, c))
-  let assert client.Protocol = client.kind(client.UnsupportedVersion([], c))
-  let assert client.InvalidInput = client.kind(client.InvalidInputResponses(c))
-  let assert client.TooLarge = client.kind(client.ListingLimitExceeded(3, c))
+    client.kind(testing.error(client.RpcError(-32_602, "x", None)))
+  let assert client.Protocol =
+    client.kind(testing.error(client.UnsupportedVersion([])))
+  let assert client.InvalidInput =
+    client.kind(testing.error(client.InvalidInputResponses))
+  let assert client.TooLarge =
+    client.kind(testing.error(client.ListingLimitExceeded(3)))
 
-  let assert client.NotSent = client.evidence(client.ConnectFailed(c))
-  let assert client.NotSent = client.evidence(client.InvalidArguments("x", c))
+  let assert client.NotSent =
+    client.evidence(testing.error(client.ConnectFailed))
+  let assert client.NotSent =
+    client.evidence(testing.error(client.InvalidArguments("x")))
   let assert client.MaybeSent =
-    client.evidence(client.TimedOut(client.MaybeSent, c))
-  let assert client.MaybeSent = client.evidence(client.ResponseTooLarge(8, c))
-  let assert client.Completed = client.evidence(client.HttpStatus(500, None, c))
+    client.evidence(testing.error(client.TimedOut(client.MaybeSent)))
+  let assert client.MaybeSent =
+    client.evidence(testing.error(client.ResponseTooLarge(8)))
   let assert client.Completed =
-    client.evidence(client.RpcError(-32_602, "x", None, c))
+    client.evidence(testing.error(client.HttpStatus(500, None)))
+  let assert client.Completed =
+    client.evidence(testing.error(client.RpcError(-32_602, "x", None)))
 
   let assert True =
-    client.is_retryable(client.ConnectFailed(c), idempotent: False)
-  let assert False =
-    client.is_retryable(client.TimedOut(client.MaybeSent, c), idempotent: False)
-  let assert True =
-    client.is_retryable(client.TimedOut(client.MaybeSent, c), idempotent: True)
-  let assert True =
-    client.is_retryable(client.TooManyPendingCalls(1, c), idempotent: False)
-  let assert True =
-    client.is_retryable(client.HttpStatus(503, None, c), idempotent: False)
-  let assert True =
-    client.is_retryable(client.HttpStatus(429, None, c), idempotent: False)
-  let assert False =
-    client.is_retryable(client.HttpStatus(401, None, c), idempotent: True)
+    client.is_retryable(testing.error(client.ConnectFailed), idempotent: False)
   let assert False =
     client.is_retryable(
-      client.RpcError(-32_602, "x", None, c),
+      testing.error(client.TimedOut(client.MaybeSent)),
+      idempotent: False,
+    )
+  let assert True =
+    client.is_retryable(
+      testing.error(client.TimedOut(client.MaybeSent)),
+      idempotent: True,
+    )
+  let assert True =
+    client.is_retryable(
+      testing.error(client.TooManyPendingCalls(1)),
+      idempotent: False,
+    )
+  let assert True =
+    client.is_retryable(
+      testing.error(client.HttpStatus(503, None)),
+      idempotent: False,
+    )
+  let assert True =
+    client.is_retryable(
+      testing.error(client.HttpStatus(429, None)),
+      idempotent: False,
+    )
+  let assert False =
+    client.is_retryable(
+      testing.error(client.HttpStatus(401, None)),
+      idempotent: True,
+    )
+  let assert False =
+    client.is_retryable(
+      testing.error(client.RpcError(-32_602, "x", None)),
       idempotent: True,
     )
 
   let assert "timed_out.maybe_sent" =
-    client.name(client.TimedOut(client.MaybeSent, c))
+    client.name(testing.error(client.TimedOut(client.MaybeSent)))
   let assert "connection_closed.not_sent" =
-    client.name(client.ConnectionClosed(client.NotSent, c))
-  let assert "http_status.401" = client.name(client.HttpStatus(401, None, c))
+    client.name(testing.error(client.ConnectionClosed(client.NotSent)))
+  let assert "http_status.401" =
+    client.name(testing.error(client.HttpStatus(401, None)))
   let assert "rpc_error.-32602" =
-    client.name(client.RpcError(-32_602, "x", None, c))
-  let assert "connect_failed" = client.name(client.ConnectFailed(c))
+    client.name(testing.error(client.RpcError(-32_602, "x", None)))
+  let assert "connect_failed" = client.name(testing.error(client.ConnectFailed))
 
   let assert "the MCP server answered HTTP 401" =
-    client.describe_error(client.HttpStatus(401, Some("Bearer"), c))
+    client.describe_error(testing.error(client.HttpStatus(401, Some("Bearer"))))
   let assert "the MCP server answered JSON-RPC error -32602: Invalid params" =
-    client.describe_error(client.RpcError(-32_602, "Invalid params", None, c))
+    client.describe_error(
+      testing.error(client.RpcError(-32_602, "Invalid params", None)),
+    )
   let assert "invalid Relay client setting: the URL" =
-    client.describe_error(client.InvalidConfig(client.Url, c))
+    client.describe_error(testing.error(client.InvalidConfig(client.Url)))
 }
 
 pub fn unreachable_http_server_fails_on_first_call_test() {
   // Connecting is lazy: the unreachable port fails on the first call.
   let peer = connect_url("http://127.0.0.1:1/")
   let assert Error(error) = client.discover(peer)
-  let assert client.ConnectFailed(..) = error
+  let assert client.ConnectFailed = client.reason(error)
   let assert client.NotSent = client.evidence(error)
   let assert client.Unreachable = client.kind(error)
   let assert True = client.is_retryable(error, idempotent: False)
@@ -350,8 +382,8 @@ pub fn protected_server_answers_401_with_its_challenge_test() {
 
   // No token: 401 with the RFC 9728 metadata challenge.
   let anonymous = connect_url(url)
-  let assert Error(client.HttpStatus(401, Some(challenge), ..)) =
-    client.discover(anonymous)
+  let assert Error(client.HttpStatus(401, Some(challenge))) =
+    client.discover(anonymous) |> reason_support.of
   let assert True = string.starts_with(challenge, "Bearer ")
   let assert True = string.contains(challenge, "resource_metadata=")
   client.close(anonymous)
@@ -378,8 +410,8 @@ pub fn protected_server_answers_401_with_its_challenge_test() {
       [#("authorization", "Bearer " <> token)]
     })
     |> client.connect
-  let assert Error(client.HttpStatus(401, Some(rejected), ..)) =
-    client.discover(refreshing)
+  let assert Error(client.HttpStatus(401, Some(rejected))) =
+    client.discover(refreshing) |> reason_support.of
   let assert True = string.contains(rejected, "invalid_token")
   let assert Ok(_) = client.discover(refreshing)
   client.close(refreshing)
@@ -394,16 +426,17 @@ pub fn json_rpc_errors_arrive_as_rpc_error_test() {
   let peer = testing.connect(server.new([needs_elicitation]), Nil)
 
   // An unknown tool is invalid params.
-  let assert Error(client.RpcError(-32_602, _, _, ..)) =
-    client.call(peer, echo_definition(), "nobody")
+  let assert Error(client.RpcError(-32_602, _, _)) =
+    client.call(peer, echo_definition(), "nobody") |> reason_support.of
 
   // A missing client capability names the capability in `data`.
-  let assert Error(client.RpcError(-32_021, _, Some(data), ..)) =
+  let assert Error(client.RpcError(-32_021, _, Some(data))) =
     client.call(
       peer,
       tool.define("needs_elicitation", named_input(), codec.string()),
       "x",
     )
+    |> reason_support.of
   let assert value.Object([
     #(
       "requiredCapabilities",
@@ -420,10 +453,11 @@ pub fn http_deadline_ends_the_call_and_cancels_the_handler_test() {
   let #(handler, url) = start_http(local_server(observed))
   let peer = connect_url(url)
   let started = monotonic_ms()
-  let assert Error(client.TimedOut(_, ..)) =
+  let assert Error(client.TimedOut(_)) =
     peer
     |> client.with_deadline(deadline.after(duration.milliseconds(300)))
     |> client.call(slow_definition(), "late")
+    |> reason_support.of
   let elapsed = monotonic_ms() - started
   let assert True = elapsed >= 250 && elapsed < 1500
   // MCP cancels by closing the connection: the handler sees it.
@@ -450,7 +484,7 @@ pub fn http_cancellation_ends_the_call_and_cancels_the_handler_test() {
     |> client.with_cancellation(token)
     |> client.call(slow_definition(), "cancel me")
   }
-  let assert Error(client.Cancelled(_, ..)) = outcome
+  let assert Error(client.Cancelled(_)) = outcome |> reason_support.of
   let assert Ok("cancelled") = process.receive(observed, 2000)
   let assert Ok(client.Succeeded("hello after", _)) =
     client.call(peer, echo_definition(), "after")
@@ -479,7 +513,8 @@ pub fn http_close_cancels_in_flight_calls_without_draining_test() {
   let cancelled = process.receive(observed, 2000)
   http.stop(handler)
   let assert True = closed_in < 1000
-  let assert Ok(Error(client.Cancelled(client.MaybeSent, ..))) = outcome
+  let assert Ok(Error(error)) = outcome
+  let assert client.Cancelled(client.MaybeSent) = client.reason(error)
   let assert Ok("cancelled") = cancelled
 }
 
@@ -496,18 +531,19 @@ pub fn in_process_close_cancels_in_flight_calls_at_once_test() {
   client.close(peer)
   let closed_in = monotonic_ms() - closing
   let assert True = closed_in < 500
-  let assert Ok(Error(client.Cancelled(client.MaybeSent, ..))) =
-    process.receive(done, 1000)
+  let assert Ok(Error(error)) = process.receive(done, 1000)
+  let assert client.Cancelled(client.MaybeSent) = client.reason(error)
   let assert Ok("cancelled") = process.receive(observed, 2000)
 }
 
 pub fn in_process_deadline_and_cancellation_cancel_the_handler_test() {
   let observed = process.new_subject()
   let peer = testing.connect(local_server(observed), Nil)
-  let assert Error(client.TimedOut(_, ..)) =
+  let assert Error(client.TimedOut(_)) =
     peer
     |> client.with_deadline(deadline.after(duration.milliseconds(200)))
     |> client.call(slow_definition(), "late")
+    |> reason_support.of
   let assert Ok("cancelled") = process.receive(observed, 2000)
   let outcome = {
     use token <- cancellation.with_token
@@ -520,7 +556,7 @@ pub fn in_process_deadline_and_cancellation_cancel_the_handler_test() {
     |> client.with_cancellation(token)
     |> client.call(slow_definition(), "cancel me")
   }
-  let assert Error(client.Cancelled(_, ..)) = outcome
+  let assert Error(client.Cancelled(_)) = outcome |> reason_support.of
   let assert Ok("cancelled") = process.receive(observed, 2000)
   client.close(peer)
 }
@@ -538,7 +574,7 @@ pub fn stdio_cancellation_reaches_the_child_test() {
     |> client.with_cancellation(token)
     |> client.call(runner_property_definition("wait", "ms"), 3000)
   }
-  let assert Error(client.Cancelled(_, ..)) = outcome
+  let assert Error(client.Cancelled(_)) = outcome |> reason_support.of
   // The child received notifications/cancelled: its handler saw the
   // cancellation and recorded it.
   let was_cancelled =
@@ -628,7 +664,7 @@ pub fn correlation_reaches_the_handler_and_client_telemetry_test() {
       Nil,
     )
   let assert Error(client.RpcError(..)) =
-    client.call(tagged, echo_definition(), "x")
+    client.call(tagged, echo_definition(), "x") |> reason_support.of
   let assert Ok(_) = client.discover(tagged)
   let _ = sinal.detach(attachment)
 
@@ -781,8 +817,8 @@ pub fn http_client_discovery_and_typed_calls_test() {
     config
     |> client.with_timeout(duration.milliseconds(300))
     |> client.connect
-  let assert Error(client.TimedOut(_, ..)) =
-    client.call(timeout_peer, slow_definition(), "MCP")
+  let assert Error(client.TimedOut(_)) =
+    client.call(timeout_peer, slow_definition(), "MCP") |> reason_support.of
   let assert Ok("cancelled") = process.receive(observed, 2000)
   client.close(timeout_peer)
 
@@ -791,7 +827,8 @@ pub fn http_client_discovery_and_typed_calls_test() {
     config
     |> client.with_max_response_bytes(8)
     |> client.connect
-  let assert Error(client.ResponseTooLarge(8, ..)) = client.discover(bounded)
+  let assert Error(client.ResponseTooLarge(8)) =
+    client.discover(bounded) |> reason_support.of
   client.close(bounded)
 
   client.close(peer)
@@ -815,10 +852,12 @@ pub fn raw_calls_and_listings_test() {
     client.call_raw(peer, "prompts/list", None, [
       #("cursor", json.string(cursor)),
     ])
+    |> reason_support.of
   let assert Error(client.RpcError(..)) =
     client.call_raw(peer, "tools/list", None, [
       #("cursor", json.string("invalid-cursor")),
     ])
+    |> reason_support.of
 
   // The default error text, through the raw call.
   let assert Ok(value.Object(failed)) =
@@ -827,10 +866,10 @@ pub fn raw_calls_and_listings_test() {
       #("arguments", json.object([#("name", json.string("MCP"))])),
     ])
   let assert Ok(value.Bool(True)) = list.key_find(failed, "isError")
-  let assert Error(client.InvalidArguments(_, ..)) =
-    client.call_raw(peer, "tools/call", None, [])
-  let assert Error(client.InvalidArguments(_, ..)) =
-    client.call_raw(peer, "tools/list", Some("echo"), [])
+  let assert Error(client.InvalidArguments(_)) =
+    client.call_raw(peer, "tools/call", None, []) |> reason_support.of
+  let assert Error(client.InvalidArguments(_)) =
+    client.call_raw(peer, "tools/list", Some("echo"), []) |> reason_support.of
 
   let assert Ok(tools) = client.list_tools(peer)
   let assert 108 = list.length(tools)
@@ -920,26 +959,28 @@ pub fn call_discovered_and_listing_bounds_are_explicit_test() {
       say_declaration,
       value.Object([#("name", value.String("remote"))]),
     )
-  let assert Error(client.InvalidArguments(_, ..)) =
+  let assert Error(client.InvalidArguments(_)) =
     client.call_discovered(
       peer,
       echo_declaration,
       value.String("not arguments"),
     )
-  let assert Error(client.InvalidArguments(_, ..)) =
+    |> reason_support.of
+  let assert Error(client.InvalidArguments(_)) =
     client.call_discovered(peer, echo_declaration, value.Array([]))
+    |> reason_support.of
 
   let assert Ok(item_limited) =
     base |> client.with_listing_limits(256, 3) |> client.connect
-  let assert Error(client.ListingLimitExceeded(3, ..)) =
-    client.list_tools(item_limited)
-  let assert Error(client.ListingLimitExceeded(3, ..)) =
-    client.list_raw(item_limited, "tools/list", "tools")
+  let assert Error(client.ListingLimitExceeded(3)) =
+    client.list_tools(item_limited) |> reason_support.of
+  let assert Error(client.ListingLimitExceeded(3)) =
+    client.list_raw(item_limited, "tools/list", "tools") |> reason_support.of
   client.close(item_limited)
   let assert Ok(page_limited) =
     base |> client.with_listing_limits(1, 10_000) |> client.connect
-  let assert Error(client.ListingLimitExceeded(1, ..)) =
-    client.list_tools(page_limited)
+  let assert Error(client.ListingLimitExceeded(1)) =
+    client.list_tools(page_limited) |> reason_support.of
   client.close(page_limited)
 
   client.close(peer)
@@ -956,44 +997,56 @@ pub fn call_discovered_and_listing_bounds_are_explicit_test() {
 pub fn repeated_listing_cursor_is_malformed_test() {
   let assert Ok(peer) =
     client.connect(answering_peer("{\"tools\":[],\"nextCursor\":\"same\"}"))
-  let assert Error(client.MalformedResponse(_, ..)) = client.list_tools(peer)
-  let assert Error(client.MalformedResponse(_, ..)) =
-    client.list_raw(peer, "tools/list", "tools")
+  let assert Error(client.MalformedResponse(_)) =
+    client.list_tools(peer) |> reason_support.of
+  let assert Error(client.MalformedResponse(_)) =
+    client.list_raw(peer, "tools/list", "tools") |> reason_support.of
   client.close(peer)
 }
 
 pub fn invalid_configuration_fails_before_transport_start_test() {
   let assert Ok(http_config) = client.http("http://127.0.0.1/")
-  let assert Error(client.InvalidConfig(client.ListingLimits, ..)) =
-    http_config |> client.with_listing_limits(0, 1) |> client.connect
-  let assert Error(client.InvalidConfig(client.ListingLimits, ..)) =
+  let assert Error(client.InvalidConfig(client.ListingLimits)) =
+    http_config
+    |> client.with_listing_limits(0, 1)
+    |> client.connect
+    |> reason_support.of
+  let assert Error(client.InvalidConfig(client.ListingLimits)) =
     client.stdio("/bin/echo", [])
     |> client.with_listing_limits(1, 0)
     |> client.connect
-  let assert Error(client.InvalidConfig(client.RequestTimeout, ..)) =
+    |> reason_support.of
+  let assert Error(client.InvalidConfig(client.RequestTimeout)) =
     http_config
     |> client.with_timeout(duration.milliseconds(0))
     |> client.connect
-  let assert Error(client.InvalidConfig(client.ConnectTimeout, ..)) =
+    |> reason_support.of
+  let assert Error(client.InvalidConfig(client.ConnectTimeout)) =
     http_config
     |> client.with_connect_timeout(duration.milliseconds(0))
     |> client.connect
-  let assert Error(client.InvalidConfig(client.MaxResponseBytes, ..)) =
-    http_config |> client.with_max_response_bytes(0) |> client.connect
-  let assert Error(client.InvalidConfig(client.MaxPendingCalls, ..)) =
+    |> reason_support.of
+  let assert Error(client.InvalidConfig(client.MaxResponseBytes)) =
+    http_config
+    |> client.with_max_response_bytes(0)
+    |> client.connect
+    |> reason_support.of
+  let assert Error(client.InvalidConfig(client.MaxPendingCalls)) =
     client.stdio("/bin/echo", [])
     |> client.with_max_pending_calls(0)
     |> client.connect
-  let assert Error(client.InvalidConfig(client.CaCertFile, ..)) =
+    |> reason_support.of
+  let assert Error(client.InvalidConfig(client.CaCertFile)) =
     http_config
     |> client.with_ca_cert_file("test/fixtures/tls/root-ca.crt")
     |> client.connect
-  let assert Error(client.InvalidConfig(client.Url, ..)) =
-    client.http("ftp://x/")
-  let assert Error(client.InvalidConfig(client.Url, ..)) =
-    client.http("http://127.0.0.1/?query")
-  let assert Error(client.InvalidConfig(client.Url, ..)) =
-    client.http("http://user@127.0.0.1/")
+    |> reason_support.of
+  let assert Error(client.InvalidConfig(client.Url)) =
+    client.http("ftp://x/") |> reason_support.of
+  let assert Error(client.InvalidConfig(client.Url)) =
+    client.http("http://127.0.0.1/?query") |> reason_support.of
+  let assert Error(client.InvalidConfig(client.Url)) =
+    client.http("http://user@127.0.0.1/") |> reason_support.of
 }
 
 pub fn configured_large_structured_response_uses_client_parser_bound_test() {
@@ -1085,15 +1138,17 @@ pub fn discovered_and_typed_tool_continuations_retain_state_test() {
     dict.get(requests, "choice")
   let assert Ok(value.String("Continue?")) = list.key_find(params, "message")
 
-  let assert Error(client.InvalidInputResponses(..)) =
-    client.resume(continuation, dict.new())
-  let assert Error(client.InvalidInputResponses(..)) =
+  let assert Error(client.InvalidInputResponses) =
+    client.resume(continuation, dict.new()) |> reason_support.of
+  let assert Error(client.InvalidInputResponses) =
     client.resume(continuation, dict.from_list([#("wrong", json.object([]))]))
-  let assert Error(client.InvalidInputResponses(..)) =
+    |> reason_support.of
+  let assert Error(client.InvalidInputResponses) =
     client.resume(
       continuation,
       dict.from_list([#("choice", json.string("no"))]),
     )
+    |> reason_support.of
 
   let replies =
     dict.from_list([
@@ -1147,8 +1202,8 @@ pub fn input_required_accepts_state_only_and_rejects_empty_result_test() {
 
   // An input_required result needs inputRequests or requestState.
   let invalid = tool.define("invalid", codec.success(Nil), codec.string())
-  let assert Error(client.MalformedResponse(_, ..)) =
-    client.call(peer, invalid, Nil)
+  let assert Error(client.MalformedResponse(_)) =
+    client.call(peer, invalid, Nil) |> reason_support.of
   client.close(peer)
 }
 
@@ -1172,8 +1227,8 @@ pub fn content_only_continuation_test() {
 pub fn unadvertised_input_method_is_unsupported_test() {
   let peer = input_peer([tool.Elicitation])
   let definition = tool.define_content("content-only", codec.success(Nil))
-  let assert Error(client.UnsupportedInputRequest("roots/list", ..)) =
-    client.call(peer, definition, Nil)
+  let assert Error(client.UnsupportedInputRequest("roots/list")) =
+    client.call(peer, definition, Nil) |> reason_support.of
   client.close(peer)
 }
 
@@ -1181,10 +1236,11 @@ pub fn non_object_arguments_are_invalid_test() {
   // Arguments that are not a JSON object fail before anything is sent.
   let peer = testing.connect(server.new([]), Nil)
   let declaration = tool.declaration(echo_definition())
-  let assert Error(client.InvalidArguments(_, ..)) =
+  let assert Error(client.InvalidArguments(_)) =
     client.call_discovered(peer, declaration, value.Bool(True))
-  let assert Error(client.InvalidArguments(_, ..)) =
-    client.call_discovered(peer, declaration, value.Null)
+    |> reason_support.of
+  let assert Error(client.InvalidArguments(_)) =
+    client.call_discovered(peer, declaration, value.Null) |> reason_support.of
   client.close(peer)
 }
 
@@ -1211,8 +1267,8 @@ pub fn discover_without_2026_07_28_is_unsupported_version_test() {
     client.connect(answering_peer(
       "{\"supportedVersions\":[\"2025-11-25\"],\"capabilities\":{}}",
     ))
-  let assert Error(client.UnsupportedVersion(["2025-11-25"], ..)) =
-    client.discover(peer)
+  let assert Error(client.UnsupportedVersion(["2025-11-25"])) =
+    client.discover(peer) |> reason_support.of
   client.close(peer)
 }
 
@@ -1562,7 +1618,8 @@ pub fn stdio_client_rejects_unrelated_responses_test() {
       "IFS= read -r request; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",\"params\":{\"uri\":\"file:///ignored\"}}'; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":\"wrong-id\",\"result\":{}}'",
     ])
     |> client.connect
-  let assert Error(client.MalformedResponse(_, ..)) = client.discover(peer)
+  let assert Error(client.MalformedResponse(_)) =
+    client.discover(peer) |> reason_support.of
   client.close(peer)
 }
 
@@ -1671,9 +1728,10 @@ pub fn stdio_frame_overflow_closes_the_owned_child_test() {
   let assert Ok(peer) =
     client.stdio("./test/fixtures/stdio/overflow-peer", [])
     |> client.connect
-  let assert Error(client.MalformedResponse(_, ..)) = client.discover(peer)
-  let assert Error(client.ConnectionClosed(client.NotSent, ..)) =
-    client.discover(peer)
+  let assert Error(client.MalformedResponse(_)) =
+    client.discover(peer) |> reason_support.of
+  let assert Error(client.ConnectionClosed(client.NotSent)) =
+    client.discover(peer) |> reason_support.of
   client.close(peer)
 }
 
@@ -1689,8 +1747,8 @@ pub fn stdio_child_exit_mid_call_is_connection_closed_test() {
   let assert Ok(peer) =
     client.stdio("/bin/sh", ["-c", "IFS= read -r request; exit 0"])
     |> client.connect
-  let assert Error(client.ConnectionClosed(client.MaybeSent, ..)) =
-    client.discover(peer)
+  let assert Error(client.ConnectionClosed(client.MaybeSent)) =
+    client.discover(peer) |> reason_support.of
   client.close(peer)
 }
 
@@ -1700,8 +1758,9 @@ pub fn stdio_timeout_is_timed_out_test() {
     |> client.with_timeout(duration.milliseconds(300))
     |> client.connect
   let started = monotonic_ms()
-  let assert Error(client.TimedOut(client.MaybeSent, ..)) =
+  let assert Error(client.TimedOut(client.MaybeSent)) =
     client.call(peer, runner_property_definition("slow", "ms"), 2000)
+    |> reason_support.of
   let assert True = monotonic_ms() - started < 1800
   client.close(peer)
 }
@@ -1733,9 +1792,11 @@ pub fn stdio_pending_call_limit_test() {
   let assert [
     #(1, Ok(client.Succeeded("slow response", _))),
     #(2, Ok(client.Succeeded("slow response", _))),
-    #(3, Error(client.TooManyPendingCalls(1, _))),
-    #(4, Error(client.TooManyPendingCalls(1, _))),
+    #(3, Error(busy_3)),
+    #(4, Error(busy_4)),
   ] = outcomes
+  let assert client.TooManyPendingCalls(1) = client.reason(busy_3)
+  let assert client.TooManyPendingCalls(1) = client.reason(busy_4)
   client.close(peer)
 }
 
@@ -1766,8 +1827,8 @@ pub fn stdio_tool_call_close_is_typed_cancellation_test() {
     })
   process.sleep(100)
   client.close(peer)
-  let assert Ok(Error(client.Cancelled(client.MaybeSent, ..))) =
-    process.receive(done, within: 3000)
+  let assert Ok(Error(error)) = process.receive(done, within: 3000)
+  let assert client.Cancelled(client.MaybeSent) = client.reason(error)
 }
 
 // --- relay/testing -----------------------------------------------------------
@@ -1868,7 +1929,8 @@ pub fn refused_call_exposes_the_correlation_the_server_logged_test() {
   // event and the server's rejection event carry.
   let #(outcome, sent) =
     with_call_events("refused-minted", fn() { client.discover(anonymous) })
-  let assert Error(client.HttpStatus(401, Some(_), ..) as first) = outcome
+  let assert Error(first) = outcome
+  let assert client.HttpStatus(401, Some(_)) = client.reason(first)
   let assert [call] = sent
   let assert True = client.error_correlation(first) == call
 
@@ -1889,7 +1951,8 @@ pub fn refused_call_exposes_the_correlation_the_server_logged_test() {
 
   // A refused `listen` carries its correlation too.
   let assert Error(refused_listen) = client.listen(anonymous, [])
-  let assert client.HttpStatus(401, _, correlation: listened) = refused_listen
+  let assert client.HttpStatus(401, _) = client.reason(refused_listen)
+  let listened = client.error_correlation(refused_listen)
   let assert True = listened == client.error_correlation(refused_listen)
   client.close(anonymous)
   http.stop(handler)
@@ -1912,7 +1975,8 @@ pub fn rpc_error_exposes_the_call_correlation_test() {
     with_call_events("rpc-error", fn() {
       client.call(peer, echo_definition(), "nobody")
     })
-  let assert Error(client.RpcError(-32_602, ..) as error) = outcome
+  let assert Error(error) = outcome
+  let assert client.RpcError(-32_602, ..) = client.reason(error)
   let assert [call] = sent
   let assert True = client.error_correlation(error) == call
 
@@ -1936,7 +2000,8 @@ pub fn rpc_error_exposes_the_call_correlation_test() {
     with_call_events("rpc-error-http", fn() {
       client.call(http_peer, echo_definition(), "nobody")
     })
-  let assert Error(client.RpcError(..) as over_http) = outcome
+  let assert Error(over_http) = outcome
+  let assert client.RpcError(..) = client.reason(over_http)
   let assert [call] = sent
   let assert True = client.error_correlation(over_http) == call
   client.close(http_peer)
@@ -1948,7 +2013,8 @@ pub fn transport_failures_expose_the_call_correlation_test() {
   let unreachable = labelled_url("http://127.0.0.1:1/", "unreachable")
   let #(outcome, sent) =
     with_call_events("unreachable", fn() { client.discover(unreachable) })
-  let assert Error(client.ConnectFailed(..) as refused) = outcome
+  let assert Error(refused) = outcome
+  let assert client.ConnectFailed(..) = client.reason(refused)
   let assert [call] = sent
   let assert True = client.error_correlation(refused) == call
   client.close(unreachable)
@@ -1961,8 +2027,8 @@ pub fn transport_failures_expose_the_call_correlation_test() {
     )
   let #(outcome, sent) =
     with_call_events("stdio-exit", fn() { client.discover(exiting) })
-  let assert Error(client.ConnectionClosed(client.MaybeSent, ..) as closed) =
-    outcome
+  let assert Error(closed) = outcome
+  let assert client.ConnectionClosed(client.MaybeSent) = client.reason(closed)
   let assert [call] = sent
   let assert True = client.error_correlation(closed) == call
   client.close(exiting)
@@ -1973,7 +2039,8 @@ pub fn transport_failures_expose_the_call_correlation_test() {
   let bounded = labelled(client.with_max_response_bytes(config, 8), "too-large")
   let #(outcome, sent) =
     with_call_events("too-large", fn() { client.discover(bounded) })
-  let assert Error(client.ResponseTooLarge(8, ..) as large) = outcome
+  let assert Error(large) = outcome
+  let assert client.ResponseTooLarge(8) = client.reason(large)
   let assert [call] = sent
   let assert True = client.error_correlation(large) == call
   client.close(bounded)
@@ -1997,8 +2064,8 @@ pub fn transport_failures_expose_the_call_correlation_test() {
     })
   process.sleep(200)
   client.close(peer)
-  let assert Ok(Error(client.Cancelled(client.MaybeSent, ..) as cancelled)) =
-    process.receive(done, 1000)
+  let assert Ok(Error(cancelled)) = process.receive(done, 1000)
+  let assert client.Cancelled(client.MaybeSent) = client.reason(cancelled)
   let assert True = client.error_correlation(cancelled) == tag
 }
 
@@ -2009,11 +2076,12 @@ pub fn timeout_and_cancellation_expose_the_call_correlation_test() {
 
   // Deadline over HTTP.
   let tag = correlation.from_key("deadline")
-  let assert Error(client.TimedOut(_, ..) as late) =
+  let assert Error(late) =
     peer
     |> client.with_correlation(tag)
     |> client.with_deadline(deadline.after(duration.milliseconds(200)))
     |> client.call(slow_definition(), "late")
+  let assert client.TimedOut(_) = client.reason(late)
   let assert True = client.error_correlation(late) == tag
   let assert Ok("cancelled") = process.receive(observed, 2000)
 
@@ -2031,7 +2099,8 @@ pub fn timeout_and_cancellation_expose_the_call_correlation_test() {
       |> client.with_cancellation(token)
       |> client.call(slow_definition(), "cancel me")
     })
-  let assert Error(client.Cancelled(_, ..) as cancelled) = outcome
+  let assert Error(cancelled) = outcome
+  let assert client.Cancelled(_) = client.reason(cancelled)
   let assert [call] = sent
   let assert True = client.error_correlation(cancelled) == call
   let assert Ok("cancelled") = process.receive(observed, 2000)
@@ -2043,11 +2112,12 @@ pub fn timeout_and_cancellation_expose_the_call_correlation_test() {
   let local_observed = process.new_subject()
   let local = testing.connect(local_server(local_observed), Nil)
   let tag = correlation.from_key("deadline-local")
-  let assert Error(client.TimedOut(_, ..) as local_late) =
+  let assert Error(local_late) =
     local
     |> client.with_correlation(tag)
     |> client.with_deadline(deadline.after(duration.milliseconds(200)))
     |> client.call(slow_definition(), "late")
+  let assert client.TimedOut(_) = client.reason(local_late)
   let assert True = client.error_correlation(local_late) == tag
   let outcome = {
     use token <- cancellation.with_token
@@ -2061,7 +2131,8 @@ pub fn timeout_and_cancellation_expose_the_call_correlation_test() {
     |> client.with_cancellation(token)
     |> client.call(slow_definition(), "cancel me")
   }
-  let assert Error(client.Cancelled(_, ..) as local_cancelled) = outcome
+  let assert Error(local_cancelled) = outcome
+  let assert client.Cancelled(_) = client.reason(local_cancelled)
   let assert True = client.error_correlation(local_cancelled) == tag
   client.close(local)
 
@@ -2070,10 +2141,11 @@ pub fn timeout_and_cancellation_expose_the_call_correlation_test() {
     runner_config()
     |> client.with_timeout(duration.milliseconds(300))
     |> client.connect
-  let assert Error(client.TimedOut(client.MaybeSent, ..) as stdio_late) =
+  let assert Error(stdio_late) =
     stdio
     |> client.with_correlation(tag)
     |> client.call(runner_property_definition("slow", "ms"), 2000)
+  let assert client.TimedOut(client.MaybeSent) = client.reason(stdio_late)
   let assert True = client.error_correlation(stdio_late) == tag
   client.close(stdio)
   let stdio = connect_runner()
@@ -2089,7 +2161,8 @@ pub fn timeout_and_cancellation_expose_the_call_correlation_test() {
     |> client.with_cancellation(token)
     |> client.call(runner_property_definition("wait", "ms"), 3000)
   }
-  let assert Error(client.Cancelled(_, ..) as stdio_cancelled) = stdio_outcome
+  let assert Error(stdio_cancelled) = stdio_outcome
+  let assert client.Cancelled(_) = client.reason(stdio_cancelled)
   let assert True = client.error_correlation(stdio_cancelled) == tag
   client.close(stdio)
 }
@@ -2121,8 +2194,12 @@ pub fn pending_call_overflow_exposes_the_call_correlation_test() {
   let overflowed =
     list.filter_map(outcomes, fn(outcome) {
       case outcome {
-        #(_, tag, Error(client.TooManyPendingCalls(1, ..) as error)) ->
-          Ok(client.error_correlation(error) == tag)
+        #(_, tag, Error(error)) ->
+          case client.reason(error) {
+            client.TooManyPendingCalls(1) ->
+              Ok(client.error_correlation(error) == tag)
+            _ -> Error(Nil)
+          }
         _ -> Error(Nil)
       }
     })
@@ -2147,17 +2224,20 @@ pub fn errors_before_a_request_carry_a_correlation_test() {
       icons: [],
       meta: [],
     )
-  let assert Error(client.InvalidArguments(_, ..) as arguments) =
+  let assert Error(arguments) =
     client.call_discovered(tagged, declaration, value.String("x"))
+  let assert client.InvalidArguments(_) = client.reason(arguments)
   let assert True = client.error_correlation(arguments) == tag
-  let assert Error(client.InvalidArguments(_, ..) as key) =
+  let assert Error(key) =
     client.discover(client.with_idempotency_key(tagged, "two words"))
+  let assert client.InvalidArguments(_) = client.reason(key)
   let assert True = client.error_correlation(key) == tag
-  let assert Error(client.InvalidArguments(_, ..) as listen_key) =
+  let assert Error(listen_key) =
     client.listen(client.with_idempotency_key(tagged, "two words"), [])
+  let assert client.InvalidArguments(_) = client.reason(listen_key)
   let assert True = client.error_correlation(listen_key) == tag
-  let assert Error(client.InvalidArguments(_, ..) as raw) =
-    client.call_raw(tagged, "tools/call", None, [])
+  let assert Error(raw) = client.call_raw(tagged, "tools/call", None, [])
+  let assert client.InvalidArguments(_) = client.reason(raw)
   let assert True = client.error_correlation(raw) == tag
 
   // An untagged view still reports one, and each call has its own.
@@ -2168,11 +2248,12 @@ pub fn errors_before_a_request_carry_a_correlation_test() {
 
   // `connect` and `http` fail before any call: the correlation is fresh.
   let assert Error(bad_url) = client.http("ftp://x/")
-  let assert client.InvalidConfig(client.Url, _) = bad_url
+  let assert client.InvalidConfig(client.Url) = client.reason(bad_url)
   let assert Ok(config) = client.http("http://127.0.0.1:1/")
   let assert Error(bad_setting) =
     client.connect(client.with_max_pending_calls(config, 0))
-  let assert client.InvalidConfig(client.MaxPendingCalls, _) = bad_setting
+  let assert client.InvalidConfig(client.MaxPendingCalls) =
+    client.reason(bad_setting)
   let assert False = text_of(bad_url) == text_of(bad_setting)
   client.close(peer)
 }
@@ -2182,8 +2263,9 @@ pub fn failures_after_the_response_expose_the_call_correlation_test() {
   let assert Ok(malformed) =
     client.connect(answering_peer("{\"unexpected\":true}"))
   let tag = correlation.from_key("malformed")
-  let assert Error(client.MalformedResponse(_, ..) as wrong_shape) =
+  let assert Error(wrong_shape) =
     client.list_tools(client.with_correlation(malformed, tag))
+  let assert client.MalformedResponse(_) = client.reason(wrong_shape)
   let assert True = client.error_correlation(wrong_shape) == tag
   client.close(malformed)
 
@@ -2192,18 +2274,20 @@ pub fn failures_after_the_response_expose_the_call_correlation_test() {
     client.connect(answering_peer(
       "{\"supportedVersions\":[\"2025-11-25\"],\"capabilities\":{}}",
     ))
-  let assert Error(client.UnsupportedVersion(..) as unsupported) =
+  let assert Error(unsupported) =
     client.discover(client.with_correlation(old, tag))
+  let assert client.UnsupportedVersion(..) = client.reason(unsupported)
   let assert True = client.error_correlation(unsupported) == tag
   client.close(old)
 
   // A listing over its bound; every page shares the listing's correlation.
   let assert Ok(many) =
     client.connect(answering_peer("{\"tools\":[],\"nextCursor\":\"next\"}"))
-  let assert Error(client.MalformedResponse(..) as repeated) =
+  let assert Error(repeated) =
     client.list_tools(client.with_correlation(many, tag))
+  let assert client.MalformedResponse(..) = client.reason(repeated)
   let assert True = client.error_correlation(repeated) == tag
-  let assert Error(client.ListingLimitExceeded(..) as limited) =
+  let assert Error(limited) =
     client.list_tools(client.with_correlation(
       {
         let assert Ok(unbounded) =
@@ -2217,6 +2301,7 @@ pub fn failures_after_the_response_expose_the_call_correlation_test() {
       },
       tag,
     ))
+  let assert client.ListingLimitExceeded(..) = client.reason(limited)
   let assert True = client.error_correlation(limited) == tag
   client.close(many)
 
@@ -2230,9 +2315,20 @@ pub fn failures_after_the_response_expose_the_call_correlation_test() {
     |> client.connect
   let assert Ok(client.InputRequired(continuation, _)) =
     client.call(client.with_correlation(inputs, tag), definition, "x")
-  let assert Error(client.InvalidInputResponses(..) as invalid) =
-    client.resume(continuation, dict.new())
+  let assert Error(invalid) = client.resume(continuation, dict.new())
+  let assert client.InvalidInputResponses(..) = client.reason(invalid)
   let assert True = client.error_correlation(invalid) == tag
   client.close(inputs)
   http.stop(handler)
+}
+
+pub fn test_errors_round_trip_their_reason_and_correlation_test() {
+  let fresh = testing.error(client.HttpStatus(401, None))
+  let assert client.HttpStatus(401, None) = client.reason(fresh)
+  let assert client.Rejected = client.kind(fresh)
+  let tag = correlation.from_key("built")
+  let built = client.new_error(client.TimedOut(client.MaybeSent), tag)
+  let assert client.TimedOut(client.MaybeSent) = client.reason(built)
+  let assert True = client.error_correlation(built) == tag
+  let assert False = text_of(fresh) == text_of(built)
 }

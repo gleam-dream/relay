@@ -45,6 +45,7 @@ import gleam/uri
 import relay/authorization.{type Attestation, type Verifier}
 import relay/client
 import relay/server.{type Server}
+import sinal/correlation
 
 /// A client connected to `server` in this VM, with each request's context.
 /// Panics when the runtime cannot start.
@@ -54,6 +55,13 @@ pub fn connect(server: Server(context), context: context) -> client.Client {
     Error(error) ->
       panic as { "relay/testing.connect: " <> client.describe_error(error) }
   }
+}
+
+/// A `client.Error` with this failure, as if a call with a fresh correlation
+/// had failed, for fakes and for testing code that handles errors. Build
+/// one with a chosen correlation using `client.new_error`.
+pub fn error(reason: client.Reason) -> client.Error {
+  client.new_error(reason, correlation.unique())
 }
 
 @external(erlang, "relay_ffi", "unique_integer")

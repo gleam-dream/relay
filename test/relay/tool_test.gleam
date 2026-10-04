@@ -14,6 +14,7 @@ import json/blueprint/value
 import relay/client
 import relay/content
 import relay/internal/protocol/v2026_07_28 as v2026
+import relay/reason_support
 import relay/reducer
 import relay/server
 import relay/test_codec
@@ -323,8 +324,8 @@ pub fn with_required_client_capabilities_refuses_undeclared_clients_test() {
       }),
     ])
   let peer = testing.connect(srv, Nil)
-  let assert Error(client.RpcError(-32_021, _, Some(_), ..)) =
-    client.call(peer, definition, "x")
+  let assert Error(client.RpcError(-32_021, _, Some(_))) =
+    client.call(peer, definition, "x") |> reason_support.of
   process.receive(calls, 0) |> should.be_error
   client.close(peer)
 
@@ -356,8 +357,8 @@ pub fn schema_override_changes_discovery_but_codec_still_validates_test() {
     )
   let assert Ok([listed]) = client.list_tools(peer)
   listed.input_schema |> should.equal(override)
-  let assert Error(client.RpcError(-32_602, _, _, ..)) =
-    client.call_discovered(peer, listed, value.Object([]))
+  let assert Error(client.RpcError(-32_602, _, _)) =
+    client.call_discovered(peer, listed, value.Object([])) |> reason_support.of
   let assert Ok(client.Succeeded(value.String("go"), _)) =
     client.call_discovered(
       peer,
@@ -398,8 +399,8 @@ pub fn content_definition_override_and_input_round_test() {
   tool.tool_declaration(bound).input_schema |> should.equal(override)
   let peer = connect_with_input(server.new([bound]), Nil)
   let assert Ok([listed]) = client.list_tools(peer)
-  let assert Error(client.RpcError(-32_602, _, _, ..)) =
-    client.call_discovered(peer, listed, value.Object([]))
+  let assert Error(client.RpcError(-32_602, _, _)) =
+    client.call_discovered(peer, listed, value.Object([])) |> reason_support.of
   let assert Ok(client.InputRequired(continuation, requests)) =
     client.call(peer, definition, "go")
   dict.keys(requests) |> should.equal(["confirm"])
@@ -465,8 +466,8 @@ pub fn duplicate_tool_name_rejected_test() {
 pub fn unknown_tool_call_test() {
   let ghost = tool.define("ghost", text_input("a"), codec.string())
   let peer = testing.connect(server.new([]), Nil)
-  let assert Error(client.RpcError(-32_602, _, _, ..)) =
-    client.call(peer, ghost, "boo")
+  let assert Error(client.RpcError(-32_602, _, _)) =
+    client.call(peer, ghost, "boo") |> reason_support.of
   client.close(peer)
 }
 
@@ -484,12 +485,13 @@ pub fn invalid_input_arguments_test() {
       ]),
       Nil,
     )
-  let assert Error(client.RpcError(-32_602, _, _, ..)) =
+  let assert Error(client.RpcError(-32_602, _, _)) =
     client.call_discovered(
       peer,
       tool.declaration(definition),
       value.Object([#("msg", value.Number(must_int(99)))]),
     )
+    |> reason_support.of
   process.receive(calls, 0) |> should.be_error
   client.close(peer)
 }
@@ -618,8 +620,8 @@ pub fn invalid_output_encoding_is_an_internal_error_test() {
       server.new([tool.handle(definition, fn(_d) { Ok(999) })]),
       Nil,
     )
-  let assert Error(client.RpcError(-32_603, _, _, ..)) =
-    client.call(peer, definition, "hi")
+  let assert Error(client.RpcError(-32_603, _, _)) =
+    client.call(peer, definition, "hi") |> reason_support.of
   client.close(peer)
 }
 

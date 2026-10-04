@@ -3,6 +3,7 @@ import gleam/int
 import gleam/list
 import gleam/option.{None}
 import gleam/otp/static_supervisor as supervisor
+import gleam/result
 import gleam/string
 import gleam/time/duration
 import gleeunit/should
@@ -13,6 +14,7 @@ import relay/completion
 import relay/content
 import relay/http
 import relay/prompts
+import relay/reason_support
 import relay/resources
 import relay/server
 import relay/testing
@@ -103,7 +105,7 @@ pub fn service_modifiers_replace_lists_test() {
   server.has_tool(without_tool, "custom") |> should.be_false
   let peer = testing.connect(without_tool, Nil)
   let assert Error(client.RpcError(code: -32_602, ..)) =
-    client.call(peer, custom, "hello")
+    client.call(peer, custom, "hello") |> reason_support.of
   client.close(peer)
 
   // A completion handler adds the completions capability.
@@ -202,7 +204,7 @@ pub fn http_connect_is_lazy_test() {
   let assert Ok(peer) =
     client.connect(client.with_connect_timeout(config, duration.seconds(1)))
   let assert Error(error) = client.discover(peer)
-  let assert client.ConnectFailed(_) = error
+  client.reason(error) |> should.equal(client.ConnectFailed)
   client.evidence(error) |> should.equal(client.NotSent)
   client.close(peer)
 }
@@ -397,9 +399,9 @@ pub fn port_panics_for_a_mounted_handler_test() {
 fn refused(
   outcome: Result(a, client.Error),
 ) -> Result(client.ConfigField, String) {
-  case outcome {
-    Error(client.InvalidConfig(field, _)) -> Ok(field)
-    Error(error) -> Error(client.name(error))
+  case result.map_error(outcome, client.reason) {
+    Error(client.InvalidConfig(field)) -> Ok(field)
+    Error(_) -> Error("other failure")
     Ok(_) -> Error("accepted")
   }
 }

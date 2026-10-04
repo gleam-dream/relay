@@ -45,11 +45,12 @@ pub fn main() {
 
 `client.call` returns `Ok(Succeeded(output, content))`, `Ok(ToolFailed(..))`
 when the tool reported a failure, `Ok(InputRequired(..))` when the tool asks
-the client for input first, or `Error(client.Error)`. The error carries the
-HTTP status, the JSON-RPC error, or the transport failure with its
-submission evidence; branch on `client.kind(error)` and
-`client.evidence(error)`, and log `client.describe_error(error)` with
-`client.error_correlation(error)`, the correlation the call was sent with.
+the client for input first, or `Error(client.Error)`. The opaque error
+carries the call's context; `client.reason(error)` is the HTTP status, the
+JSON-RPC error, or the transport failure with its submission evidence.
+Branch on `client.kind(error)` and `client.evidence(error)`, and log
+`client.describe_error(error)` with `client.error_correlation(error)`, the
+correlation the call was sent with.
 
 ## Serve over stdio
 
@@ -246,10 +247,12 @@ case client.call(peer, definition, "Ada") {
 }
 ```
 
-Every `client.Error` variant ends with that `correlation`; match payloads
-with `..` (`HttpStatus(401, Some(challenge), ..)`). An error from
+Match the failure with `client.reason(error)`, for example
+`client.HttpStatus(401, Some(challenge))`; context such as the correlation
+lives on the opaque `Error`, so it never changes a match. An error from
 `client.http` or `client.connect` precedes any call and carries a fresh
-correlation that no server saw.
+correlation that no server saw. Tests build an error with
+`testing.error(reason)`, or `client.new_error(reason, correlation)`.
 
 MCP `2026-07-28` has no session and no idempotency key, so Relay carries
 an optional one of its own, in `_meta` under

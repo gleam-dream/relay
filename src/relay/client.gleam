@@ -11,12 +11,12 @@
 //// - `read_resource`, `get_prompt`, `complete`, `discover`, the listings,
 ////   `listen` and the raw `call_raw` and `list_raw` cover the rest.
 ////
-//// Every operation returns `Result(_, Error)`. `Error` carries the HTTP
-//// status, the JSON-RPC error, or the transport failure with its
-//// submission `Evidence`; branch on `kind(error)` or `evidence(error)` and
-//// log `describe_error(error)` with `error_correlation(error)`, the
-//// correlation the call was sent with, which finds the server's events for
-//// it. A tool's own failure is not an `Error`: it is the `ToolFailed`
+//// Every operation returns `Result(_, Error)`. `Error` is opaque: branch on
+//// `kind(error)` or `evidence(error)`, match the HTTP status, the JSON-RPC
+//// error or the transport failure with its submission `Evidence` in
+//// `reason(error)`, and log `describe_error(error)` with
+//// `error_correlation(error)`, the correlation the call was sent with,
+//// which finds the server's events for it. A tool's own failure is not an `Error`: it is the `ToolFailed`
 //// result.
 ////
 //// Per-call controls are views on the client: `with_deadline`,
@@ -400,52 +400,60 @@ pub type Evidence {
   Completed
 }
 
-/// Why an operation failed. It may gain variants in a minor release:
-/// branch on `kind` and `evidence`, and match variants with a `_` arm.
-///
-/// Every variant ends with the `correlation` the operation was sent with,
-/// so a caller can tie the failure to the server's logs; read it with
-/// `error_correlation`, and match payloads with `..` so the pattern does not
-/// depend on it: `HttpStatus(401, Some(challenge), ..)`. An error that
-/// precedes any call, from `http`, `connect` or a bad setting, carries a
-/// fresh correlation that no server saw.
-pub type Error {
-  InvalidConfig(field: ConfigField, correlation: Correlation)
+/// Why an operation failed, with the call it failed in. It is opaque so
+/// that context can grow without breaking a match: read the failure with
+/// `reason`, the classification with `kind` and `evidence`, and the
+/// correlation the call was sent with, which finds the server's events for
+/// it, with `error_correlation`. An error from `http`, `connect` or a bad
+/// setting precedes any call and carries a fresh correlation that no server
+/// saw.
+pub opaque type Error {
+  Failed(reason: Reason, correlation: Correlation)
+}
+
+/// What went wrong. It may gain variants in a minor release: branch on
+/// `kind` and `evidence`, and match variants of `reason(error)` with a `_`
+/// arm.
+pub type Reason {
+  InvalidConfig(field: ConfigField)
   /// The connection or the child process could not be established.
-  ConnectFailed(correlation: Correlation)
+  ConnectFailed
   /// The HTTP client's destination policy refused the host.
-  Refused(correlation: Correlation)
-  TimedOut(evidence: Evidence, correlation: Correlation)
-  Cancelled(evidence: Evidence, correlation: Correlation)
-  ConnectionClosed(evidence: Evidence, correlation: Correlation)
-  ResponseTooLarge(limit: Int, correlation: Correlation)
-  TooManyPendingCalls(limit: Int, correlation: Correlation)
+  Refused
+  TimedOut(evidence: Evidence)
+  Cancelled(evidence: Evidence)
+  ConnectionClosed(evidence: Evidence)
+  ResponseTooLarge(limit: Int)
+  TooManyPendingCalls(limit: Int)
   /// The server answered with a non-success HTTP status and no JSON-RPC
   /// error; a 401 or 403 carries its `WWW-Authenticate` challenge.
-  HttpStatus(
-    status: Int,
-    www_authenticate: Option(String),
-    correlation: Correlation,
-  )
+  HttpStatus(status: Int, www_authenticate: Option(String))
   /// The server answered with a JSON-RPC error object.
-  RpcError(
-    code: Int,
-    message: String,
-    data: Option(Value),
-    correlation: Correlation,
-  )
+  RpcError(code: Int, message: String, data: Option(Value))
   /// The response broke the protocol; `detail` is for logs only.
-  MalformedResponse(detail: String, correlation: Correlation)
+  MalformedResponse(detail: String)
   /// The server does not support the `2026-07-28` revision.
-  UnsupportedVersion(supported: List(String), correlation: Correlation)
+  UnsupportedVersion(supported: List(String))
   /// The server asked for an input method this client did not advertise.
-  UnsupportedInputRequest(method: String, correlation: Correlation)
+  UnsupportedInputRequest(method: String)
   /// The arguments could not be encoded or are not a JSON object; `detail`
   /// is for logs only.
-  InvalidArguments(detail: String, correlation: Correlation)
+  InvalidArguments(detail: String)
   /// `resume` needs exactly one JSON object response per request key.
-  InvalidInputResponses(correlation: Correlation)
-  ListingLimitExceeded(limit: Int, correlation: Correlation)
+  InvalidInputResponses
+  ListingLimitExceeded(limit: Int)
+}
+
+/// The failure, to match on.
+///
+/// ```gleam
+/// case client.reason(error) {
+///   client.HttpStatus(401, Some(challenge)) -> reauthorize(challenge)
+///   _ -> Nil
+/// }
+/// ```
+pub fn reason(error: Error) -> Reason {
+  error.reason
 }
 
 /// The correlation the failed operation was sent with: the view's
@@ -465,24 +473,13 @@ pub type Error {
 /// }
 /// ```
 pub fn error_correlation(error: Error) -> Correlation {
-  case error {
-    InvalidConfig(_, correlation)
-    | ConnectFailed(correlation)
-    | Refused(correlation)
-    | TimedOut(_, correlation)
-    | Cancelled(_, correlation)
-    | ConnectionClosed(_, correlation)
-    | ResponseTooLarge(_, correlation)
-    | TooManyPendingCalls(_, correlation)
-    | HttpStatus(_, _, correlation)
-    | RpcError(_, _, _, correlation)
-    | MalformedResponse(_, correlation)
-    | UnsupportedVersion(_, correlation)
-    | UnsupportedInputRequest(_, correlation)
-    | InvalidArguments(_, correlation)
-    | InvalidInputResponses(correlation)
-    | ListingLimitExceeded(_, correlation) -> correlation
-  }
+  error.correlation
+}
+
+/// An error for tests and fakes: `reason` as the failure of the call that
+/// carried `correlation`. `relay/testing.error` supplies a fresh one.
+pub fn new_error(reason: Reason, correlation: Correlation) -> Error {
+  Failed(reason, correlation)
 }
 
 /// The closed classification of an `Error`. It never gains variants.
@@ -507,40 +504,39 @@ pub type Kind {
 
 /// The closed classification of an error, for branching.
 pub fn kind(error: Error) -> Kind {
-  case error {
-    InvalidConfig(..) -> Configuration
-    ConnectFailed(..) | Refused(..) | ConnectionClosed(..) -> Unreachable
-    TimedOut(..) -> Timeout
-    Cancelled(..) -> Cancellation
-    TooManyPendingCalls(..) -> Overloaded
+  case error.reason {
+    InvalidConfig(_) -> Configuration
+    ConnectFailed | Refused | ConnectionClosed(_) -> Unreachable
+    TimedOut(_) -> Timeout
+    Cancelled(_) -> Cancellation
+    TooManyPendingCalls(_) -> Overloaded
     HttpStatus(..) -> Rejected
     RpcError(..)
-    | MalformedResponse(..)
-    | UnsupportedVersion(..)
-    | UnsupportedInputRequest(..) -> Protocol
-    InvalidArguments(..) | InvalidInputResponses(..) -> InvalidInput
-    ResponseTooLarge(..) | ListingLimitExceeded(..) -> TooLarge
+    | MalformedResponse(_)
+    | UnsupportedVersion(_)
+    | UnsupportedInputRequest(_) -> Protocol
+    InvalidArguments(_) | InvalidInputResponses -> InvalidInput
+    ResponseTooLarge(_) | ListingLimitExceeded(_) -> TooLarge
   }
 }
 
 /// Whether the server may have received the request.
 pub fn evidence(error: Error) -> Evidence {
-  case error {
-    InvalidConfig(..)
-    | ConnectFailed(..)
-    | Refused(..)
-    | TooManyPendingCalls(..)
-    | InvalidArguments(..)
-    | InvalidInputResponses(..) -> NotSent
-    TimedOut(evidence, _)
-    | Cancelled(evidence, _)
-    | ConnectionClosed(evidence, _) -> evidence
-    ResponseTooLarge(..) | MalformedResponse(..) -> MaybeSent
+  case error.reason {
+    InvalidConfig(_)
+    | ConnectFailed
+    | Refused
+    | TooManyPendingCalls(_)
+    | InvalidArguments(_)
+    | InvalidInputResponses -> NotSent
+    TimedOut(evidence) | Cancelled(evidence) | ConnectionClosed(evidence) ->
+      evidence
+    ResponseTooLarge(_) | MalformedResponse(_) -> MaybeSent
     HttpStatus(..)
     | RpcError(..)
-    | UnsupportedVersion(..)
-    | UnsupportedInputRequest(..)
-    | ListingLimitExceeded(..) -> Completed
+    | UnsupportedVersion(_)
+    | UnsupportedInputRequest(_)
+    | ListingLimitExceeded(_) -> Completed
   }
 }
 
@@ -552,8 +548,8 @@ pub fn is_retryable(error: Error, idempotent idempotent: Bool) -> Bool {
     Unreachable, NotSent | Timeout, NotSent | Overloaded, _ -> True
     Unreachable, MaybeSent | Timeout, MaybeSent -> idempotent
     Rejected, _ ->
-      case error {
-        HttpStatus(429, ..) | HttpStatus(503, ..) -> True
+      case error.reason {
+        HttpStatus(429, _) | HttpStatus(503, _) -> True
         _ -> False
       }
     _, _ -> False
@@ -570,62 +566,62 @@ pub fn name(error: Error) -> String {
       Completed -> "completed"
     }
   }
-  case error {
-    InvalidConfig(..) -> "invalid_config"
-    ConnectFailed(..) -> "connect_failed"
-    Refused(..) -> "refused"
-    TimedOut(evidence, _) -> "timed_out." <> evidence_name(evidence)
-    Cancelled(evidence, _) -> "cancelled." <> evidence_name(evidence)
-    ConnectionClosed(evidence, _) ->
+  case error.reason {
+    InvalidConfig(_) -> "invalid_config"
+    ConnectFailed -> "connect_failed"
+    Refused -> "refused"
+    TimedOut(evidence) -> "timed_out." <> evidence_name(evidence)
+    Cancelled(evidence) -> "cancelled." <> evidence_name(evidence)
+    ConnectionClosed(evidence) ->
       "connection_closed." <> evidence_name(evidence)
-    ResponseTooLarge(..) -> "response_too_large"
-    TooManyPendingCalls(..) -> "too_many_pending_calls"
-    HttpStatus(status, ..) -> "http_status." <> int.to_string(status)
+    ResponseTooLarge(_) -> "response_too_large"
+    TooManyPendingCalls(_) -> "too_many_pending_calls"
+    HttpStatus(status, _) -> "http_status." <> int.to_string(status)
     RpcError(code, ..) -> "rpc_error." <> int.to_string(code)
-    MalformedResponse(..) -> "malformed_response"
-    UnsupportedVersion(..) -> "unsupported_version"
-    UnsupportedInputRequest(..) -> "unsupported_input_request"
-    InvalidArguments(..) -> "invalid_arguments"
-    InvalidInputResponses(..) -> "invalid_input_responses"
-    ListingLimitExceeded(..) -> "listing_limit_exceeded"
+    MalformedResponse(_) -> "malformed_response"
+    UnsupportedVersion(_) -> "unsupported_version"
+    UnsupportedInputRequest(_) -> "unsupported_input_request"
+    InvalidArguments(_) -> "invalid_arguments"
+    InvalidInputResponses -> "invalid_input_responses"
+    ListingLimitExceeded(_) -> "listing_limit_exceeded"
   }
 }
 
 /// A one-line description for logs.
 pub fn describe_error(error: Error) -> String {
-  case error {
-    InvalidConfig(field, _) ->
+  case error.reason {
+    InvalidConfig(field) ->
       "invalid Relay client setting: " <> config_field_name(field)
-    ConnectFailed(_) -> "the MCP server could not be reached"
-    Refused(_) -> "the destination policy refused the MCP server's address"
-    TimedOut(..) -> "the MCP request timed out"
-    Cancelled(..) -> "the MCP request was cancelled"
-    ConnectionClosed(..) -> "the connection to the MCP server closed"
-    ResponseTooLarge(limit, _) ->
+    ConnectFailed -> "the MCP server could not be reached"
+    Refused -> "the destination policy refused the MCP server's address"
+    TimedOut(_) -> "the MCP request timed out"
+    Cancelled(_) -> "the MCP request was cancelled"
+    ConnectionClosed(_) -> "the connection to the MCP server closed"
+    ResponseTooLarge(limit) ->
       "the MCP response exceeds " <> int.to_string(limit) <> " bytes"
-    TooManyPendingCalls(limit, _) ->
+    TooManyPendingCalls(limit) ->
       "more than " <> int.to_string(limit) <> " calls wait for the stdio server"
-    HttpStatus(status, ..) ->
+    HttpStatus(status, _) ->
       "the MCP server answered HTTP " <> int.to_string(status)
-    RpcError(code, message, ..) ->
+    RpcError(code, message, _) ->
       "the MCP server answered JSON-RPC error "
       <> int.to_string(code)
       <> ": "
       <> message
-    MalformedResponse(detail, _) -> "malformed MCP response: " <> detail
-    UnsupportedVersion(supported, _) ->
+    MalformedResponse(detail) -> "malformed MCP response: " <> detail
+    UnsupportedVersion(supported) ->
       "the MCP server supports "
       <> string.join(supported, ", ")
       <> ", not "
       <> protocol_version
-    UnsupportedInputRequest(method, _) ->
+    UnsupportedInputRequest(method) ->
       "the MCP server asked for "
       <> method
       <> ", which this client did not advertise"
-    InvalidArguments(detail, _) -> "invalid tool arguments: " <> detail
-    InvalidInputResponses(_) ->
+    InvalidArguments(detail) -> "invalid tool arguments: " <> detail
+    InvalidInputResponses ->
       "input responses must answer every request key with one JSON object"
-    ListingLimitExceeded(limit, _) ->
+    ListingLimitExceeded(limit) ->
       "the listing exceeds its limit of " <> int.to_string(limit)
   }
 }
@@ -699,11 +695,11 @@ fn ms(value: Duration) -> Int {
 // An error before any call has no request to join: it carries a fresh
 // correlation that no server saw.
 fn config_error(field: ConfigField) -> Error {
-  InvalidConfig(field, correlation.unique())
+  Failed(InvalidConfig(field), correlation.unique())
 }
 
-fn setup_error(make: fn(Correlation) -> Error) -> Error {
-  make(correlation.unique())
+fn setup_error(reason: Reason) -> Error {
+  Failed(reason, correlation.unique())
 }
 
 fn validate(config: Config) -> Result(Config, Error) {
@@ -823,8 +819,10 @@ fn check_idempotency_key(
       case carrier.valid(key) {
         True -> Ok(Nil)
         False ->
-          Error(InvalidArguments(
-            "the idempotency key must be 1 to 128 visible ASCII characters",
+          Error(Failed(
+            InvalidArguments(
+              "the idempotency key must be 1 to 128 visible ASCII characters",
+            ),
             call,
           ))
       }
@@ -1034,18 +1032,18 @@ fn gun_failure(
     gun_error.MaybeSent -> MaybeSent
   }
   case gun_error.kind(failure) {
-    gun_error.InvalidInput -> InvalidConfig(Headers, call)
-    gun_error.Refused -> Refused(call)
-    gun_error.TimedOut -> TimedOut(evidence, call)
-    gun_error.TooLarge -> ResponseTooLarge(limit, call)
-    gun_error.CancelledLocally -> Cancelled(evidence, call)
+    gun_error.InvalidInput -> Failed(InvalidConfig(Headers), call)
+    gun_error.Refused -> Failed(Refused, call)
+    gun_error.TimedOut -> Failed(TimedOut(evidence), call)
+    gun_error.TooLarge -> Failed(ResponseTooLarge(limit), call)
+    gun_error.CancelledLocally -> Failed(Cancelled(evidence), call)
     gun_error.Network ->
       case evidence {
-        NotSent -> ConnectFailed(call)
-        _ -> ConnectionClosed(evidence, call)
+        NotSent -> Failed(ConnectFailed, call)
+        _ -> Failed(ConnectionClosed(evidence), call)
       }
     gun_error.Unavailable | gun_error.Misuse | gun_error.Playback ->
-      ConnectionClosed(evidence, call)
+      Failed(ConnectionClosed(evidence), call)
   }
 }
 
@@ -1084,7 +1082,7 @@ fn next_event(
       }
     None ->
       case bit_array.byte_size(pending) > limit {
-        True -> #(None, <<>>, Error(ResponseTooLarge(limit, call)))
+        True -> #(None, <<>>, Error(Failed(ResponseTooLarge(limit), call)))
         False ->
           case body.next_within(stream, duration.milliseconds(wait_ms)) {
             Ok(None) -> #(None, pending, Ok(Nil))
@@ -1099,7 +1097,7 @@ fn next_event(
             Ok(Some(body.End(_))) -> #(
               None,
               pending,
-              Error(ConnectionClosed(Completed, call)),
+              Error(Failed(ConnectionClosed(Completed), call)),
             )
             Error(failure) -> #(
               None,
@@ -1218,14 +1216,14 @@ fn stdio_peer(
 
 fn stdio_failure(failure: stdio_client.Failure, call: Correlation) -> Error {
   case failure {
-    stdio_client.NotRunning -> ConnectionClosed(NotSent, call)
-    stdio_client.Busy(limit) -> TooManyPendingCalls(limit, call)
-    stdio_client.TimedOut -> TimedOut(MaybeSent, call)
-    stdio_client.Exited -> ConnectionClosed(MaybeSent, call)
-    stdio_client.ClientClosed -> Cancelled(MaybeSent, call)
-    stdio_client.Cancelled -> Cancelled(MaybeSent, call)
-    stdio_client.TooLarge(limit) -> ResponseTooLarge(limit, call)
-    stdio_client.Malformed(detail) -> MalformedResponse(detail, call)
+    stdio_client.NotRunning -> Failed(ConnectionClosed(NotSent), call)
+    stdio_client.Busy(limit) -> Failed(TooManyPendingCalls(limit), call)
+    stdio_client.TimedOut -> Failed(TimedOut(MaybeSent), call)
+    stdio_client.Exited -> Failed(ConnectionClosed(MaybeSent), call)
+    stdio_client.ClientClosed -> Failed(Cancelled(MaybeSent), call)
+    stdio_client.Cancelled -> Failed(Cancelled(MaybeSent), call)
+    stdio_client.TooLarge(limit) -> Failed(ResponseTooLarge(limit), call)
+    stdio_client.Malformed(detail) -> Failed(MalformedResponse(detail), call)
   }
 }
 
@@ -1306,14 +1304,14 @@ fn in_process_peer(
       Ok(Nil) -> Ok(#(exchange, outputs))
       Error(runtime.FrameTooLarge(..)) | Error(runtime.FrameTooDeep(..)) -> {
         process.send(router, Unregister(reducer.exchange_id_to_int(exchange)))
-        Error(InvalidArguments(
-          "the request exceeds the server's frame limits",
+        Error(Failed(
+          InvalidArguments("the request exceeds the server's frame limits"),
           call,
         ))
       }
       Error(_) -> {
         process.send(router, Unregister(reducer.exchange_id_to_int(exchange)))
-        Error(ConnectionClosed(NotSent, call))
+        Error(Failed(ConnectionClosed(NotSent), call))
       }
     }
   }
@@ -1339,7 +1337,7 @@ fn in_process_peer(
               Error(Nil) -> Ok(None)
               Ok(Routed(runtime.OutputWrite(_, bytes))) -> Ok(Some(bytes))
               Ok(Routed(runtime.OutputClose(_))) | Ok(PeerClosed) ->
-                Error(ConnectionClosed(Completed, call))
+                Error(Failed(ConnectionClosed(Completed), call))
             }
           },
           close: fn() {
@@ -1372,19 +1370,20 @@ fn await_frame(
 ) -> Result(BitArray, Error) {
   let left = deadline - monotonic_ms()
   case left <= 0, is_cancelled(budget) {
-    _, True -> Error(Cancelled(MaybeSent, budget.correlation))
-    True, _ -> Error(TimedOut(MaybeSent, budget.correlation))
+    _, True -> Error(Failed(Cancelled(MaybeSent), budget.correlation))
+    True, _ -> Error(Failed(TimedOut(MaybeSent), budget.correlation))
     False, False ->
       case process.receive(outputs, int.min(left, 50)) {
         Error(Nil) -> await_frame(outputs, budget, deadline)
-        Ok(PeerClosed) -> Error(Cancelled(MaybeSent, budget.correlation))
+        Ok(PeerClosed) ->
+          Error(Failed(Cancelled(MaybeSent), budget.correlation))
         Ok(Routed(runtime.OutputWrite(_, bytes))) ->
           case v2026.is_response_frame(bytes) {
             True -> Ok(bytes)
             False -> await_frame(outputs, budget, deadline)
           }
         Ok(Routed(runtime.OutputClose(_))) ->
-          Error(ConnectionClosed(MaybeSent, budget.correlation))
+          Error(Failed(ConnectionClosed(MaybeSent), budget.correlation))
       }
   }
 }
@@ -1538,14 +1537,20 @@ fn interpret(
               {
                 200, Ok(result) -> Ok(Response(result, incoming.body, call))
                 200, Error(_) ->
-                  Error(MalformedResponse("the response has no result", call))
+                  Error(Failed(
+                    MalformedResponse("the response has no result"),
+                    call,
+                  ))
                 _, _ -> Error(status_error(incoming, call))
               }
           }
         _, _ ->
           case incoming.status {
             200 ->
-              Error(MalformedResponse("the response is not correlated", call))
+              Error(Failed(
+                MalformedResponse("the response is not correlated"),
+                call,
+              ))
             _ -> Error(status_error(incoming, call))
           }
       }
@@ -1554,7 +1559,8 @@ fn interpret(
 
 fn status_error(incoming: Incoming, call: Correlation) -> Error {
   case incoming.status {
-    200 -> MalformedResponse("the response was not valid JSON-RPC", call)
+    200 ->
+      Failed(MalformedResponse("the response was not valid JSON-RPC"), call)
     status ->
       case
         bit_array.to_string(incoming.body)
@@ -1564,7 +1570,8 @@ fn status_error(incoming: Incoming, call: Correlation) -> Error {
         })
       {
         Ok(error) -> error
-        Error(Nil) -> HttpStatus(status, incoming.www_authenticate, call)
+        Error(Nil) ->
+          Failed(HttpStatus(status, incoming.www_authenticate), call)
       }
   }
 }
@@ -1577,18 +1584,18 @@ fn rpc_error_decoder(call: Correlation) -> Decoder(Error) {
     None,
     decode.optional(value.decoder()),
   )
-  decode.success(RpcError(code, message, data, call))
+  decode.success(Failed(RpcError(code, message, data), call))
 }
 
 fn decode_result(response: Response, decoder: Decoder(a)) -> Result(a, Error) {
   decode.run(response.result, decoder)
   |> result.map_error(fn(errors) {
-    MalformedResponse(
-      case errors {
+    Failed(
+      MalformedResponse(case errors {
         [decode.DecodeError(expected, _, path), ..] ->
           "expected " <> expected <> " at " <> string.join(path, ".")
         [] -> "the result did not match the expected shape"
-      },
+      }),
       response.call,
     )
   })
@@ -1604,7 +1611,10 @@ fn exact(
     |> value.with_max_bytes(bit_array.byte_size(response.body) + 1)
   case value.parse_bits(response.body, limits) {
     Error(_) ->
-      Error(MalformedResponse("the response is not valid JSON", response.call))
+      Error(Failed(
+        MalformedResponse("the response is not valid JSON"),
+        response.call,
+      ))
     Ok(root) -> Ok(at(root, path))
   }
 }
@@ -1689,7 +1699,10 @@ pub fn discover(client: Client) -> Result(Discovery, Error) {
   case list.contains(discovery.supported_versions, protocol_version) {
     True -> Ok(discovery)
     False ->
-      Error(UnsupportedVersion(discovery.supported_versions, response.call))
+      Error(Failed(
+        UnsupportedVersion(discovery.supported_versions),
+        response.call,
+      ))
   }
 }
 
@@ -1733,7 +1746,7 @@ pub fn call(
   let #(client, call) = call_correlation(client)
   case codec.encode(definition.input, input) {
     Error(error) ->
-      Error(InvalidArguments(codec.describe_encode_error(error), call))
+      Error(Failed(InvalidArguments(codec.describe_encode_error(error)), call))
     Ok(arguments) ->
       invoke(
         client,
@@ -1786,7 +1799,11 @@ pub fn call_discovered(
         None,
         fn(structured, _) { Ok(option.unwrap(structured, value.Null)) },
       )
-    _ -> Error(InvalidArguments("tool arguments must be a JSON object", call))
+    _ ->
+      Error(Failed(
+        InvalidArguments("tool arguments must be a JSON object"),
+        call,
+      ))
   }
 }
 
@@ -1803,7 +1820,7 @@ pub fn resume(
     && list.all(keys, list.contains(continuation.keys, _))
     && list.all(dict.values(responses), is_object)
   {
-    False -> Error(InvalidInputResponses(call))
+    False -> Error(Failed(InvalidInputResponses, call))
     True ->
       invoke(
         client,
@@ -1876,8 +1893,10 @@ fn invoke(
       // The revision requires at least one of the two members.
       use requests <- result.try(case requests, state {
         None, None ->
-          Error(MalformedResponse(
-            "an input_required result has no inputRequests or requestState",
+          Error(Failed(
+            MalformedResponse(
+              "an input_required result has no inputRequests or requestState",
+            ),
             response.call,
           ))
         Some(requests), _ -> Ok(requests)
@@ -1919,12 +1938,16 @@ fn invoke(
         False ->
           case decode_output(structured, blocks) {
             Ok(output) -> Ok(Succeeded(output, blocks))
-            Error(detail) -> Error(MalformedResponse(detail, response.call))
+            Error(detail) ->
+              Error(Failed(MalformedResponse(detail), response.call))
           }
       }
     }
     Some(other) ->
-      Error(MalformedResponse("unknown resultType " <> other, response.call))
+      Error(Failed(
+        MalformedResponse("unknown resultType " <> other),
+        response.call,
+      ))
   }
 }
 
@@ -1946,14 +1969,17 @@ fn admit_input_requests(
       "elicitation/create" -> Ok(tool.Elicitation)
       "sampling/createMessage" -> Ok(tool.Sampling)
       "roots/list" -> Ok(tool.Roots)
-      _ -> Error(UnsupportedInputRequest(method_name, call))
+      _ -> Error(Failed(UnsupportedInputRequest(method_name), call))
     }
     use method <- result.try(method)
     case list.contains(client.config.input_methods, method), params {
-      False, _ -> Error(UnsupportedInputRequest(method_name, call))
+      False, _ -> Error(Failed(UnsupportedInputRequest(method_name), call))
       True, value.Object(_) -> Ok(#(key, tool.InputRequest(method, params)))
       True, _ ->
-        Error(MalformedResponse("input request params must be an object", call))
+        Error(Failed(
+          MalformedResponse("input request params must be an object"),
+          call,
+        ))
     }
   })
   |> result.map(dict.from_list)
@@ -1985,7 +2011,8 @@ fn page(
   item_count: Int,
 ) -> Result(List(a), Error) {
   case page_count >= client.config.max_listing_pages {
-    True -> Error(ListingLimitExceeded(client.config.max_listing_pages, call))
+    True ->
+      Error(Failed(ListingLimitExceeded(client.config.max_listing_pages), call))
     False -> {
       let params = case cursor {
         Some(cursor) -> [#("cursor", json.string(cursor))]
@@ -2003,12 +2030,18 @@ fn page(
       let pages = [items, ..pages]
       case item_count > client.config.max_listing_items, next {
         True, _ ->
-          Error(ListingLimitExceeded(client.config.max_listing_items, call))
+          Error(Failed(
+            ListingLimitExceeded(client.config.max_listing_items),
+            call,
+          ))
         False, None -> Ok(list.flatten(list.reverse(pages)))
         False, Some(next) ->
           case list.contains(seen, next) {
             True ->
-              Error(MalformedResponse("the listing repeated a cursor", call))
+              Error(Failed(
+                MalformedResponse("the listing repeated a cursor"),
+                call,
+              ))
             False ->
               page(
                 client,
@@ -2198,7 +2231,8 @@ fn raw_page(
   item_count: Int,
 ) -> Result(List(Value), Error) {
   case page_count >= client.config.max_listing_pages {
-    True -> Error(ListingLimitExceeded(client.config.max_listing_pages, call))
+    True ->
+      Error(Failed(ListingLimitExceeded(client.config.max_listing_pages), call))
     False -> {
       let params = case cursor {
         Some(cursor) -> [#("cursor", json.string(cursor))]
@@ -2208,7 +2242,11 @@ fn raw_page(
       use items <- result.try(exact(response, ["result", collection]))
       use items <- result.try(case items {
         Some(value.Array(items)) -> Ok(items)
-        _ -> Error(MalformedResponse("the listing has no " <> collection, call))
+        _ ->
+          Error(Failed(
+            MalformedResponse("the listing has no " <> collection),
+            call,
+          ))
       })
       use next <- result.try(
         decode_result(response, {
@@ -2220,12 +2258,18 @@ fn raw_page(
       let pages = [items, ..pages]
       case item_count > client.config.max_listing_items, next {
         True, _ ->
-          Error(ListingLimitExceeded(client.config.max_listing_items, call))
+          Error(Failed(
+            ListingLimitExceeded(client.config.max_listing_items),
+            call,
+          ))
         False, None -> Ok(list.flatten(list.reverse(pages)))
         False, Some(next) ->
           case list.contains(seen, next) {
             True ->
-              Error(MalformedResponse("the listing repeated a cursor", call))
+              Error(Failed(
+                MalformedResponse("the listing repeated a cursor"),
+                call,
+              ))
             False ->
               raw_page(
                 client,
@@ -2260,15 +2304,15 @@ pub fn call_raw(
   let #(client, call) = call_correlation(client)
   case needs_name, name {
     True, None ->
-      Error(InvalidArguments(method <> " needs a routing name", call))
+      Error(Failed(InvalidArguments(method <> " needs a routing name"), call))
     False, Some(_) ->
-      Error(InvalidArguments(method <> " takes no routing name", call))
+      Error(Failed(InvalidArguments(method <> " takes no routing name"), call))
     _, _ -> {
       use response <- result.try(request(client, method, name, params))
       use found <- result.try(exact(response, ["result"]))
       option.to_result(
         found,
-        MalformedResponse("the response has no result", call),
+        Failed(MalformedResponse("the response has no result"), call),
       )
     }
   }
@@ -2433,7 +2477,7 @@ pub fn listen(
     }
     Ok(None) -> {
       stream.close()
-      Error(TimedOut(MaybeSent, call))
+      Error(Failed(TimedOut(MaybeSent), call))
     }
     Ok(Some(frame)) ->
       case acknowledgement(frame, id, call) {
@@ -2476,8 +2520,8 @@ fn parse_frame(frame: BitArray, call: Correlation) -> Result(Dynamic, Error) {
   |> result.try(fn(text) {
     json.parse(text, decode.dynamic) |> result.replace_error(Nil)
   })
-  |> result.replace_error(MalformedResponse(
-    "a stream event is not valid JSON",
+  |> result.replace_error(Failed(
+    MalformedResponse("a stream event is not valid JSON"),
     call,
   ))
 }
@@ -2522,16 +2566,18 @@ fn acknowledgement(
         }),
       )
       |> result.map(subs.notifications_of)
-      |> result.replace_error(MalformedResponse(
-        "the acknowledgement has no notification filter",
+      |> result.replace_error(Failed(
+        MalformedResponse("the acknowledgement has no notification filter"),
         call,
       ))
     _, _ ->
       case decode.run(message, decode.at(["error"], rpc_error_decoder(call))) {
         Ok(error) -> Error(error)
         Error(_) ->
-          Error(MalformedResponse(
-            "the stream did not begin with its acknowledgement",
+          Error(Failed(
+            MalformedResponse(
+              "the stream did not begin with its acknowledgement",
+            ),
             call,
           ))
       }
@@ -2545,7 +2591,8 @@ fn notification(
 ) -> Result(Notification, Error) {
   use message <- result.try(parse_frame(frame, call))
   case subscription_matches(message, id) {
-    False -> Error(MalformedResponse("a stream event is not correlated", call))
+    False ->
+      Error(Failed(MalformedResponse("a stream event is not correlated"), call))
     True ->
       case decode.run(message, decode.at(["method"], decode.string)) {
         Ok("notifications/tools/list_changed") ->
@@ -2557,12 +2604,15 @@ fn notification(
         Ok("notifications/resources/updated") ->
           decode.run(message, decode.at(["params", "uri"], decode.string))
           |> result.map(subscriptions.ResourceUpdated)
-          |> result.replace_error(MalformedResponse(
-            "a resource update has no uri",
+          |> result.replace_error(Failed(
+            MalformedResponse("a resource update has no uri"),
             call,
           ))
         _ ->
-          Error(MalformedResponse("a stream event has an unknown method", call))
+          Error(Failed(
+            MalformedResponse("a stream event has an unknown method"),
+            call,
+          ))
       }
   }
 }

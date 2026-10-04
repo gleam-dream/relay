@@ -5,6 +5,7 @@ import gleeunit/should
 import json/blueprint/value
 import relay/client
 import relay/content
+import relay/reason_support
 import relay/resources
 import relay/server
 import relay/testing
@@ -17,8 +18,8 @@ fn serve(resource: resources.Resource(Nil)) -> client.Client {
 }
 
 fn not_found(peer: client.Client, uri: String) -> Nil {
-  let assert Error(client.RpcError(-32_002, _, _, ..)) =
-    client.read_resource(peer, uri)
+  let assert Error(client.RpcError(-32_002, _, _)) =
+    client.read_resource(peer, uri) |> reason_support.of
   Nil
 }
 

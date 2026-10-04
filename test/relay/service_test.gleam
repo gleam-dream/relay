@@ -15,6 +15,7 @@ import relay/content
 import relay/internal/jsonrpc
 import relay/internal/subscriptions_state as subscription_state
 import relay/prompts
+import relay/reason_support
 import relay/reducer
 import relay/resources
 import relay/server
@@ -43,13 +44,13 @@ pub fn service_handler_errors_map_to_json_rpc_errors_test() {
       completion.completion(fn(_ctx: Nil, _request) { Error(Denied) }),
     )
   let peer = testing.connect(srv, Nil)
-  let assert Error(client.RpcError(-32_002, resource_message, _, ..)) =
-    client.read_resource(peer, "urn:private")
+  let assert Error(client.RpcError(-32_002, resource_message, _)) =
+    client.read_resource(peer, "urn:private") |> reason_support.of
   string.contains(resource_message, "Denied") |> should.be_false
-  let assert Error(client.RpcError(-32_602, prompt_message, _, ..)) =
-    client.get_prompt(peer, "private", dict.new())
+  let assert Error(client.RpcError(-32_602, prompt_message, _)) =
+    client.get_prompt(peer, "private", dict.new()) |> reason_support.of
   string.contains(prompt_message, "Denied") |> should.be_false
-  let assert Error(client.RpcError(-32_603, completion_message, _, ..)) =
+  let assert Error(client.RpcError(-32_603, completion_message, _)) =
     client.complete(
       peer,
       completion.Request(
@@ -59,22 +60,24 @@ pub fn service_handler_errors_map_to_json_rpc_errors_test() {
         dict.new(),
       ),
     )
+    |> reason_support.of
   string.contains(completion_message, "Denied") |> should.be_false
   // An unknown resource and an unknown prompt fail the same way.
-  let assert Error(client.RpcError(-32_002, _, _, ..)) =
-    client.read_resource(peer, "urn:missing")
-  let assert Error(client.RpcError(-32_602, _, _, ..)) =
-    client.get_prompt(peer, "missing", dict.new())
+  let assert Error(client.RpcError(-32_002, _, _)) =
+    client.read_resource(peer, "urn:missing") |> reason_support.of
+  let assert Error(client.RpcError(-32_602, _, _)) =
+    client.get_prompt(peer, "missing", dict.new()) |> reason_support.of
   client.close(peer)
 }
 
 pub fn completion_without_a_handler_is_method_not_found_test() {
   let peer = testing.connect(server.new([]), Nil)
-  let assert Error(client.RpcError(-32_601, _, _, ..)) =
+  let assert Error(client.RpcError(-32_601, _, _)) =
     client.complete(
       peer,
       completion.Request(completion.PromptReference("p"), "a", "", dict.new()),
     )
+    |> reason_support.of
   client.close(peer)
 }
 
@@ -512,8 +515,8 @@ pub fn prompt_arguments_meta_and_listing_test() {
     ),
   )
   // The handler's error is an invalid-params error.
-  let assert Error(client.RpcError(-32_602, _, _, ..)) =
-    client.get_prompt(peer, "review", dict.new())
+  let assert Error(client.RpcError(-32_602, _, _)) =
+    client.get_prompt(peer, "review", dict.new()) |> reason_support.of
   client.close(peer)
 }
 
@@ -601,13 +604,14 @@ pub fn prompt_call_runs_an_input_round_test() {
   |> should.be_true
 
   // A forged request state is refused.
-  let assert Error(client.RpcError(-32_602, _, _, ..)) =
+  let assert Error(client.RpcError(-32_602, _, _)) =
     client.call_raw(peer, "prompts/get", Some("asking"), [
       #("name", json.string("asking")),
       #("arguments", json.object([])),
       #("requestState", json.string("forged")),
       #("inputResponses", json.object([#("detail", json.object([]))])),
     ])
+    |> reason_support.of
   client.close(peer)
 }
 

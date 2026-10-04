@@ -316,40 +316,36 @@ recipe check uses the changed items; fabric has no Relay dependency yet.
 | `warden/README.md:193,217`, `warden/src/warden/resource.gleam:77,101` (doc recipe mirrored into `recipe.gleam`) | the same two verifier forms                                                         | the same changes; warden can map its audience failure to `IssuedForAnotherResource`                                                                                                                |
 | `oversight/playground/interface_lab`                                                                            | its own `lab/relay_*` modules and an older Relay API                                | not affected; it does not compile against the wave 4 API either                                                                                                                                    |
 
-## Round 7: every `client.Error` carries its call's correlation
+## Round 7: `client.Error` is opaque and carries its call's correlation
 
 secure_mcp found that a refused call, `Error(HttpStatus(401, _))`, does not
 say which correlation the call was sent with. A view without a correlation
 mints one per call, so the caller could not tie the failure to the server's
 rejection event or logs.
 
-| Item                                 | Before                                      | After                                                            |
-| ------------------------------------ | ------------------------------------------- | ---------------------------------------------------------------- |
-| `client.error_correlation`           | none                                        | `error_correlation(error: Error) -> Correlation` (added)         |
-| every `client.Error` variant         | `HttpStatus(status, www_authenticate)`, ... | each ends with `correlation: Correlation` (breaking, positional) |
-| `client.listen`, `next_notification` | errors carry no correlation                 | carry the stream's correlation                                   |
+| Item                                                         | Before                 | After                                                                             |
+| ------------------------------------------------------------ | ---------------------- | --------------------------------------------------------------------------------- |
+| `client.Error`                                               | a union of 16 variants | opaque: `Failed(reason, correlation)`, read with the accessors below (breaking)   |
+| `client.Reason`                                              | none                   | the 16 variants, with their original arities (added)                              |
+| `client.reason`                                              | none                   | `reason(error: Error) -> Reason` (added)                                          |
+| `client.error_correlation`                                   | none                   | `error_correlation(error: Error) -> Correlation` (added)                          |
+| `client.new_error`                                           | none                   | `new_error(reason: Reason, correlation: Correlation) -> Error` (added, for tests) |
+| `testing.error`                                              | none                   | `error(reason: client.Reason) -> client.Error`, with a fresh correlation (added)  |
+| `kind`, `evidence`, `is_retryable`, `name`, `describe_error` | take `Error`           | unchanged                                                                         |
 
-### The choice: an accessor over a field on every variant
+### The choice: an opaque `Error` over a field on every variant
 
-`Error` is a public union that callers match, and a Gleam variant cannot
-gain data without gaining a field, so no accessor can be added to the
-existing variants without changing their arity. A side channel (a process
-dictionary, a lookup table) would not survive a retry on another process
-and would hide the value from `string.inspect` and from equality. The change
-therefore does two things:
-
-- every variant ends with a labelled `correlation: Correlation`, the same
-  name and position (last) in all 16 variants, so a future variant follows
-  one rule;
-- `error_correlation(error)` reads it, so callers do not match 16 variants
-  to find it. Gleam cannot read a field shared by variants of different
-  arity, which is why the accessor is the supported way.
-
-Matches that bind the payload break once; the fix is mechanical. Matches
-that end in `..`, such as `RpcError(code: -32_602, ..)`, and every use of
-`kind`, `evidence`, `name`, `describe_error` and `is_retryable` are
-unaffected. The doc comment of `Error` already told callers to branch on
-`kind` and `evidence`; it now says to end payload patterns with `..`.
+A first version of this round added a trailing `correlation` field to each
+variant. That breaks every positional match now, and the next piece of
+per-call context (timing, a request id) would break them again. `Error` is
+now one opaque record of the failure and its call's context; the variants
+moved unchanged to `Reason`. Context grows by adding a field to the record
+and an accessor, and no match changes. Relay's other public types do not
+embed `client.Error` (the stream types, `Subscription` and `Continuation`,
+keep theirs internal), so nothing else changed shape. Code that must
+return or store an `Error` it did not receive, such as a fake client in a
+test, builds one with `testing.error(reason)`, or
+`client.new_error(reason, correlation)` for a chosen correlation.
 
 ```gleam
 // before
@@ -358,19 +354,29 @@ case client.discover(peer) {
   Error(client.TimedOut(client.MaybeSent)) -> retry()
   _ -> Nil
 }
-// after: `..` skips the correlation
+// after
 case client.discover(peer) {
-  Error(client.HttpStatus(401, Some(challenge), ..) as refused) -> {
-    log.warning(
-      "refused, correlation "
-      <> correlation.to_string(client.error_correlation(refused)),
-    )
-    reauthorize(challenge)
-  }
-  Error(client.TimedOut(client.MaybeSent, ..)) -> retry()
-  _ -> Nil
+  Error(error) ->
+    case client.reason(error) {
+      client.HttpStatus(401, Some(challenge)) -> {
+        log.warning(
+          "refused, correlation "
+          <> correlation.to_string(client.error_correlation(error)),
+        )
+        reauthorize(challenge)
+      }
+      client.TimedOut(client.MaybeSent) -> retry()
+      _ -> Nil
+    }
+  Ok(_) -> Nil
 }
 ```
+
+Every use of `kind`, `evidence`, `name`, `describe_error` and
+`is_retryable` is unaffected. A test that asserted `Error(client.RpcError(..))`
+matches the reason instead:
+`let assert Error(error) = client.call(..)` then
+`let assert client.RpcError(-32_602, ..) = client.reason(error)`.
 
 ### Which correlation an error carries
 
@@ -399,18 +405,21 @@ and round of one logical call. Views with `with_correlation` are unchanged.
 ### Dependents
 
 Grep of `/code/gleam-dream/*/{src,test,integrations,consumers,examples}`
-and `oversight/apps`, `oversight/playground` on 4 October 2026. Only
-positional patterns of the changed variants break; nothing else outside
-Relay constructs a `client.Error`.
+and `oversight/apps`, `oversight/playground` on 4 October 2026. Only code
+that matches a `client.Error` variant breaks, and only at the match; the
+siblings are not edited here.
 
-| Dependent                                                                          | Uses                                                                                            | Effect                                                                                                                                                           |
-| ---------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `oversight/apps/secure_mcp/src/secure_mcp.gleam:136`                               | `Error(mcp.HttpStatus(status, challenge))`                                                      | **breaks** (arity): `mcp.HttpStatus(status, challenge, correlation)`; read it with the pattern, or `error_correlation` and put it in the `refusal` text (SMCP-6) |
-| `oversight/apps/secure_mcp/test/secure_mcp_test.gleam:171,202,242,257,301,310,313` | `mcp.HttpStatus(401, Some(challenge))` patterns and one `==` against a constructed `HttpStatus` | **breaks** (arity): add `..`; the `==` at 171 cannot compare a correlation, so match the status and challenge and assert the correlation separately              |
-| `oversight/apps/tool_hub/test/tool_hub_test.gleam:692,727`                         | `client.Cancelled(client.MaybeSent)`, `client.TimedOut(client.MaybeSent)`                       | **breaks** (arity): add `, ..`                                                                                                                                   |
-| `oversight/apps/tool_hub/src/tool_hub.gleam:283`                                   | `client.describe_error(error)`                                                                  | compiles; can log `client.error_correlation(error)` beside it, which joins the inventory server's events (TH-7)                                                  |
-| `fabric/integrations/fabric_relay/test/serve_test.gleam:392`                       | `Error(client.TimedOut(_))`                                                                     | **breaks** (arity): `client.TimedOut(_, ..)`                                                                                                                     |
-| `fabric/integrations/fabric_relay/src/fabric_relay.gleam:165,295,299,319`          | `ListingFailed(client.Error)`, `CallFailed(client.Error)`, `describe_error`, `name`, `evidence` | compiles; its failure records can read `error_correlation` to name the call's correlation next to the run's                                                      |
-| `fabric/integrations/fabric_relay/test/remote_tool_test.gleam:335`                 | `client.evidence(error)`                                                                        | unaffected                                                                                                                                                       |
-| `oversight/playground/ecosystem_pilot`                                             | `client.InvalidInputResponses` and other pre-wave-4 names                                       | not affected; it already fails to compile against the wave 4 API                                                                                                 |
-| `warden/relay_consumer`, `oversight/apps/*` other than the two above               | no `client.Error` pattern                                                                       | not affected                                                                                                                                                     |
+| Dependent                                                                                 | Uses                                                                                            | Effect and exact replacement                                                                                                                                                                                                                                                                     |
+| ----------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `oversight/apps/secure_mcp/src/secure_mcp.gleam:136`                                      | `Error(mcp.HttpStatus(status, challenge)) -> ..` in `refusal`                                   | **breaks** (type): `Error(error) -> case mcp.reason(error) { mcp.HttpStatus(status, challenge) -> <existing text> <> " correlation=" <> correlation.to_string(mcp.error_correlation(error)); other -> "unexpected " <> string.inspect(other) }`; the outer `other ->` arm keeps `Ok(_)` (SMCP-6) |
+| `oversight/apps/secure_mcp/test/secure_mcp_test.gleam:88-93`                              | `fn refusal(..) -> mcp.Error` returning the discover error                                      | **breaks** (type) at every caller below: change the signature to `-> mcp.Reason` and return `mcp.reason(error)`; this one edit repairs the patterns and the `==` at 171                                                                                                                          |
+| `oversight/apps/secure_mcp/test/secure_mcp_test.gleam:171,202,242,257,301,310,313`        | `mcp.HttpStatus(..)` patterns and one `==` over `refusal(..)`                                   | compile unchanged once `refusal` returns `mcp.Reason`; to assert the correlation, return `#(mcp.reason(error), mcp.error_correlation(error))` instead and match the first element                                                                                                                |
+| `oversight/apps/tool_hub/test/tool_hub_test.gleam:692`                                    | `let assert Ok(Error(client.Cancelled(client.MaybeSent))) = process.receive(caller, 2000)`      | **breaks** (type): `let assert Ok(Error(error)) = process.receive(caller, 2000)` then `let assert client.Cancelled(client.MaybeSent) = client.reason(error)`                                                                                                                                     |
+| `oversight/apps/tool_hub/test/tool_hub_test.gleam:727`                                    | `let assert Error(client.TimedOut(client.MaybeSent)) = client.call(..)`                         | **breaks** (type): `let assert Error(error) = client.call(..)` then `let assert client.TimedOut(client.MaybeSent) = client.reason(error)`                                                                                                                                                        |
+| `oversight/apps/tool_hub/test/tool_hub_test.gleam:41,54,535`                              | `client.Error` in helper signatures                                                             | unaffected: the type name is unchanged                                                                                                                                                                                                                                                           |
+| `oversight/apps/tool_hub/src/tool_hub.gleam:283`                                          | `client.describe_error(error)`                                                                  | compiles; may log `client.error_correlation(error)` beside it, which joins the inventory server's events (TH-7)                                                                                                                                                                                  |
+| `fabric/integrations/fabric_relay/test/serve_test.gleam:392`                              | `let assert Error(client.TimedOut(_)) = client.call(peer, ask(), Question("slow"))`             | **breaks** (type): `let assert Error(error) = client.call(peer, ask(), Question("slow"))` then `let assert client.TimedOut(_) = client.reason(error)`                                                                                                                                            |
+| `fabric/integrations/fabric_relay/src/fabric_relay.gleam:153,165,184,295,299,305,319-320` | `ListingFailed(client.Error)`, `CallFailed(client.Error)`, `describe_error`, `name`, `evidence` | compiles unchanged: it stores and classifies the opaque error with the retained accessors; it may add `client.error_correlation(error)` to the `CallFailed` detail                                                                                                                               |
+| `fabric/integrations/fabric_relay/test/remote_tool_test.gleam:335`                        | `client.evidence(error)` on a `ListingFailed` error                                             | unaffected                                                                                                                                                                                                                                                                                       |
+| `oversight/playground/ecosystem_pilot`                                                    | `client.InvalidInputResponses` and other pre-wave-4 names                                       | not affected; it already fails to compile against the wave 4 API                                                                                                                                                                                                                                 |
+| `warden/relay_consumer`, other `oversight/apps/*`                                         | no `client.Error` pattern                                                                       | not affected                                                                                                                                                                                                                                                                                     |
