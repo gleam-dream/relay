@@ -143,7 +143,8 @@ pub fn url_config_admits_only_supported_components_test() {
   ]
   |> list.each(fn(url) {
     client.http(url)
-    |> should.equal(Error(client.InvalidConfig(client.Url)))
+    |> refused
+    |> should.equal(Ok(client.Url))
   })
   let assert Ok(_) = client.http("http://localhost")
   let assert Ok(_) = client.http("HTTP://localhost/")
@@ -168,19 +169,26 @@ pub fn configured_http_lifecycle_test() {
 
   // connect validates every setting before it starts anything.
   client.connect(client.with_ca_cert_file(config, "ca.pem"))
-  |> should.equal(Error(client.InvalidConfig(client.CaCertFile)))
+  |> refused
+  |> should.equal(Ok(client.CaCertFile))
   client.connect(client.with_timeout(config, duration.milliseconds(0)))
-  |> should.equal(Error(client.InvalidConfig(client.RequestTimeout)))
+  |> refused
+  |> should.equal(Ok(client.RequestTimeout))
   client.connect(client.with_connect_timeout(config, duration.milliseconds(0)))
-  |> should.equal(Error(client.InvalidConfig(client.ConnectTimeout)))
+  |> refused
+  |> should.equal(Ok(client.ConnectTimeout))
   client.connect(client.with_max_response_bytes(config, 0))
-  |> should.equal(Error(client.InvalidConfig(client.MaxResponseBytes)))
+  |> refused
+  |> should.equal(Ok(client.MaxResponseBytes))
   client.connect(client.with_listing_limits(config, 0, 10))
-  |> should.equal(Error(client.InvalidConfig(client.ListingLimits)))
+  |> refused
+  |> should.equal(Ok(client.ListingLimits))
   client.connect(client.with_listing_limits(config, 10, 0))
-  |> should.equal(Error(client.InvalidConfig(client.ListingLimits)))
+  |> refused
+  |> should.equal(Ok(client.ListingLimits))
   client.connect(client.with_max_pending_calls(config, 0))
-  |> should.equal(Error(client.InvalidConfig(client.MaxPendingCalls)))
+  |> refused
+  |> should.equal(Ok(client.MaxPendingCalls))
   http.stop(running)
 }
 
@@ -194,7 +202,7 @@ pub fn http_connect_is_lazy_test() {
   let assert Ok(peer) =
     client.connect(client.with_connect_timeout(config, duration.seconds(1)))
   let assert Error(error) = client.discover(peer)
-  error |> should.equal(client.ConnectFailed)
+  let assert client.ConnectFailed(_) = error
   client.evidence(error) |> should.equal(client.NotSent)
   client.close(peer)
 }
@@ -204,11 +212,14 @@ pub fn stdio_config_validates_and_hides_its_command_test() {
   string.contains(string.inspect(config), "relay-secret-argument")
   |> should.be_false
   client.connect(client.with_max_pending_calls(config, 0))
-  |> should.equal(Error(client.InvalidConfig(client.MaxPendingCalls)))
+  |> refused
+  |> should.equal(Ok(client.MaxPendingCalls))
   client.connect(client.with_ca_cert_file(config, "ca.pem"))
-  |> should.equal(Error(client.InvalidConfig(client.CaCertFile)))
+  |> refused
+  |> should.equal(Ok(client.CaCertFile))
   client.connect(client.with_timeout(config, duration.milliseconds(0)))
-  |> should.equal(Error(client.InvalidConfig(client.RequestTimeout)))
+  |> refused
+  |> should.equal(Ok(client.RequestTimeout))
 }
 
 // --- listener lifecycle -------------------------------------------------------
@@ -379,4 +390,16 @@ pub fn port_panics_for_a_mounted_handler_test() {
   let assert Ok(handler) = http.handler(http.new(empty_server()))
   let assert Error(_) = rescue(fn() { http.port(handler) })
   http.stop(handler)
+}
+
+// The setting a refused `http` or `connect` named; any other outcome is
+// reported by name.
+fn refused(
+  outcome: Result(a, client.Error),
+) -> Result(client.ConfigField, String) {
+  case outcome {
+    Error(client.InvalidConfig(field, _)) -> Ok(field)
+    Error(error) -> Error(client.name(error))
+    Ok(_) -> Error("accepted")
+  }
 }

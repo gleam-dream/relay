@@ -989,7 +989,7 @@ pub fn listen_streams_beyond_the_cap_get_503_test() {
   let #(rejected, attachment) = observe_rejections()
   let assert Ok(first) = client.listen(peer, [subscriptions.ToolsListChanged])
 
-  let assert Error(client.HttpStatus(503, _)) =
+  let assert Error(client.HttpStatus(503, _, ..)) =
     client.listen(peer, [subscriptions.ToolsListChanged])
   let meta = receive_rejection(rejected, telemetry.TooManyStreams)
   meta.status |> should.equal(503)
@@ -1222,9 +1222,9 @@ pub fn idempotency_key_view_reaches_the_handler_test() {
   plain.idempotency_key |> should.equal(None)
 
   // A key Relay cannot carry fails before it is sent.
-  let assert Error(client.InvalidArguments(_)) =
+  let assert Error(client.InvalidArguments(_, ..)) =
     client.call(client.with_idempotency_key(peer, "two words"), whoami(), Nil)
-  let assert Error(client.InvalidArguments(_)) =
+  let assert Error(client.InvalidArguments(_, ..)) =
     client.call(
       client.with_idempotency_key(peer, string.repeat("k", 129)),
       whoami(),

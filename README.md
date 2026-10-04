@@ -48,7 +48,8 @@ when the tool reported a failure, `Ok(InputRequired(..))` when the tool asks
 the client for input first, or `Error(client.Error)`. The error carries the
 HTTP status, the JSON-RPC error, or the transport failure with its
 submission evidence; branch on `client.kind(error)` and
-`client.evidence(error)`, and log `client.describe_error(error)`.
+`client.evidence(error)`, and log `client.describe_error(error)` with
+`client.error_correlation(error)`, the correlation the call was sent with.
 
 ## Serve over stdio
 
@@ -228,6 +229,27 @@ pub fn ask(
 
 The value is untrusted client input: Relay accepts 1 to 128 visible ASCII
 characters, ignores anything else, and never uses it to authorize.
+
+A failed call tells you which correlation it carried, including a minted
+one, so a refusal such as `HttpStatus(401, ..)` joins the server's rejection
+event and logs:
+
+```gleam
+case client.call(peer, definition, "Ada") {
+  Error(error) ->
+    log(
+      client.describe_error(error)
+      <> " correlation="
+      <> correlation.to_string(client.error_correlation(error)),
+    )
+  Ok(_) -> Nil
+}
+```
+
+Every `client.Error` variant ends with that `correlation`; match payloads
+with `..` (`HttpStatus(401, Some(challenge), ..)`). An error from
+`client.http` or `client.connect` precedes any call and carries a fresh
+correlation that no server saw.
 
 MCP `2026-07-28` has no session and no idempotency key, so Relay carries
 an optional one of its own, in `_meta` under
