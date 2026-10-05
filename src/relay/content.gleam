@@ -26,7 +26,9 @@
 //// }
 //// ```
 
+import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/string
 import json/blueprint/value.{type Value}
 
 /// The `_meta` object of a protocol value: its members. An empty
@@ -209,4 +211,17 @@ pub fn with_meta(block: ContentBlock, meta: Meta) -> ContentBlock {
       ResourceLinkBlock(ResourceLink(..link, meta: meta))
     EmbeddedResourceBlock(..) -> EmbeddedResourceBlock(..block, meta: meta)
   }
+}
+
+/// Join only the text blocks, in wire order, with newlines. Other content
+/// remains available on the original result; this is a text projection.
+pub fn text_of(blocks: List(ContentBlock)) -> String {
+  blocks
+  |> list.filter_map(fn(block) {
+    case block {
+      TextContent(text:, ..) -> Ok(text)
+      _ -> Error(Nil)
+    }
+  })
+  |> string.join("\n")
 }

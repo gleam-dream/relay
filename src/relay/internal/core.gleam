@@ -63,7 +63,7 @@ pub type InputRequest {
 
 /// What a handler returns: a result, or a request for another input round.
 pub type Reply(output) {
-  Complete(output: output, content: Option(List(ContentBlock)))
+  Complete(output: output, content: Option(List(ContentBlock)), meta: Meta)
   NeedsInput(requests: List(#(String, InputRequest)))
 }
 

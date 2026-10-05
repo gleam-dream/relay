@@ -1038,7 +1038,7 @@ pub fn perform(
       }
     PromptWork(prompt, arguments, request_state) ->
       case prompt.get(call, arguments) {
-        Ok(core.Complete(rendered, _)) ->
+        Ok(core.Complete(rendered, _, _)) ->
           Outcome(
             v2026.encode_prompts_get_response(id, rendered),
             telemetry.Succeeded,

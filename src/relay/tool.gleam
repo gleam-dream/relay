@@ -569,8 +569,15 @@ pub fn handle_call(
           Error(core.ToolError(blocks, structured)) ->
             core.Failed(blocks, structured)
           Ok(core.NeedsInput(requests)) -> core.AwaitingInput(requests)
-          Ok(core.Complete(value, blocks)) ->
-            encode_output(output, value, blocks)
+          Ok(core.Complete(value, blocks, meta)) ->
+            case encode_output(output, value, blocks), meta {
+              core.Completed(structured, blocks), [_, ..] ->
+                core.Completed(
+                  structured,
+                  list.map(blocks, content.with_meta(_, meta)),
+                )
+              outcome, _ -> outcome
+            }
         }
     }
   })
@@ -603,7 +610,15 @@ fn encode_output(
 /// A finished call. A structured tool also gets a text block that mirrors
 /// the encoded value, for clients that read only content.
 pub fn complete(output: output) -> Reply(output) {
-  core.Complete(output, None)
+  core.Complete(output, None, [])
+}
+
+/// A finished call whose generated content blocks carry `_meta`. Works
+/// for structured and content-only definitions, preserving their normal
+/// rendering. The supplied members replace each generated block's metadata.
+/// Useful for application request ids and links to asynchronous work.
+pub fn complete_with_meta(output: output, meta: content.Meta) -> Reply(output) {
+  core.Complete(output, None, meta)
 }
 
 /// A finished call with explicit content blocks instead of the text mirror.
@@ -611,7 +626,7 @@ pub fn complete_with_content(
   output: output,
   blocks: List(ContentBlock),
 ) -> Reply(output) {
-  core.Complete(output, Some(blocks))
+  core.Complete(output, Some(blocks), [])
 }
 
 /// Pauses the call until the client answers every request; the client calls

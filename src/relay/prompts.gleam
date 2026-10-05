@@ -121,8 +121,8 @@ pub fn prompt_call(
       case get(call, args) {
         Error(_) -> Error(Nil)
         Ok(core.NeedsInput(requests)) -> Ok(core.NeedsInput(requests))
-        Ok(core.Complete(rendered, blocks)) ->
-          Ok(core.Complete(encode_result(rendered), blocks))
+        Ok(core.Complete(rendered, blocks, meta)) ->
+          Ok(core.Complete(encode_result(rendered), blocks, meta))
       }
     },
   )
