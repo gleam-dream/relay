@@ -4,7 +4,8 @@
     disconnect_after_first_sse_event/4,
     send_and_hold/4,
     read_until/3,
-    abort_connection/1
+    abort_connection/1,
+    with_unlistened_port/1
 ]).
 
 %% A raw HTTP/1.1 client for the endpoint tests. It sends exactly the given
@@ -256,3 +257,15 @@ read_first_sse_event(Socket, Status, Acc) ->
 
 format(Reason) ->
     unicode:characters_to_binary(io_lib:format("~p", [Reason])).
+
+%% Reserve a loopback TCP port without listening. Connections are refused
+%% while the callback runs, and another test cannot reuse the same port.
+with_unlistened_port(Callback) ->
+    {ok, Socket} = socket:open(inet, stream, tcp),
+    try
+        ok = socket:bind(Socket, #{family => inet, addr => {127, 0, 0, 1}, port => 0}),
+        {ok, #{port := Port}} = socket:sockname(Socket),
+        Callback(Port)
+    after
+        socket:close(Socket)
+    end.

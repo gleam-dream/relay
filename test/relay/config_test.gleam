@@ -194,12 +194,13 @@ pub fn configured_http_lifecycle_test() {
   http.stop(running)
 }
 
+@external(erlang, "relay_http_ffi", "with_unlistened_port")
+fn with_unlistened_port(callback: fn(Int) -> a) -> a
+
 pub fn http_connect_is_lazy_test() {
-  let assert Ok(running) = http.start(http.new(empty_server()))
-  let port = http.port(running)
-  http.stop(running)
-  // Nothing listens on the port now; connect still succeeds and the first
-  // call reports that nothing was sent.
+  // Keep the port bound without listening through the whole call. This
+  // avoids racing a stopped listener's socket closure or port reuse.
+  use port <- with_unlistened_port
   let assert Ok(config) = client.http(url(port))
   let assert Ok(peer) =
     client.connect(client.with_connect_timeout(config, duration.seconds(1)))
