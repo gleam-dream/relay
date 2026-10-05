@@ -351,3 +351,32 @@ nix develop --command ./scripts/verify_checksums.sh
 ./scripts/conformance/run-server-suite.sh
 nix flake check
 ```
+
+## Composing typed tool calls
+
+`relay/client/output` is an optional convenience boundary for non-interactive
+callers that need the native answer:
+
+```gleam
+let result = client.call(peer, definition, input) |> output.require
+case result {
+  Ok(answer) -> use_answer(answer)
+  Error(error) -> {
+    output.error_kind(error)  // transport failure, tool refusal, needs input
+    output.evidence(error)    // preserves MaybeSent, NotSent or Completed
+    output.describe_error(error)
+  }
+}
+```
+
+Keep the original `client.ToolResult` for input continuations or media content.
+For discovered tools, `output.require_discovered(result, declaration)` keeps
+structured JSON or explicitly projects content-only text to a JSON string.
+`content.text_of` joins text blocks; `output.meta(result, key)` reads application
+metadata without assuming any ecosystem-specific key.
+
+A handler can return `tool.complete_with_meta(answer, metadata)` to attach
+application ids to its generated content blocks, including the normal text
+mirror of structured answers. These are Relay capabilities; composition with
+other libraries remains application code. Fabric documents compiled recipes
+in its README and consumer package.

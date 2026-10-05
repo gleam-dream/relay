@@ -423,3 +423,46 @@ siblings are not edited here.
 | `fabric/integrations/fabric_relay/test/remote_tool_test.gleam:335`                        | `client.evidence(error)` on a `ListingFailed` error                                             | unaffected                                                                                                                                                                                                                                                                                       |
 | `oversight/playground/ecosystem_pilot`                                                    | `client.InvalidInputResponses` and other pre-wave-4 names                                       | not affected; it already fails to compile against the wave 4 API                                                                                                                                                                                                                                 |
 | `warden/relay_consumer`, other `oversight/apps/*`                                         | no `client.Error` pattern                                                                       | not affected                                                                                                                                                                                                                                                                                     |
+
+## Round 9: ports for consumer composition
+
+No existing public function was removed. The internal reply representation
+now carries optional block metadata; it is opaque publicly and no persisted
+record format uses it.
+
+```gleam
+// Before: each caller flattens Succeeded / ToolFailed / InputRequired.
+case client.call(peer, definition, input) { ... }
+// After: keep native answers and a typed output boundary.
+client.call(peer, definition, input) |> output.require
+```
+
+`relay/client/output.Error` retains `CallFailed(client.Error)`, a refusal's
+content and structured value, or `InputRequired`. Use `error_kind`, `evidence`
+and `describe_error`; it never turns a possibly sent call into a definite
+failure. Interactive callers continue using `client.ToolResult` and `resume`.
+
+```gleam
+// Before: project discovered content and flatten errors in consumer code.
+client.call_discovered(peer, declaration, arguments) |> application_projection
+// After: an explicit text projection; structured JSON is unchanged.
+client.call_discovered(peer, declaration, arguments)
+  |> output.require_discovered(declaration)
+// Before: filter TextContent and join manually; scan _meta manually.
+// After:
+content.text_of(blocks)
+output.meta(result, "my-app/request-id")
+```
+
+```gleam
+// Before: manually encode the output and construct a matching text block.
+tool.complete_with_content(answer, [content.text(encoded) |> content.with_meta(meta)])
+// After: normal rendering with metadata, structured or content-only.
+tool.complete_with_meta(answer, meta)
+```
+
+The metadata replaces generated block metadata. Existing `complete` and
+`complete_with_content` behavior stays unchanged. Fabric's unpublished
+`consumers/relay_tools` and oversight's `apps/tool_hub` use these ports; Relay
+imports no fabric types. The published package count falls through removal of
+consumer bridges, not through a new cross-library dependency.

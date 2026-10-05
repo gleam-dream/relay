@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Round 9: add `relay/client/output` for typed output extraction, stable error
+  classification, submission evidence and metadata lookup. Discovered calls
+  can explicitly project content-only replies to text.
+- Add `tool.complete_with_meta` and `content.text_of`. Reply metadata preserves
+  normal structured mirrors and works for content-only definitions. These
+  ports support consumer recipes without depending on fabric.
+- Refresh sibling revision pins to the locally validated heads.
+
 Relay has no published release yet. This section describes the first
 release candidate. Wave 4 redesigned the public API before publication; the
 [wave 4 migration guide](docs/migration-wave-4.md) lists every removed and
