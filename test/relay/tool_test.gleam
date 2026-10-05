@@ -359,7 +359,7 @@ pub fn schema_override_changes_discovery_but_codec_still_validates_test() {
   listed.input_schema |> should.equal(override)
   let assert Error(client.RpcError(-32_602, _, _)) =
     client.call_discovered(peer, listed, value.Object([])) |> reason_support.of
-  let assert Ok(client.Succeeded(value.String("go"), _)) =
+  let assert Ok(client.Succeeded(Some(value.String("go")), _)) =
     client.call_discovered(
       peer,
       listed,
@@ -605,7 +605,7 @@ pub fn exact_blueprint_number_preservation_test() {
       tool.declaration(definition),
       value.Object([#("num", value.Number(parsed))]),
     )
-  output |> should.equal(value.Number(parsed))
+  output |> should.equal(Some(value.Number(parsed)))
   let assert Ok(client.Succeeded(typed, _)) =
     client.call(peer, definition, parsed)
   typed |> should.equal(parsed)
@@ -681,7 +681,7 @@ pub fn content_only_tool_does_not_need_output_codec_test() {
     Ok(client.Succeeded([content.text("hello")], [content.text("hello")])),
   )
   // A discovered call of a content-only tool has no structured value.
-  let assert Ok(client.Succeeded(value.Null, [_])) =
+  let assert Ok(client.Succeeded(None, [_])) =
     client.call_discovered(
       peer,
       tool.declaration(definition),

@@ -803,7 +803,7 @@ pub fn http_client_discovery_and_typed_calls_test() {
   let assert Ok(declarations) = client.list_tools(peer)
   let assert [exact_declaration] =
     list.filter(declarations, fn(declaration) { declaration.name == "exact" })
-  let assert Ok(client.Succeeded(value.Number(discovered), _)) =
+  let assert Ok(client.Succeeded(Some(value.Number(discovered)), _)) =
     client.call_discovered(
       peer,
       exact_declaration,
@@ -943,17 +943,17 @@ pub fn call_discovered_and_listing_bounds_are_explicit_test() {
   let assert Ok(declarations) = client.list_tools(peer)
   let assert [echo_declaration] =
     list.filter(declarations, fn(declaration) { declaration.name == "echo" })
-  let assert Ok(client.Succeeded(value.String("hello remote"), [block])) =
+  let assert Ok(client.Succeeded(Some(value.String("hello remote")), [block])) =
     client.call_discovered(
       peer,
       echo_declaration,
       value.Object([#("name", value.String("remote"))]),
     )
   let assert True = block == content.text("hello remote")
-  // A content-only result has a Null output.
+  // A content-only result has no structured output.
   let assert [say_declaration] =
     list.filter(declarations, fn(declaration) { declaration.name == "say" })
-  let assert Ok(client.Succeeded(value.Null, _)) =
+  let assert Ok(client.Succeeded(None, _)) =
     client.call_discovered(
       peer,
       say_declaration,
@@ -1170,7 +1170,7 @@ pub fn discovered_and_typed_tool_continuations_retain_state_test() {
       declaration,
       value.Object([#("name", value.String("dynamic"))]),
     )
-  let assert Ok(client.Succeeded(value.String("continued dynamic"), [_])) =
+  let assert Ok(client.Succeeded(Some(value.String("continued dynamic")), [_])) =
     client.resume(dynamic_continuation, replies)
   client.close(peer)
   http.stop(handler)

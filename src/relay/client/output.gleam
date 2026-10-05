@@ -6,11 +6,10 @@
 //// read-only hint and the application's policy.
 
 import gleam/list
-import gleam/option.{type Option, None}
+import gleam/option.{type Option, None, Some}
 import json/blueprint/value.{type Value}
 import relay/client
 import relay/content
-import relay/tool
 
 /// One error boundary for callers requiring a tool's output.
 pub type Error {
@@ -91,13 +90,17 @@ pub fn meta(result: client.ToolResult(a), key: String) -> Option(Value) {
 /// Extract a discovered tool's structured value, or project a content-only
 /// answer to a JSON string of its text blocks. Only use this projection
 /// when text is sufficient; `call_discovered` retains all media blocks.
+/// An explicit structured null remains null, regardless of output schema.
 pub fn require_discovered(
-  result: Result(client.ToolResult(Value), client.Error),
-  declaration: tool.Declaration,
+  result: Result(client.ToolResult(Option(Value)), client.Error),
 ) -> Result(Value, Error) {
-  case result, declaration.output_schema {
-    Ok(client.Succeeded(value.Null, blocks)), None ->
+  case result {
+    Ok(client.Succeeded(None, blocks)) ->
       Ok(value.String(content.text_of(blocks)))
-    other, _ -> require(other)
+    Ok(client.Succeeded(Some(structured), _)) -> Ok(structured)
+    Ok(client.ToolFailed(blocks, structured)) ->
+      Error(ToolFailed(blocks, structured))
+    Ok(client.InputRequired(..)) -> Error(InputRequired)
+    Error(error) -> Error(CallFailed(error))
   }
 }

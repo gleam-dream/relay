@@ -1781,13 +1781,15 @@ fn output_decoder(
 }
 
 /// Calls a tool known from `list_tools` with exact JSON arguments, which
-/// must be an object; the output is the exact structured value, or `Null`
-/// for a content-only result.
+/// must be an object. The output preserves structured-content presence:
+/// `None` when absent, `Some(value.Null)` for explicit JSON null, and
+/// `Some(value)` for any other structured value. Content blocks are retained
+/// in every case, independently of the declaration's output schema.
 pub fn call_discovered(
   client: Client,
   declaration: tool.Declaration,
   arguments: Value,
-) -> Result(ToolResult(Value), Error) {
+) -> Result(ToolResult(Option(Value)), Error) {
   let #(client, call) = call_correlation(client)
   case arguments {
     value.Object(_) ->
@@ -1797,7 +1799,7 @@ pub fn call_discovered(
         wire.value_to_json(arguments),
         None,
         None,
-        fn(structured, _) { Ok(option.unwrap(structured, value.Null)) },
+        fn(structured, _) { Ok(structured) },
       )
     _ ->
       Error(Failed(
