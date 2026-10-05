@@ -447,7 +447,7 @@ failure. Interactive callers continue using `client.ToolResult` and `resume`.
 client.call_discovered(peer, declaration, arguments) |> application_projection
 // After: an explicit text projection; structured JSON is unchanged.
 client.call_discovered(peer, declaration, arguments)
-  |> output.require_discovered(declaration)
+  |> output.require_discovered
 // Before: filter TextContent and join manually; scan _meta manually.
 // After:
 content.text_of(blocks)
@@ -466,3 +466,35 @@ The metadata replaces generated block metadata. Existing `complete` and
 `consumers/relay_tools` and oversight's `apps/tool_hub` use these ports; Relay
 imports no fabric types. The published package count falls through removal of
 consumer bridges, not through a new cross-library dependency.
+
+### Round 9 review: preserve discovered reply presence
+
+`client.call_discovered` now returns `Result(ToolResult(Option(Value)), Error)`.
+The same output type survives every `client.resume` round. A present JSON null
+is a value; an absent `structuredContent` member is `None`. An output schema
+cannot establish which member the server actually sent.
+
+```gleam
+// Before: absence and explicit JSON null were both Succeeded(value.Null, blocks).
+let assert Ok(client.Succeeded(value, blocks)) =
+  client.call_discovered(peer, declaration, arguments)
+// After: preserve the distinction when inspecting the reply.
+let assert Ok(client.Succeeded(structured, blocks)) =
+  client.call_discovered(peer, declaration, arguments)
+case structured {
+  None -> handle_content(blocks)
+  Some(value) -> handle_structured(value) // value.Null remains explicit null.
+}
+// Before: schema-dependent projection could replace explicit null with text.
+client.call_discovered(peer, declaration, arguments)
+  |> output.require_discovered(declaration)
+// After: only absent structured content becomes a JSON string of text blocks.
+client.call_discovered(peer, declaration, arguments)
+  |> output.require_discovered
+```
+
+Typed `client.call`, content blocks, metadata and failure evidence are unchanged.
+Dependents: fabric's discovery recipe (README, module docs and consumer) and
+oversight's tool_hub copy remove the declaration argument. Direct discovered
+callers match `Some(value)` or `None`; callers using the projection still
+receive `Result(Value, output.Error)`.

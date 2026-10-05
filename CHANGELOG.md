@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Round 9 review: discovered calls now preserve absent structured content as
+  `None` and explicit JSON null as `Some(value.Null)`, including continuations.
+  `output.require_discovered` no longer takes a declaration; only actual
+  absence triggers its text projection. Typed `client.call` is unchanged.
+
 - Round 9: add `relay/client/output` for typed output extraction, stable error
   classification, submission evidence and metadata lookup. Discovered calls
   can explicitly project content-only replies to text.

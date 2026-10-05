@@ -370,8 +370,11 @@ case result {
 ```
 
 Keep the original `client.ToolResult` for input continuations or media content.
-For discovered tools, `output.require_discovered(result, declaration)` keeps
-structured JSON or explicitly projects content-only text to a JSON string.
+For discovered tools, `client.call_discovered` returns `ToolResult(Option(Value))`:
+`None` means no structured content; `Some(value.Null)` means explicit JSON null.
+`output.require_discovered(result)` keeps every present structured value and
+projects content-only text to a JSON string only when structured content is
+absent. This choice does not depend on the declaration's output schema.
 `content.text_of` joins text blocks; `output.meta(result, key)` reads application
 metadata without assuming any ecosystem-specific key.
 
