@@ -498,3 +498,24 @@ Dependents: fabric's discovery recipe (README, module docs and consumer) and
 oversight's tool_hub copy remove the declaration argument. Direct discovered
 callers match `Some(value)` or `None`; callers using the projection still
 receive `Result(Value, output.Error)`.
+
+### Round 9: intentional listener shutdown
+
+`http.stop` keeps the same signature and five-second wait bound. Previously,
+the listener's intentional shutdown could terminate the linked endpoint and
+its caller, depending on process scheduling. The endpoint now removes that
+link before requesting listener shutdown. Unexpected listener failure remains
+linked to the endpoint and caller.
+
+Before and after, callers use the same code:
+
+```gleam
+let assert Ok(endpoint) = http.start(http.new(service))
+// Serve requests.
+http.stop(endpoint)
+// Continue the caller's work.
+```
+
+No consumer or recipe changes are needed. The correction adds no process,
+monitor, timeout or configuration. Two public API lifecycle tests cover
+intentional shutdown and unexpected listener failure.

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Keep the caller alive when `http.stop` intentionally shuts down its linked
+  listener. Unexpected listener failures still propagate through the link.
+
 - Round 9 review: discovered calls now preserve absent structured content as
   `None` and explicit JSON null as `Some(value.Null)`, including continuations.
   `output.require_discovered` no longer takes a declaration; only actual

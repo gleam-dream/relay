@@ -43,6 +43,9 @@ pub fn main() {
 }
 ```
 
+`http.stop` closes the endpoint without terminating its linked caller. An
+unexpected listener failure still propagates through that link.
+
 `client.call` returns `Ok(Succeeded(output, content))`, `Ok(ToolFailed(..))`
 when the tool reported a failure, `Ok(InputRequired(..))` when the tool asks
 the client for input first, or `Error(client.Error)`. The opaque error
