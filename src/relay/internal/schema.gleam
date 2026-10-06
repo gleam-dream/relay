@@ -35,9 +35,9 @@ pub fn validate_output_schema(
   }
 }
 
-/// Checks if a schema represents an object-like structure. Fails closed: the
-/// any schema, and a kind this package does not know, is accepted only when
-/// its document declares `"type": "object"`.
+/// Accepts `ObjectSchema` and `UnionSchema` for tool arguments. `OtherSchema`
+/// must declare `"type": "object"` in its document. `AnySchema` and all
+/// remaining schema views are rejected.
 pub fn is_object_schema(schema: Schema) -> Bool {
   case codec.view(schema) {
     codec.ObjectSchema(_) -> True
