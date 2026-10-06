@@ -25,6 +25,7 @@ import relay/http
 import relay/prompts
 import relay/resources
 import relay/server
+import relay/subscriptions
 import relay/tool
 
 const png_1x1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p2sAAAAASUVORK5CYII="
@@ -37,7 +38,7 @@ fn bytes(base64: String) -> BitArray {
 }
 
 pub fn main() -> Nil {
-  let assert Ok(listener) = http.start(http.new(conformance_server()))
+  let listener = start()
   io.println(
     "RELAY_CONFORMANCE_URL=http://127.0.0.1:"
     <> int.to_string(http.port(listener))
@@ -46,12 +47,49 @@ pub fn main() -> Nil {
   keep_alive()
 }
 
+/// Starts the unpublished fixture; the caller owns and stops its endpoint.
+pub fn start() -> http.Handler(Nil) {
+  let assert Ok(listener) = http.start(http.new(conformance_server()))
+  let assert Ok(Nil) =
+    http.register_tool(
+      listener,
+      tool.define("test_trigger_tool_change", no_input(), no_input())
+        |> tool.with_description(
+          "Mutates the live tool catalog for notification checks",
+        )
+        |> tool.handle(fn(_) {
+          let _ = http.unregister_tool(listener, "conformance_added_tool")
+          http.register_tool(
+            listener,
+            content_tool("conformance_added_tool", [
+              content.text("Added by the fixture owner."),
+            ]),
+          )
+          |> result.map_error(fn(_) { Nil })
+        }),
+    )
+  let assert Ok(Nil) =
+    http.register_tool(
+      listener,
+      tool.define("test_trigger_prompt_change", no_input(), no_input())
+        |> tool.with_description(
+          "Publishes the owner prompt notification for stream checks",
+        )
+        |> tool.handle(fn(_) {
+          // The endpoint owner explicitly publishes the offered prompt signal.
+          http.notify(listener, subscriptions.PromptsListChanged)
+          Ok(Nil)
+        }),
+    )
+  listener
+}
+
 fn keep_alive() -> Nil {
   process.sleep(60_000)
   keep_alive()
 }
 
-fn conformance_server() -> server.Server(Nil) {
+pub fn conformance_server() -> server.Server(Nil) {
   let text_resource =
     resources.static("test://static-text", "Static Text", fn(_context, uri) {
       Ok([
@@ -261,9 +299,9 @@ fn test_tools() -> List(tool.Tool(Nil)) {
       |> tool.handle(fn(_) { Ok(Nil) }),
     progress_tool("test_streaming_elicitation", [10.0, 20.0]),
     input_required_tool("test_input_required_result_elicitation", fn(responses) {
-      case dict.is_empty(responses) {
-        False -> Ok(tool.complete(Nil))
-        True ->
+      case accepted_name_response(responses) {
+        True -> Ok(tool.complete(Nil))
+        False ->
           Ok(
             tool.request_input(
               dict.from_list([
@@ -413,6 +451,23 @@ fn input_required_tool(
   tool.define(name, no_input(), no_input())
   |> tool.with_description("Input continuation fixture for the pinned suite")
   |> tool.handle_call(fn(call, _) { handler(tool.input_responses(call)) })
+}
+
+fn accepted_name_response(responses: dict.Dict(String, Value)) -> Bool {
+  case dict.get(responses, "user_name") {
+    Ok(value.Object(fields)) -> {
+      let fields = dict.from_list(fields)
+      case dict.get(fields, "action"), dict.get(fields, "content") {
+        Ok(value.String("accept")), Ok(value.Object(content)) ->
+          case dict.get(dict.from_list(content), "name") {
+            Ok(value.String(_)) -> True
+            _ -> False
+          }
+        _, _ -> False
+      }
+    }
+    _ -> False
+  }
 }
 
 fn confirm_tool(name: String) -> tool.Tool(Nil) {

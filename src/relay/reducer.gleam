@@ -511,7 +511,7 @@ fn route(
             state,
             exchange,
             None,
-            jsonrpc.error_to_json(Some(id), jsonrpc.resource_not_found()),
+            jsonrpc.error_to_json(Some(id), jsonrpc.resource_not_found(uri)),
           )
         Ok(read) ->
           start(
@@ -1032,7 +1032,7 @@ pub fn perform(
           )
         Error(Nil) ->
           Outcome(
-            jsonrpc.error_to_json(Some(id), jsonrpc.resource_not_found()),
+            jsonrpc.error_to_json(Some(id), jsonrpc.resource_not_found(uri)),
             telemetry.Failed,
           )
       }

@@ -327,15 +327,47 @@ in its README and consumer package.
 
 ## Verification
 
-Run these commands from the Relay checkout.
+Run the shared registry from the Relay checkout:
 
 ```bash
-nix develop --command gleam format --check src test dev
-nix develop --command gleam build --warnings-as-errors
-nix develop --command gleam test
-nix develop --command python3 scripts/check_negative_fixtures.py
-nix develop --command python3 scripts/relay_schema_check.py
-nix develop --command ./scripts/verify_checksums.sh
-./scripts/conformance/run-server-suite.sh
-nix flake check
+nix develop --command python3 -B scripts/check.py fast
+nix develop --command python3 -B scripts/check.py full
 ```
+
+| Profile  | Obligations and evidence                                                                                                                         |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `fast`   | Tree formatting, Ruff correctness lint, ShellCheck, actionlint, gate regressions, strict native/Gleam build and all root/consumer tests.         |
+| `ci`     | All fast checks plus paired compiler controls, jsonschema 4.26.0 frozen corpus/mutations, checksums/pins and the complete official server suite. |
+| `design` | Native render freshness, vocabulary, links and layer integrity.                                                                                  |
+| `full`   | All `ci` and `design` obligations.                                                                                                               |
+
+Builds use Gleam warnings as errors and independently compile authored Erlang
+under `src`, `test` and `dev` with `erlc -Werror` and dependency includes.
+Generated dependencies, frozen MCP/TLS fixtures, the pnpm lockfile and deliberate
+negative compiler fixtures are excluded from authored formatting/lint. Ruff checks
+syntax/imports/undefined names; it is not a Python type checker. Shell checks
+include authored extensionless stdio peers. Gates check the
+tree without repairing it. No benchmark harness or latency claim is introduced.
+
+The server check invokes `scripts/conformance/run-server-suite.sh` with the
+frozen pnpm lock, `@modelcontextprotocol/conformance` 0.2.0-alpha.10, all server
+scenarios and spec 2026-07-28. It retains structured results and the local
+server log on success or failure. A machine-result validator requires every
+selected scenario, rejects missing/skipped cases, failures/warnings and empty
+selections, and requires assertions from every selected scenario. Emitted server
+assertions establish their tested scope; zero-assertion output establishes no
+coverage and fails the gate. Client,
+authorization and legacy certification require separate evidence.
+
+Push, pull request and manual CI require both registry jobs. Profiles retain
+per-check logs, results, dependency revisions and environment/lock metadata in
+`.artifacts/PROFILE`; conformance results/server logs live inside its `server-suite`
+directory, with a separate run directory and machine summary per invocation.
+Existing direct script commands remain available for focused work.
+
+Private Sinal and HTTP Gun checkout requires `vars.SIBLINGS_APP_CLIENT_ID` with
+`secrets.SIBLINGS_APP_PRIVATE_KEY`, or `secrets.SIBLINGS_READ_TOKEN` restricted to
+those two repositories. Public JSON Blueprint uses ordinary checkout. All
+siblings use immutable `sibling-revisions.txt` refs; credentials are not persisted.
+Fork pull requests receive no private credential and fail explicitly; verify
+their changes from a trusted repository branch.

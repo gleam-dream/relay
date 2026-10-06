@@ -1,74 +1,121 @@
-name: Test
-on: [push, pull_request]
+name: CI
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
-  test:
+  verification:
+    name: Full verification
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - name: Require trusted access to private sibling sources
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "Fork pull requests cannot access private Sinal and HTTP Gun sources. Run verification on a trusted repository branch." >&2
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: relay
-      # gleam.toml reaches json_blueprint, sinal and http_gun through ../ path
-      # dependencies, so CI checks out each sibling beside relay at the commit
-      # recorded in sibling-revisions.txt.
-      - name: Read pinned sibling revisions
+          persist-credentials: false
+      - name: Validate the complete pinned sibling revisions
+        id: pins
+        run: python3 -B relay/scripts/check.py pins >> "$GITHUB_OUTPUT"
+      - name: Read token for private Sinal and HTTP Gun sources
         id: siblings
-        run: |
-          echo "json_blueprint=$(grep '^json_blueprint=' relay/sibling-revisions.txt | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-          echo "sinal=$(grep '^sinal=' relay/sibling-revisions.txt | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-          echo "http_gun=$(grep '^http_gun=' relay/sibling-revisions.txt | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
+        if: vars.SIBLINGS_APP_CLIENT_ID != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          repository: lostbean/json_blueprint
-          ref: ${{ steps.siblings.outputs.json_blueprint }}
-          path: json_blueprint
-      # gleam-dream/sinal is private, and the default GITHUB_TOKEN reads only
-      # this repository. SIBLINGS_READ_TOKEN must hold a token with read
-      # access to gleam-dream/sinal.
-      - uses: actions/checkout@v4
+          client-id: ${{ vars.SIBLINGS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SIBLINGS_APP_PRIVATE_KEY }}
+          owner: gleam-dream
+          repositories: sinal,http_gun
+          permission-contents: read
+      - name: Require private-source credentials before sibling checkout
+        env:
+          SIBLINGS_TOKEN: ${{ steps.siblings.outputs.token || secrets.SIBLINGS_READ_TOKEN }}
+        run: |
+          if [ -z "$SIBLINGS_TOKEN" ]; then
+            echo "Configure vars.SIBLINGS_APP_CLIENT_ID with secrets.SIBLINGS_APP_PRIVATE_KEY, or secrets.SIBLINGS_READ_TOKEN, for read access to Sinal and HTTP Gun." >&2
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: gleam-dream/sinal
-          ref: ${{ steps.siblings.outputs.sinal }}
+          ref: ${{ steps.pins.outputs.sinal }}
           path: sinal
-          token: ${{ secrets.SIBLINGS_READ_TOKEN || github.token }}
-      # gleam-dream/http_gun is private too; the same token reads it.
-      - uses: actions/checkout@v4
+          token: ${{ steps.siblings.outputs.token || secrets.SIBLINGS_READ_TOKEN }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: gleam-dream/http_gun
-          ref: ${{ steps.siblings.outputs.http_gun }}
+          ref: ${{ steps.pins.outputs.http_gun }}
           path: http_gun
-          token: ${{ secrets.SIBLINGS_READ_TOKEN || github.token }}
-      - uses: erlef/setup-beam@v1
+          token: ${{ steps.siblings.outputs.token || secrets.SIBLINGS_READ_TOKEN }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          otp-version: "28"
-          gleam-version: "1.18.1"
-          rebar3-version: "3.27.0"
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - run: pip install jsonschema==4.26.0
-      - run: gleam deps download
-        working-directory: relay
-      - run: gleam format --check src test dev
-        working-directory: relay
-      - run: gleam build --warnings-as-errors
-        working-directory: relay
-      - run: gleam test
-        working-directory: relay
-      - run: python3 scripts/check_negative_fixtures.py
-        working-directory: relay
-      - run: python3 scripts/relay_schema_check.py
-        working-directory: relay
-      - run: ./scripts/verify_checksums.sh
-        working-directory: relay
-
-  design:
-    name: Design layer
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v31
+          repository: lostbean/json_blueprint
+          ref: ${{ steps.pins.outputs.json_blueprint }}
+          path: json_blueprint
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
         with:
           extra_nix_config: experimental-features = nix-command flakes
-      - run: nix run .#design-gate-check -- docs/design .
+      - name: Runtime, frozen schema and official MCP server checks
+        working-directory: relay
+        run: nix develop --no-update-lock-file -c python3 -B scripts/check.py ci
+      - name: Retain runtime evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: relay-verification
+          path: relay/.artifacts/ci/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+  design:
+    name: Design layers
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+      - run: nix develop --no-update-lock-file -c python3 -B scripts/check.py design
+      - name: Retain design evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: relay-design
+          path: .artifacts/design/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+  ci:
+    name: CI
+    needs: [verification, design]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every mandatory result
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          results = json.loads(os.environ['RESULTS'])
+          failures = {job: value['result'] for job, value in results.items() if value['result'] != 'success'}
+          if not results or failures:
+              raise SystemExit(f'Required jobs did not succeed: {failures}')
+          PY

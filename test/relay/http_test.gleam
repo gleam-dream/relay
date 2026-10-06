@@ -375,7 +375,11 @@ pub fn streamable_http_loopback_test() {
       ),
       resource_read,
     )
-  should.be_true(string.contains(text(missing_resource), "-32002"))
+  should.be_true(string.contains(text(missing_resource), "-32602"))
+  should.be_true(string.contains(
+    text(missing_resource),
+    "\"uri\":\"memory://missing/1\"",
+  ))
   let prompt_get =
     envelope("prompts/get", True, [
       #("name", json.string("missing")),

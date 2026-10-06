@@ -25,4 +25,7 @@ for line in sys.stdin:
         }
         if reply != "absent":
             result["structuredContent"] = json.loads(reply)
-    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+    print(
+        json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}),
+        flush=True,
+    )

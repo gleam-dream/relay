@@ -44,7 +44,7 @@ pub fn service_handler_errors_map_to_json_rpc_errors_test() {
       completion.completion(fn(_ctx: Nil, _request) { Error(Denied) }),
     )
   let peer = testing.connect(srv, Nil)
-  let assert Error(client.RpcError(-32_002, resource_message, _)) =
+  let assert Error(client.RpcError(-32_602, resource_message, _)) =
     client.read_resource(peer, "urn:private") |> reason_support.of
   string.contains(resource_message, "Denied") |> should.be_false
   let assert Error(client.RpcError(-32_602, prompt_message, _)) =
@@ -63,7 +63,7 @@ pub fn service_handler_errors_map_to_json_rpc_errors_test() {
     |> reason_support.of
   string.contains(completion_message, "Denied") |> should.be_false
   // An unknown resource and an unknown prompt fail the same way.
-  let assert Error(client.RpcError(-32_002, _, _)) =
+  let assert Error(client.RpcError(-32_602, _, _)) =
     client.read_resource(peer, "urn:missing") |> reason_support.of
   let assert Error(client.RpcError(-32_602, _, _)) =
     client.get_prompt(peer, "missing", dict.new()) |> reason_support.of
@@ -682,5 +682,24 @@ pub fn completion_values_keeps_the_first_hundred_test() {
   received.values |> should.equal(list.take(many, 100))
   received.total |> should.equal(Some(150))
   received.has_more |> should.equal(Some(True))
+  client.close(peer)
+}
+
+/// Both unknown resources and private reader failures retain the requested URI.
+pub fn modern_resource_errors_include_uri_without_private_failure_test() {
+  let srv =
+    server.new([])
+    |> server.with_resources([
+      resources.static("urn:private", "private", fn(_ctx: Nil, _uri) {
+        Error(Denied)
+      }),
+    ])
+  let peer = testing.connect(srv, Nil)
+  list.each(["urn:private", "urn:missing?tag=\"quoted\""], fn(uri) {
+    let assert Error(client.RpcError(-32_602, message, Some(data))) =
+      client.read_resource(peer, uri) |> reason_support.of
+    data |> should.equal(value.Object([#("uri", value.String(uri))]))
+    string.contains(message, "Denied") |> should.be_false
+  })
   client.close(peer)
 }

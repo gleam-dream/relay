@@ -54,10 +54,24 @@
           settings.global.excludes = [
             "**/*.pdf"
             ".render/**"
+            "**/.render/**"
+            "**/build/**"
+            "**/.artifacts/**"
+            "**/node_modules/**"
+            "fixtures/negative/**"
+            "test/fixtures/mcp_2026/**"
+            "test/fixtures/tls/**"
+            "scripts/conformance/pnpm-lock.yaml"
           ];
           programs.gleam.enable = true;
           programs.nixfmt.enable = true;
           programs.prettier.enable = true;
+          programs.ruff.format = true;
+          programs.shfmt.enable = true;
+          settings.formatter.shfmt.options = [
+            "-i"
+            "2"
+          ];
         };
       in
       {
@@ -74,6 +88,11 @@
             pnpm
             beam28Packages.erlang
             rebar3
+            ruff
+            shellcheck
+            shfmt
+            actionlint
+            coreutils
             (python3.withPackages (ps: [ ps.jsonschema ]))
           ];
         };

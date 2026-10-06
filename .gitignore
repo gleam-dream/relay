@@ -5,3 +5,5 @@ erl_crash.dump
 scripts/conformance/node_modules/
 .render/
 **/.render/
+
+.artifacts/

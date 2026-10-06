@@ -10,11 +10,26 @@ Before changing a public facade, read the [public API guidelines](https://github
 
 ## Tooling
 
-- `nix develop` (or direnv): dev shell with `gleam`, Erlang/OTP 28, `rebar3`, `lefthook`.
-- `nix fmt`: formats the whole repo via treefmt (`gleam format`, `nixfmt`, `prettier`).
+- `nix develop` (or direnv): pinned Gleam, Erlang/OTP 28, rebar3, Node/pnpm, Python/jsonschema 4.26.0 and authored-tooling checks.
+- `nix fmt -- PATH...`: formats named authored files via treefmt. Keep formatting scoped; frozen protocol/TLS and negative compiler fixtures are excluded.
 - `lefthook`: pre-commit hook formats staged files and re-stages them.
 - `nix flake check`: fails iff the tree is not formatted (plus any existing checks).
 - `gleam test`: runs the test suite.
+
+## Verification
+
+Use the authoritative registry from this checkout:
+
+```sh
+nix develop --command python3 -B scripts/check.py fast
+nix develop --command python3 -B scripts/check.py full
+```
+
+`fast` checks formatting/static tools, gate regressions and strict root
+build/tests. `full` also checks compiler controls, frozen schema and checksum
+evidence, the complete pinned MCP server suite and the native design layer.
+CI splits the same registry into `ci` and `design` jobs and requires both.
+See docs/usage.md's verification inventory and its explicit conformance limits.
 
 <!-- agent-skills:begin -->
 <!-- framework-commit: cab7c0590036edaa66d8430cc5016399a9fd2c71 origin: git@github.com:lostbean/skills.git -->

@@ -170,13 +170,20 @@
     )
     #md-table(3, (
       [*Service*], [*Interface and interaction*], [*Failure and invariant*],
-      [Resources], [static / template / try_template / template_with_matcher; list/read; native text/blob contents], [One simple variable per slash segment, including suffix/prefix; unsupported syntax requires explicit matcher; private read errors become resource-not-found.],
+      [Resources], [static / template / try_template / template_with_matcher; list/read; native text/blob contents], [One simple variable per slash segment, including suffix/prefix; unsupported syntax requires explicit matcher; modern read failures return invalid params with the requested URI; private failure details remain hidden. See #adr(9).],
       [Prompts], [prompt / prompt_call with named string arguments; list/get; role and content messages], [Required arguments validated; private errors become invalid params; input rounds retain Call context.],
       [Completion], [completion receives prompt/template reference, argument name/value and other arguments], [Private error becomes internal error; output limited to 100 values with total and has_more.],
       [Content], [text/image/audio/resource link/embedded resource; annotations, icons, meta; text_of], [Binary bytes preserved; text_of intentionally projects text only and joins text blocks.],
       [Paging], [Deterministic catalog order, signed family/offset cursor, client all-page traversal], [Forged/cross-family cursors fail; authorized-view/revision binding remains a ruling.],
       [Registry updates], [server changes immutable description; endpoint/runtime register_tool changes live owner], [Successful changes increment generation and notify active relevant streams; absent removals and failed additions do not invent changes.],
     ))
+    #behavior(title: "Modern resource failures retain the requested URI", area: "Resource errors", level: "interface")[
+      #given[A modern resource read names an unknown URI or its configured reader refuses the read.]
+      #when[The server answers that read.]
+      #then[The caller receives invalid params with code -32602.]
+      #then[Error data.uri retains the requested URI.]
+      #then[Private reader failure details remain hidden.]
+    ]
     #behavior(title: "Re-evaluate visibility on named calls", area: "Tool access", level: "interface")[
       #given[A tool was listed for an earlier application context but is now hidden or not callable.]
       #when[The client names that tool in a new call.]
@@ -454,6 +461,7 @@
     ))
     #points(
       [test/fixtures/mcp_2026 retains upstream raw bytes, checksum, commit and MIT license. scripts/conformance retains package and lockfile; acceptance uses the pinned 0.2.0-alpha.10 requirement anchor. See #adr(7).],
+      [The pinned server gate requires assertions for every selected scenario and rejects missing results, skips, failures and warnings. The unpublished fixture validates its requested elicitation response, mutates the live tool catalog and publishes prompt notifications through the endpoint owner. See #adr(9).],
       [Keep split UTF-8/large frames, broken stdout with idle stdin, owner/child death, equal wire ids, duplicate admission, cancellation races, tombstones, held-writer mailbox bounds, burst disconnect, registry-generation barriers, FIFO subscription timeout and overflow fixtures. Source assertion names supply reproduction points, not a test-run diary.],
       [Revision codecs, custom template matcher, generic verifier and reducer interpreter are extension contracts with different ownership. A new transport must prove framing, limits, disconnect/cancellation and cleanup from an external consumer; a buffering interface cannot fabricate socket ownership.],
       [A new protocol revision carries its schema, requirements, supported-method set and independent lifecycle strategy. Supported-version removal requires a major version; deprecation lasts at least a minor release. Older than 2025-03-26 is excluded.],

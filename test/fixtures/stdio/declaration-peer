@@ -4,20 +4,20 @@ set -eu
 while IFS= read -r request; do
   id=$(printf '%s' "$request" | sed 's/.*"id":"//;s/".*//')
   case "$request" in
-    *'"method":"tools/list"'*)
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"tools\":[{\"name\":\"annotated\",\"title\":\"Annotated tool\",\"description\":\"keeps every declaration field\",\"inputSchema\":{\"type\":\"object\"},\"outputSchema\":{\"type\":\"string\"},\"annotations\":{\"title\":\"Safe lookup\",\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true,\"openWorldHint\":false},\"icons\":[{\"src\":\"https://example.test/tool.svg\",\"mimeType\":\"image/svg+xml\",\"sizes\":[\"any\"],\"theme\":\"dark\"}],\"_meta\":{\"vendor\":\"fixture\"}}]}}"
-      ;;
-    *'"method":"resources/list"'*)
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"resources\":[{\"uri\":\"memory://annotated\",\"name\":\"Annotated resource\",\"title\":\"Resource title\",\"description\":\"A resource fixture\",\"mimeType\":\"text/plain\",\"size\":12,\"annotations\":{\"audience\":[\"user\"],\"priority\":0.5,\"lastModified\":\"2026-09-22T00:00:00Z\"},\"icons\":[{\"src\":\"data:image/png;base64,AA==\",\"sizes\":[\"48x48\"],\"theme\":\"light\"}],\"_meta\":{\"vendor\":\"fixture\"}}]}}"
-      ;;
-    *'"method":"resources/templates/list"'*)
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"resourceTemplates\":[{\"uriTemplate\":\"memory://annotated/{name}\",\"name\":\"Annotated template\",\"mimeType\":\"text/plain\",\"annotations\":{\"lastModified\":\"2026-09-22T00:00:00Z\"},\"icons\":[{\"src\":\"https://example.test/template.png\",\"mimeType\":\"image/png\"}]}]}}"
-      ;;
-    *'"method":"prompts/list"'*)
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"prompts\":[{\"name\":\"minimal-prompt\",\"title\":\"Minimal prompt\",\"icons\":[{\"src\":\"https://example.test/prompt.svg\",\"theme\":\"dark\"}]}]}}"
-      ;;
-    *)
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"error\":{\"code\":-32601,\"message\":\"method not found\"}}"
-      ;;
+  *'"method":"tools/list"'*)
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"tools\":[{\"name\":\"annotated\",\"title\":\"Annotated tool\",\"description\":\"keeps every declaration field\",\"inputSchema\":{\"type\":\"object\"},\"outputSchema\":{\"type\":\"string\"},\"annotations\":{\"title\":\"Safe lookup\",\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true,\"openWorldHint\":false},\"icons\":[{\"src\":\"https://example.test/tool.svg\",\"mimeType\":\"image/svg+xml\",\"sizes\":[\"any\"],\"theme\":\"dark\"}],\"_meta\":{\"vendor\":\"fixture\"}}]}}"
+    ;;
+  *'"method":"resources/list"'*)
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"resources\":[{\"uri\":\"memory://annotated\",\"name\":\"Annotated resource\",\"title\":\"Resource title\",\"description\":\"A resource fixture\",\"mimeType\":\"text/plain\",\"size\":12,\"annotations\":{\"audience\":[\"user\"],\"priority\":0.5,\"lastModified\":\"2026-09-22T00:00:00Z\"},\"icons\":[{\"src\":\"data:image/png;base64,AA==\",\"sizes\":[\"48x48\"],\"theme\":\"light\"}],\"_meta\":{\"vendor\":\"fixture\"}}]}}"
+    ;;
+  *'"method":"resources/templates/list"'*)
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"resourceTemplates\":[{\"uriTemplate\":\"memory://annotated/{name}\",\"name\":\"Annotated template\",\"mimeType\":\"text/plain\",\"annotations\":{\"lastModified\":\"2026-09-22T00:00:00Z\"},\"icons\":[{\"src\":\"https://example.test/template.png\",\"mimeType\":\"image/png\"}]}]}}"
+    ;;
+  *'"method":"prompts/list"'*)
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"prompts\":[{\"name\":\"minimal-prompt\",\"title\":\"Minimal prompt\",\"icons\":[{\"src\":\"https://example.test/prompt.svg\",\"theme\":\"dark\"}]}]}}"
+    ;;
+  *)
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"error\":{\"code\":-32601,\"message\":\"method not found\"}}"
+    ;;
   esac
 done

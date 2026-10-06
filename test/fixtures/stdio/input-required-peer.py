@@ -22,7 +22,11 @@ for line in sys.stdin:
     elif name == "empty-requests" and "inputResponses" not in params:
         result = {"resultType": "input_required", "inputRequests": {}}
     elif name == "empty-requests":
-        result = {"resultType": "complete", "content": [], "structuredContent": "resumed empty"}
+        result = {
+            "resultType": "complete",
+            "content": [],
+            "structuredContent": "resumed empty",
+        }
     elif name == "content-only" and "requestState" not in params:
         result = {
             "resultType": "input_required",
@@ -39,4 +43,7 @@ for line in sys.stdin:
         result = {"resultType": "complete", "content": [], "structuredContent": "late"}
     else:
         result = {"resultType": "input_required"}
-    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+    print(
+        json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}),
+        flush=True,
+    )

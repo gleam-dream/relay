@@ -107,9 +107,8 @@ remain beside the [frozen fixture](test/fixtures/mcp_2026/README.md).
 From the Relay checkout:
 
 ```bash
-nix develop --command gleam build --warnings-as-errors
-nix develop --command gleam test
-nix flake check
+nix develop --command python3 -B scripts/check.py fast
+nix develop --command python3 -B scripts/check.py full
 ```
 
 The [full verification commands](docs/usage.md#verification) also cover compiler

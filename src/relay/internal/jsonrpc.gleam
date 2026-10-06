@@ -33,7 +33,7 @@ pub const invalid_params_code = -32_602
 
 pub const internal_error_code = -32_603
 
-pub const resource_not_found_code = -32_002
+pub const resource_not_found_code = invalid_params_code
 
 pub const unsupported_protocol_version_code = -32_022
 
@@ -59,8 +59,16 @@ pub fn internal_error() -> RpcError {
   RpcError(internal_error_code, "Internal error.", None)
 }
 
-pub fn resource_not_found() -> RpcError {
-  RpcError(resource_not_found_code, "Resource not found.", None)
+pub fn resource_not_found(uri: String) -> RpcError {
+  RpcError(
+    resource_not_found_code,
+    "Resource not found.",
+    Some(
+      json.object([
+        #("uri", json.string(uri)),
+      ]),
+    ),
+  )
 }
 
 pub fn unsupported_protocol_version(
