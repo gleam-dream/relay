@@ -365,9 +365,7 @@ per-check logs, results, dependency revisions and environment/lock metadata in
 directory, with a separate run directory and machine summary per invocation.
 Existing direct script commands remain available for focused work.
 
-Private Sinal and HTTP Gun checkout requires `vars.SIBLINGS_APP_CLIENT_ID` with
-`secrets.SIBLINGS_APP_PRIVATE_KEY`, or `secrets.SIBLINGS_READ_TOKEN` restricted to
-those two repositories. Public JSON Blueprint uses ordinary checkout. All
-siblings use immutable `sibling-revisions.txt` refs; credentials are not persisted.
-Fork pull requests receive no private credential and fail explicitly; verify
-their changes from a trusted repository branch.
+Sinal, HTTP Gun and JSON Blueprint are public repositories. CI checks out each
+sibling at its immutable `sibling-revisions.txt` ref with the ordinary checkout
+token. Repository permissions remain read-only and checkout credentials are not
+persisted. Fork pull requests use the same verification jobs.
