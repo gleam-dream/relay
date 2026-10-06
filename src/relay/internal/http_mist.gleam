@@ -217,6 +217,8 @@ pub fn start(
 
 /// Stops a listener started by `start`.
 pub fn stop(listener: process.Pid) -> Nil {
+  // This shutdown is requested by the owner, not a listener failure.
+  process.unlink(listener)
   stop_supervisor(listener)
 }
 

@@ -696,7 +696,8 @@ pub fn port(handler: Handler(context)) -> Int {
 }
 
 /// Stops the endpoint: closes its streams, stops its listener and its
-/// actor. Waits at most 5 s.
+/// actor without terminating its linked caller. Waits at most 5 s.
+/// Unexpected listener failure still reaches the caller through the link.
 pub fn stop(handler: Handler(context)) -> Nil {
   let reply = process.new_subject()
   process.send(handler.subject, StopEndpoint(reply))
