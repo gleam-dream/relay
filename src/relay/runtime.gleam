@@ -70,6 +70,7 @@ import gleam/time/duration.{type Duration}
 import relay/internal/carrier
 import relay/internal/emit
 import relay/internal/protocol/v2026_07_28 as v2026
+import relay/internal/request_owner
 import relay/reducer.{type ExchangeId, type Invocation, type InvocationId}
 import relay/server.{type Server}
 import relay/subscriptions.{type Notification}
@@ -310,6 +311,7 @@ type Cancelling {
 type State(context) {
   State(
     config: Config,
+    scope: Option(request_owner.Scope),
     reducer: reducer.State(context),
     sink: fn(Output) -> Result(Nil, Nil),
     workers: Dict(Int, Worker),
@@ -344,10 +346,31 @@ pub fn start(
   sink: fn(Output) -> Result(Nil, Nil),
 ) -> Result(Runtime(context), StartError) {
   use config <- result.try(validate(config))
-  builder(server, config, sink, None)
+  builder(server, config, sink, None, None)
   |> actor.start
   |> result.map(fn(started) { Runtime(started.data) })
   |> result.map_error(ActorStartFailed)
+}
+
+/// Internal HTTP lifetime seam; ordinary runtimes keep their own limits.
+@internal
+pub fn start_scoped(
+  server: Server(context),
+  config: Config,
+  sink: fn(Output) -> Result(Nil, Nil),
+  scope: request_owner.Scope,
+) -> Result(#(Pid, Runtime(context)), StartError) {
+  use config <- result.try(validate(config))
+  builder(server, config, sink, None, Some(scope))
+  |> actor.start
+  |> result.map(fn(started) { #(started.pid, Runtime(started.data)) })
+  |> result.map_error(ActorStartFailed)
+}
+
+/// Internal nonblocking shutdown; the request owner observes actual termination.
+@internal
+pub fn shutdown(runtime: Runtime(context)) -> Nil {
+  process.send(runtime.subject, Stop(process.new_subject()))
 }
 
 /// A child specification for a runtime registered under `name`; find it with
@@ -362,7 +385,7 @@ pub fn supervised(
     case validate(config) {
       Error(error) -> Error(actor.InitFailed(describe_start_error(error)))
       Ok(config) ->
-        builder(server, config, sink, Some(name))
+        builder(server, config, sink, Some(name), None)
         |> actor.start
         |> result.map(fn(started) {
           actor.Started(started.pid, Runtime(started.data))
@@ -381,6 +404,7 @@ fn builder(
   config: Config,
   sink: fn(Output) -> Result(Nil, Nil),
   name: Option(process.Name(Message(context))),
+  scope: Option(request_owner.Scope),
 ) {
   let builder =
     actor.new_with_initialiser(5000, fn(self) {
@@ -394,6 +418,7 @@ fn builder(
         |> process.select_trapped_exits(OwnerExited)
       State(
         config: config,
+        scope: scope,
         reducer: reducer.init(server),
         sink: sink,
         workers: dict.new(),
@@ -539,11 +564,10 @@ fn handle_message(
       case dict.get(state.cancelling, pid) {
         // The handler already returned.
         Error(Nil) -> actor.continue(state)
-        Ok(cancelling) -> {
+        Ok(_) -> {
           process.kill(pid)
-          let _ = process.demonitor_process(cancelling.monitor)
-          State(..state, cancelling: dict.delete(state.cancelling, pid))
-          |> continue_or_stop
+          // Capacity and shutdown wait for the actual DOWN acknowledgement.
+          actor.continue(state)
         }
       }
     WorkerDown(process.ProcessDown(monitor: _, pid: pid, reason: reason)) ->
@@ -789,14 +813,6 @@ fn start_worker(
       let method = reducer.invocation_method(invocation)
       let tool = reducer.invocation_tool(invocation)
       let correlation = reducer.invocation_correlation(invocation)
-      emit.invocation_started(telemetry.InvocationStartedMeta(
-        exchange_id: exchange,
-        invocation_id: id,
-        method: method,
-        tool: tool,
-        correlation: correlation,
-        listener: state.config.label,
-      ))
       let self = state.self
       let report = fn(progress, total, message) {
         let _ =
@@ -806,36 +822,61 @@ fn start_worker(
         Nil
       }
       let invocation_id = reducer.invocation_id(invocation)
-      let pid =
-        process.spawn_unlinked(fn() {
-          let input = case
-            rescue_run(fn() { reducer.perform(invocation, report) })
-          {
-            Ok(input) -> input
-            Error(_) -> reducer.Crashed(invocation_id)
-          }
-          process.send(self, WorkerFinished(id, input))
-        })
-      let monitor = process.monitor(pid)
-      let timer =
-        process.send_after(
-          self,
-          duration.to_milliseconds(state.config.invocation_timeout),
-          WorkerTimeout(id),
-        )
-      let worker =
-        Worker(
-          invocation: invocation_id,
-          pid: pid,
-          monitor: monitor,
-          timer: timer,
-          started_at: monotonic_ms(),
-          exchange: exchange,
+      let run = fn() {
+        emit.invocation_started(telemetry.InvocationStartedMeta(
+          exchange_id: exchange,
+          invocation_id: id,
           method: method,
           tool: tool,
           correlation: correlation,
-        )
-      State(..state, workers: dict.insert(state.workers, id, worker))
+          listener: state.config.label,
+        ))
+        let authorized = case state.scope {
+          None -> True
+          Some(scope) -> request_owner.authorized(scope)
+        }
+        let input = case authorized {
+          False -> reducer.TimedOut(invocation_id)
+          True ->
+            case rescue_run(fn() { reducer.perform(invocation, report) }) {
+              Ok(input) -> input
+              Error(_) -> reducer.Crashed(invocation_id)
+            }
+        }
+        process.send(self, WorkerFinished(id, input))
+      }
+      let spawned = case state.scope {
+        None -> Ok(process.spawn_unlinked(run))
+        Some(scope) ->
+          request_owner.spawn(scope, run, fn(pid) {
+            reducer.signal_cancelled(pid, invocation_id)
+          })
+      }
+      case spawned {
+        Error(Nil) -> state
+        Ok(pid) -> {
+          let monitor = process.monitor(pid)
+          let timer =
+            process.send_after(
+              self,
+              duration.to_milliseconds(state.config.invocation_timeout),
+              WorkerTimeout(id),
+            )
+          let worker =
+            Worker(
+              invocation: invocation_id,
+              pid: pid,
+              monitor: monitor,
+              timer: timer,
+              started_at: monotonic_ms(),
+              exchange: exchange,
+              method: method,
+              tool: tool,
+              correlation: correlation,
+            )
+          State(..state, workers: dict.insert(state.workers, id, worker))
+        }
+      }
     }
   }
 }
@@ -909,27 +950,20 @@ fn cancel_worker(
   id: Int,
   worker: Worker,
 ) -> State(context) {
-  reducer.signal_cancelled(worker.pid, worker.invocation)
+  case state.scope {
+    None -> reducer.signal_cancelled(worker.pid, worker.invocation)
+    Some(scope) -> request_owner.cancel_child(scope, worker.pid)
+  }
   let _ = process.cancel_timer(worker.timer)
   let state =
     remember(State(..state, workers: dict.delete(state.workers, id)), id)
   let grace = duration.to_milliseconds(state.config.cancellation_grace)
-  case grace <= 0 {
-    True -> {
-      process.kill(worker.pid)
-      let _ = process.demonitor_process(worker.monitor)
-      state
-    }
-    False -> {
-      let kill =
-        process.send_after(state.self, grace, KillAfterGrace(worker.pid))
-      let cancelling = Cancelling(monitor: worker.monitor, kill: kill)
-      State(
-        ..state,
-        cancelling: dict.insert(state.cancelling, worker.pid, cancelling),
-      )
-    }
-  }
+  let kill = process.send_after(state.self, grace, KillAfterGrace(worker.pid))
+  let cancelling = Cancelling(monitor: worker.monitor, kill: kill)
+  State(
+    ..state,
+    cancelling: dict.insert(state.cancelling, worker.pid, cancelling),
+  )
 }
 
 fn remember(state: State(context), id: Int) -> State(context) {

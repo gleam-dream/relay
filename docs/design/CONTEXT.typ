@@ -8,6 +8,7 @@
   (slug: "term-reducer", title: [Reducer], body: [A pure transition over one connection's protocol state that returns effects for an authoritative interpreter.]),
   (slug: "term-runtime", title: [Runtime], body: [The actor owning one reducer history and supervising the invocation processes that interpret its effects.]),
   (slug: "term-endpoint", title: [Endpoint], body: [The HTTP owner of the current server description, admitted request slots, active streams, and an optional listener.]),
+  (slug: "term-request-owner", title: [Request owner], body: [The Relay coordinator holding dispatch, deadline, and cleanup authority for one admitted HTTP request. Its managed worker carries the callback process lifetime through the exchange. _Avoid_: callback worker — omits execution and cleanup ownership.]),
   (slug: "term-grant", title: [Grant], body: [An admitted principal, exact protected resource, and actual attested scopes accepted by Relay's resource-server policy.]),
   (slug: "term-attestation", title: [Attestation], body: [A configured verifier's assertion about a token's principal, audiences, and scopes. Construction is not proof of cryptographic verification.]),
   (slug: "term-protection", title: [Protection], body: [The configured resource and endpoint scopes against which an attestation is admitted, together with authorization-server metadata.]),
@@ -19,7 +20,7 @@
   (slug: "term-subscription", title: [Subscription], body: [One owned listen request with an acknowledged notification filter and a cancellable stream lifetime.]),
   (slug: "term-cursor", title: [Cursor], body: [An opaque server-authenticated reference to a position in one listing family. Catalog and authorization-view binding remain required refinements.]),
   (slug: "term-tombstone", title: [Tombstone], body: [A retained terminal identity suppressing late or repeated work during a bounded retention interval.]),
-  (slug: "term-cancellation-grace", title: [Cancellation grace], body: [The interval after a handler receives cancellation and before Relay kills a handler that has not returned.]),
+  (slug: "term-cancellation-grace", title: [Cancellation grace], body: [The bounded interval between cancellation of Relay-owned request or invocation work and forced termination of work that has not stopped.]),
   (slug: "term-protocol-schema", title: [Protocol schema], body: [The frozen revision's authority for JSON-RPC envelopes, method parameters, declarations, and result fields.]),
   (slug: "term-input-contract", title: [Input contract], body: [A Blueprint contract loaded from a tool's application input schema for local argument validation. Admission to Blueprint's finite profile is separate from MCP protocol validity.]),
 )

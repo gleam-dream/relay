@@ -27,7 +27,9 @@ pub type Reply {
     next: fn(Int) -> Event,
     close: fn() -> Nil,
     keepalive_ms: Int,
-    write_timeout_ms: Int,
+    write_budget: fn() -> Result(Int, Nil),
+    written: fn(Event) -> Nil,
+    attached: fn(process.Pid) -> Bool,
   )
 }
 
@@ -66,13 +68,39 @@ fn handle(
       |> response.map(mist.Bytes)
     Error(Malformed) -> endpoint.malformed_body() |> response.map(mist.Bytes)
     Ok(body) -> {
-      let connection = request.body
-      let closed = client_closed(connection)
+      let closed = client_closed(request.body)
       case endpoint.serve(request.set_body(request, body), closed) {
         Buffered(reply) -> response.map(reply, mist.Bytes)
-        Streamed(head, next, close, keepalive_ms, write_timeout_ms) -> {
-          let _ = set_send_timeout(connection, write_timeout_ms)
-          stream(request, head, next, close, keepalive_ms)
+        Streamed(
+          head,
+          next,
+          close,
+          keepalive_ms,
+          write_budget,
+          written,
+          attached,
+        ) -> {
+          case write_budget() {
+            Error(Nil) -> {
+              close()
+              response.new(504)
+              |> response.set_header("connection", "close")
+              |> response.set_body(mist.Bytes(bytes_tree.new()))
+            }
+            Ok(timeout) -> {
+              let _ = set_send_timeout(request.body, timeout)
+              stream(
+                request,
+                head,
+                next,
+                close,
+                keepalive_ms,
+                write_budget,
+                written,
+                attached,
+              )
+            }
+          }
         }
       }
     }
@@ -135,6 +163,9 @@ fn stream(
   next: fn(Int) -> Event,
   close: fn() -> Nil,
   keepalive_ms: Int,
+  write_budget: fn() -> Result(Int, Nil),
+  written: fn(Event) -> Nil,
+  attached: fn(process.Pid) -> Bool,
 ) -> Response(mist.ResponseData) {
   // The chunk process owns the socket and closes it when the stream ends,
   // so the response must tell the client not to reuse the connection.
@@ -142,24 +173,51 @@ fn stream(
     request: request,
     response: response.set_header(head, "connection", "close"),
     init: fn(subject) {
+      // Mist starts this process through its factory. Refuse initialization
+      // unless the request owner has registered its lifetime before first pull.
+      let assert True = attached(process.self())
+        as "Relay request ended before stream initialization"
       process.send(subject, Pull)
       subject
     },
     loop: fn(subject, _pull, connection) {
-      let sent = case next(keepalive_ms) {
-        Data(bytes) -> Some(mist.send_chunk(connection, event(bytes)))
-        Idle -> Some(mist.send_chunk(connection, <<": keepalive\n\n">>))
+      let pulled = next(keepalive_ms)
+      let bytes = case pulled {
+        Data(bytes) -> Some(event(bytes))
+        Idle -> Some(<<": keepalive\n\n">>)
         Ended -> None
       }
-      case sent {
-        None -> mist.chunk_stop()
-        Some(Ok(Nil)) -> {
-          process.send(subject, Pull)
-          mist.chunk_continue(subject)
+      case bytes {
+        None -> {
+          case write_budget() {
+            Error(Nil) -> mist.chunk_stop_abnormal("Relay request ended")
+            Ok(timeout) -> {
+              let _ = set_send_timeout(connection, timeout)
+              mist.chunk_stop()
+            }
+          }
         }
-        Some(Error(Nil)) -> {
-          close()
-          mist.chunk_stop()
+        Some(bytes) -> {
+          case write_budget() {
+            Error(Nil) -> {
+              close()
+              mist.chunk_stop_abnormal("Relay request ended")
+            }
+            Ok(timeout) -> {
+              let _ = set_send_timeout(connection, timeout)
+              case mist.send_chunk(connection, bytes) {
+                Ok(Nil) -> {
+                  written(pulled)
+                  process.send(subject, Pull)
+                  mist.chunk_continue(subject)
+                }
+                Error(_) -> {
+                  close()
+                  mist.chunk_stop()
+                }
+              }
+            }
+          }
         }
       }
     },

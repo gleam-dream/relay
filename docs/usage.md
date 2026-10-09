@@ -77,14 +77,44 @@ answers 406. `http.start`, `http.supervised` and `http.mist_handler` stream
 server-sent events, send keepalives, and cancel a call when its client
 disconnects, which is how MCP `2026-07-28` cancels over HTTP.
 
-The endpoint timeout bounds handler execution and response waits after context
-construction. Context builders and bearer verifiers run synchronously before
-those budgets start; callers must bound their database or network work separately.
-They can occupy an admitted slot and delay disconnect observation. A shared
-admission deadline and callback ownership remain an [unresolved design decision](adr/0008-admission-budget-remains-unresolved.md).
+## Request deadlines and callback ownership
 
-The application owns the mounted endpoint. Call `http.stop(mcp)` when its
-router or supervisor stops.
+`http.with_request_timeout` sets one deadline from slot admission through
+correlation, bearer verification, native context construction, finite execution
+and response writes. Admission consumes the execution budget. Expiry before
+dispatch returns 504; a late verifier or context result cannot start a tool.
+After dispatch, timeout does not establish whether an application effect ran.
+Mist's bounded body read happens before slot admission. A buffered host owns its
+body allocation and final socket write.
+
+Callbacks run in a Relay-owned request worker. That worker remains alive through
+the finite exchange or an established subscription. Subscription establishment
+finishes only when its acknowledgement is written successfully; later stream
+writes keep bounded per-write waits without the finite request timer.
+
+This changes process affinity for buffered mounts: a Subject created inside the
+callback belongs to Relay's worker, and only that worker can receive from it.
+If a context borrows an application mailbox, client, or pool, create it under
+its application owner and keep that owner alive. Relay does not adopt arbitrary
+detached children, children trapping exits, or remote effects. A callback crash
+returns 500 without terminating the process calling `http.handle`.
+
+Deadline expiry, disconnect, serving-owner death and endpoint shutdown revoke
+dispatch authority and start bounded cleanup. The cancellation grace is separate
+from the response deadline. Retiring work counts against request capacity until
+its owned processes have terminated. Normally completed buffered responses wait
+for this cleanup and acknowledged slot release within the original deadline.
+After timeout, another request can briefly receive 503
+after the timed-out request receives 504. Handler cancellation is signalled once
+even if runtime telemetry is blocked; arbitrary callback code has no implicit
+cooperative cancellation port and is terminated by the end of the grace.
+
+The application owns the mounted endpoint. Call `http.stop(mcp)` when its router
+or supervisor stops. Shutdown initiates cancellation before stopping the
+listener; `stop` retains its existing maximum five-second wait and does not
+promise that every configured cleanup grace has elapsed before returning.
+The ownership decision and migration tradeoff are recorded in
+[ADR 0010](adr/0010-own-admission-and-execution-under-one-deadline.md).
 
 ## Protect the endpoint
 
@@ -255,7 +285,7 @@ described above.
 | Host and Origin allow-lists                 | loopback names and the bind host    | `http.with_allowed_hosts`, `http.with_allowed_origins`            |
 | HTTP request body                           | 1 MiB, then 413                     | `http.with_max_body_bytes`                                        |
 | HTTP response, or one stream's events       | 1 MiB                               | `http.with_max_response_bytes`                                    |
-| HTTP invocation and response wait           | 30 s after context construction     | `http.with_request_timeout`                                       |
+| HTTP admitted-request deadline              | 30 s from slot admission            | `http.with_request_timeout`                                       |
 | SSE keepalive                               | 15 s                                | `http.with_sse_keepalive`                                         |
 | concurrent HTTP requests                    | 1,024, then 503                     | `http.with_max_concurrent_requests`                               |
 | concurrent `subscriptions/listen` streams   | 64, then 503                        | `http.with_max_listen_streams`                                    |

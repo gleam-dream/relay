@@ -15,9 +15,6 @@
   ])
 
   #pending-ledger(
-    pending-entry(title: "Bound admission without changing callback ownership", kind: "ruling", adr: [#adr(8)])[
-      Context construction and bearer verification execute synchronously before the HTTP invocation and response budgets start. Admission can retain a request slot outside those budgets. A whole-request deadline requires an explicit process-affinity, cancellation, cleanup, late-success, and capacity-release contract; no correction is approved here.
-    ],
     pending-entry(title: "Bind paging and input state to the admitted view", kind: "ruling", adr: [#adr(4)])[
       The implemented cursor authenticates family and offset with the server key; continuation state authenticates the operation family and a nonce, without binding arguments, principal or outstanding response keys. The retained design requires catalog revision, tenant and authorized visible-view binding. Cross-trust-domain grant reuse, anonymous access, and policy changes between rounds need explicit semantics before claiming these stronger guarantees.
     ],
@@ -236,21 +233,30 @@
     ]
   ])
 
-  #section(title: "HTTP endpoint and limits", lead: "Buffered mounting, streaming ownership, and admission budgets have different guarantees.", visual: sequence(
-    title: "Protected request timing", participants: (
+  #section(title: "HTTP endpoint and limits", lead: "Relay owns the admitted request deadline and bounds cleanup separately.", visual: sequence(
+    title: "One deadline covers admission and execution", participants: (
       (id: "peer", label: "Peer", shape: "participant"), (id: "mist", label: "HTTP body reader", shape: "boundary"),
-      (id: "endpoint", label: "Endpoint / request process", shape: "control"), (id: "callback", label: "Verifier and context", shape: "participant"),
+      (id: "owner", label: "Request owner", shape: "control"), (id: "worker", label: "Request worker", shape: "participant"),
       (id: "runtime", label: "Runtime / handler", shape: "control"),
     ), steps: (
-      seq-msg("peer", "mist", "POST bounded body"), seq-msg("mist", "endpoint", "acquire request slot; validate headers"),
-      seq-msg("endpoint", "callback", "synchronous admission", activate: true), seq-note("callback", [Outside request_timeout supervision], side: "right"),
-      seq-msg("callback", "endpoint", "grant and native context", dashed: true, deactivate: true),
-      seq-msg("endpoint", "runtime", "start invocation and response budgets", activate: true),
-      seq-msg("runtime", "peer", "JSON or SSE; progress; final result", dashed: true),
-      seq-msg("peer", "runtime", "disconnect signals cancellation", deactivate: true),
-    ), caption: [This is the implemented ordering. Whole-request deadline and callback process-affinity corrections remain unresolved in #adr(8).],
+      seq-msg("peer", "mist", "POST bounded body"), seq-msg("mist", "owner", "admit slot; establish deadline"),
+      seq-msg("owner", "worker", "correlation, verification, context", activate: true),
+      seq-msg("worker", "owner", "native context; request dispatch authority", dashed: true),
+      seq-msg("owner", "runtime", "authorize dispatch with remaining budget", activate: true),
+      seq-msg("runtime", "peer", "finite response or established stream", dashed: true),
+      seq-msg("peer", "owner", "disconnect revokes authority"),
+      seq-msg("owner", "runtime", "cancel; enforce cleanup grace", deactivate: true),
+      seq-msg("owner", "worker", "stop; release slot after termination", deactivate: true),
+    ), caption: [The request owner remains responsive while callbacks run. Mist body reads precede admission; established subscriptions retain their separate lifetime. Finite writes use the remaining deadline; owned writer termination precedes slot release. See #adr(10).],
   ), body: [
-    #answers(title: "Endpoint owner", responsibility: [Own current registry, admission slots, streams, optional listener and shutdown ordering.], interface: [new / new_with_context / new_protected, setters, handler, handle, mist_handler, start, supervised, stop; live registration and notify.], interactions: [Mist owns socket reads/writes; the endpoint leases a server snapshot, builds context, then creates request runtime/broker; application router owns mounted endpoint lifetime.], invariants: [Validate completed config before binding; loopback default; nonloopback unprotected bind requires explicit opt-in; header/media/Host/Origin validation and byte/depth limits precede protocol work.], failure: [Typed startup settings/actor/listener failures; HTTP rejections with telemetry; capacity 503; body 413; buffered listen 406; response wait failure 504.])
+    #answers(title: "Endpoint owns admitted work and cleanup", responsibility: [Own current registry, admission slots, streams, optional listener and shutdown ordering.], interface: [new / new_with_context / new_protected, setters, handler, handle, mist_handler, start, supervised, stop; live registration and notify.], interactions: [Mist owns socket reads/writes; the endpoint leases a server snapshot and supervises each admitted request owner; the application router owns mounted endpoint lifetime.], invariants: [Validate completed config before binding; loopback default; nonloopback unprotected bind requires explicit opt-in; header/media/Host/Origin validation and byte/depth limits precede protocol work.], failure: [Typed startup settings/actor/listener failures; HTTP rejections with telemetry; capacity 503; body 413; buffered listen 406; pre-dispatch deadline expiry 504.])
+    #points(
+      [Each #term("term-request-owner") remains responsive to deadline expiry, serving-process death, peer disconnect where observable, and endpoint shutdown while a managed worker runs application callbacks. The worker remains alive through the admitted exchange, including finite streaming output and any successfully established subscription.],
+      [Slot admission establishes one absolute deadline before application correlation, context construction, or bearer verification. Admission consumes that budget; dispatch receives only the remaining duration. The owner checks deadline and cancellation authority before permitting dispatch and ignores late callback results. Actual handler entry rechecks authority after synchronous observations.],
+      [Expiry before dispatch returns HTTP 504 while the connection remains usable. Disconnect suppresses the response. The runtime classifies invocation failures while the request owner accounts for their termination. Expiry after dispatch retains runtime cancellation and protocol outcome semantics; it does not prove application effects never ran.],
+      [Expiry and disconnect begin a separate bounded cleanup interval using #term("term-cancellation-grace"). Normally completed buffered responses wait for owned work termination and acknowledged slot release within the original deadline. Retiring workers retain their request slots until owned request work terminates; capacity release never requires the callback to return voluntarily. Endpoint stop signals cancellation before listener shutdown. Owner death also cancels owned request work; a scoped handler receives cancellation once even when its runtime is blocked in an observation.],
+      [The deadline bounds finite response production and response waits. Mist registers its stream writer before the first pull; headers, events, keepalives and stream finalization check the current write budget. Writing the initial subscription acknowledgement successfully ends the finite request timer and uses the existing stream-capacity contract; the callback worker remains alive until that subscription closes. Mist's preceding body read remains outside this deadline.],
+    )
     #state-type(id: "endpoint-phase", title: "Endpoint phase", variants: ("Configured", "Running", "Stopping", "Stopped", "Failed"))
     #entity(id: "endpoint", title: "Endpoint lifetime", description: [The actor and optional linked listener that own admitted HTTP requests.], kind: "aggregate", owner: "endpoint caller", lifecycle: "stateful", domain: "MCP", tint: "blue")[
       #attribute(id: "phase", name: "Phase", type: [Endpoint phase], provenance: "derived", state-type: "endpoint-phase", state-machine: "endpoint-life")[Running preserves unexpected listener failure propagation; intentional shutdown disconnects that link before termination.]
@@ -267,13 +273,13 @@
       [Body and JSON depth], [1 MiB → 413; depth 64 → 400], [Mist bounded reader before slot; endpoint body check before context; depth before reducer parse. Mounted body allocation belongs to host.],
       [Request slots and listen streams], [1,024 and 64 → 503], [Leased admitted requests/streams; does not count all incomplete network body readers.],
       [Response budget], [1 MiB response or cumulative stream event bytes], [Broker enforces event output budget and acknowledged delivery; existing allocations are not erased by refusal.],
-      [Invocation / response wait], [30 s], [Begins after context and bearer callback; response collection and stream write waits have their own timing.],
-      [Cancellation and keepalive], [5 s grace; 15 s SSE keepalive], [Disconnect suppresses output and signals worker; keepalive is transport liveness.],
+      [Admitted request deadline], [30 s], [One absolute deadline starts at slot admission and covers callbacks, finite execution and response waits.],
+      [Cancellation and keepalive], [5 s grace; 15 s SSE keepalive], [Cleanup begins after cancellation; retiring work retains capacity until termination. Keepalive is transport liveness.],
       [Host and Origin], [Loopback names / bind host and configured origins], [Case-insensitive header names; rejection precedes callback; missing Origin is permitted by current policy.],
     ))
     #points(
       [handle consumes Request(BitArray) and returns buffered Response(BytesTree). It drops progress, cannot observe peer disconnect, and rejects subscriptions/listen with 406. mist_handler, start, and supervised retain streaming, keepalive and disconnect cancellation.],
-      [Context and verifier closures execute in the serving request process. A blocking callback occupies its admitted slot and can delay observing closure. Its own network/database timeout and owned cleanup remain the caller's responsibility under the current implementation; the false whole-request claim is a design gap, not a repaired runtime guarantee.],
+      [Correlation, context, and verifier closures execute in the managed request worker, including buffered mounting. A callback-created Subject belongs to that worker and only its owner can receive from it; successful context construction does not terminate the worker. Long-lived clients, pools, and actors remain application-owned borrowed resources. Arbitrary detached or exit-trapping children and remote effects do not become Relay-owned resources.],
       [Modern MCP accepts POST only; protected-resource metadata has a separate GET path. No modern GET notification endpoint, DELETE session termination, or protocol session is added by this metadata route.],
       [Optional FFI helpers inspect Mist's Connection record to set a send timeout and observe buffered connection closure. They fall back on unfamiliar shapes; Mist upgrades require the real disconnect tests and record-contract check. See #adr(3).],
     )
@@ -282,11 +288,52 @@
       #when[A client requests subscriptions/listen.]
       #then[The response is 406; ordinary requests remain buffered and emit no progress.]
     ]
-    #behavior(title: "Protected context runs before invocation supervision", area: "HTTP admission timing", level: "interface")[
-      #given[A configured verifier or context callback remains blocked beyond the request timeout.]
-      #when[The callback later succeeds under the current implementation.]
-      #then[The invocation may still start and return success because its budget begins after the callback.]
-      #then[The request timeout setting has not bounded the callback's lifetime.]
+    #behavior(title: "Blocked admission expires before dispatch", area: "HTTP admission timing", level: "interface")[
+      #given[A configured callback remains blocked after its admitted request deadline.]
+      #when[The deadline expires while the client remains connected.]
+      #then[The owner returns HTTP 504 and revokes dispatch authority without waiting for the callback.]
+      #then[No callback result from that request may invoke a tool.]
+    ]
+    #behavior(title: "Admission consumes the execution budget", area: "HTTP admission timing", level: "interface")[
+      #given[Admission has consumed part of an admitted request's original deadline budget.]
+      #when[Its native context is accepted for dispatch.]
+      #then[Finite execution and response waits share only the remaining original budget.]
+    ]
+    #behavior(title: "Delayed policy cannot start expired work", area: "HTTP admission timing", level: "interface")[
+      #given[Context construction succeeds before the deadline but tool admission policy remains blocked.]
+      #when[The policy returns after expiry or cancellation.]
+      #then[The invocation gate rejects the expired request before starting its handler.]
+      #then[Queued admission results cannot restore dispatch authority.]
+    ]
+    #behavior(title: "Disconnect closes blocked admission authority", area: "HTTP cancellation", level: "interface")[
+      #given[A streaming-capable HTTP connection closes while its callback is blocked.]
+      #when[The request owner observes that closure.]
+      #then[It suppresses output, revokes dispatch authority, and begins bounded cleanup.]
+      #then[Late admission success cannot start a tool invocation.]
+    ]
+    #behavior(title: "Retiring work remains capacity bounded", area: "HTTP cleanup", level: "interface")[
+      #given[All request slots are held by active or retiring owned work.]
+      #when[Another request attempts admission.]
+      #then[The endpoint returns HTTP 503 until a slot's owned work terminates.]
+      #then[Cleanup expiry forces termination without waiting for the callback to return.]
+    ]
+    #behavior(title: "Endpoint shutdown owns admitted callback work", area: "HTTP cleanup", level: "interface")[
+      #given[An endpoint has a request blocked in context creation or verification.]
+      #when[The endpoint stops or the serving owner dies.]
+      #then[The request loses dispatch authority and its owned work terminates within cancellation grace.]
+      #then[Borrowed application resources retain their application-owned lifetime.]
+    ]
+    #behavior(title: "Callback failure isolates the mounted caller", area: "HTTP callback ownership", level: "interface")[
+      #given[An application invokes the buffered mount from a live caller process.]
+      #when[The managed callback crashes.]
+      #then[The request returns HTTP 500 and its owned work is cleaned up.]
+      #then[The caller remains alive and the endpoint can admit subsequent requests.]
+    ]
+    #behavior(title: "Callback resources retain the request worker", area: "HTTP callback ownership", level: "interface")[
+      #given[A callback creates a Subject in its managed request worker.]
+      #when[Context creation succeeds and finite execution begins.]
+      #then[The Subject's owner remains alive through the admitted exchange.]
+      #then[The Subject still permits receiving only in its owning process.]
     ]
   ])
 

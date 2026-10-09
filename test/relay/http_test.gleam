@@ -1387,3 +1387,286 @@ pub fn uncorrelated_client_mints_the_call_correlation_test() {
   http.stop(listener)
   let assert Ok(Nil) = sinal.detach(attachment)
 }
+
+@external(erlang, "relay_http_ffi", "suspend_stream_writer")
+fn suspend_stream_writer(port: Int) -> Result(process.Pid, String)
+
+@external(erlang, "relay_http_ffi", "resume_stream_writer")
+fn resume_stream_writer(pid: process.Pid) -> Nil
+
+pub fn finite_deadline_stops_a_suspended_stream_writer_test() {
+  let notices = process.new_subject()
+  let work =
+    tool.define("held_stream", no_input(), no_input())
+    |> tool.handle_call(fn(call, _) {
+      let release = process.new_subject()
+      process.send(notices, release)
+      tool.report_progress(call, 1.0, None, None)
+      let _ = process.receive(release, 2000)
+      Ok(tool.complete(Nil))
+    })
+  let listener =
+    http.new(server.new([work]))
+    |> http.with_request_timeout(duration.milliseconds(200))
+    |> http.with_cancellation_grace(duration.milliseconds(30))
+    |> http.with_max_concurrent_requests(1)
+    |> started
+  let assert Ok(connection) =
+    send_and_hold(
+      http.port(listener),
+      "POST",
+      headers_with_name("tools/call", "held_stream", "text/event-stream"),
+      progress_call_envelope("held_stream"),
+    )
+  let assert Ok(release) = process.receive(notices, 1000)
+  let assert Ok(_) = read_until(connection, <<"notifications/progress">>, 1000)
+  let assert Ok(writer) = suspend_stream_writer(http.port(listener))
+  let monitor = process.monitor(writer)
+  let stopped =
+    process.new_selector()
+    |> process.select_specific_monitor(monitor, fn(_) { Nil })
+    |> process.selector_receive(500)
+  resume_stream_writer(writer)
+  let _ = abort_connection(connection)
+  process.send(release, Nil)
+  http.stop(listener)
+  let _ = process.demonitor_process(monitor)
+  stopped |> should.equal(Ok(Nil))
+}
+
+pub fn subscription_keeps_context_owner_after_admission_deadline_test() {
+  let contexts = process.new_subject()
+  let listener =
+    http.new_with_context(server.new([]), fn(_) {
+      let mailbox = process.new_subject()
+      process.send(contexts, mailbox)
+      Ok(mailbox)
+    })
+    |> http.with_request_timeout(duration.milliseconds(80))
+    |> http.with_cancellation_grace(duration.milliseconds(20))
+    |> http.with_sse_keepalive(duration.milliseconds(10))
+    |> started
+  let peer = connect(listener)
+  let assert Ok(subscription) =
+    client.listen(peer, [subscriptions.ToolsListChanged])
+  let assert Ok(mailbox) = process.receive(contexts, 1000)
+  let assert Ok(owner) = process.subject_owner(mailbox)
+  let monitor = process.monitor(owner)
+  // Waiting for a notification times out beyond the admitted request budget;
+  // the following real event proves the subscription remains usable.
+  process.sleep(150)
+  client.next_notification(subscription, duration.milliseconds(150))
+  |> should.equal(Ok(None))
+  let owner_alive = process.is_alive(owner)
+  http.notify(listener, subscriptions.ToolsListChanged)
+  let event = client.next_notification(subscription, duration.seconds(1))
+  client.close_subscription(subscription)
+  client.close(peer)
+  let stopped =
+    process.new_selector()
+    |> process.select_specific_monitor(monitor, fn(_) { Nil })
+    |> process.selector_receive(1000)
+  http.stop(listener)
+  owner_alive |> should.be_true
+  event |> should.equal(Ok(Some(subscriptions.ToolsListChanged)))
+  stopped |> should.equal(Ok(Nil))
+}
+
+pub fn finite_stream_keeps_callback_subject_until_handler_finishes_test() {
+  let contexts = process.new_subject()
+  let entered = process.new_subject()
+  let work =
+    tool.define("subject_stream", no_input(), no_input())
+    |> tool.handle_call(fn(call, _) {
+      let release = process.new_subject()
+      process.send(entered, release)
+      tool.report_progress(call, 1.0, None, None)
+      let _ = process.receive(release, 1000)
+      let assert Ok(owner) = process.subject_owner(tool.context(call))
+      case process.is_alive(owner) {
+        True -> Ok(tool.complete(Nil))
+        False -> panic as "Request context owner died before streamed invocation"
+      }
+    })
+  let listener =
+    http.new_with_context(server.new([work]), fn(_) {
+      let mailbox = process.new_subject()
+      process.send(contexts, mailbox)
+      Ok(mailbox)
+    })
+    |> started
+  let assert Ok(connection) =
+    send_and_hold(
+      http.port(listener),
+      "POST",
+      headers_with_name("tools/call", "subject_stream", "text/event-stream"),
+      progress_call_envelope("subject_stream"),
+    )
+  let assert Ok(release) = process.receive(entered, 1000)
+  let assert Ok(mailbox) = process.receive(contexts, 1000)
+  let assert Ok(owner) = process.subject_owner(mailbox)
+  let monitor = process.monitor(owner)
+  let assert Ok(_) = read_until(connection, <<"notifications/progress">>, 1000)
+  let alive = process.is_alive(owner)
+  process.send(release, Nil)
+  let result = read_until(connection, <<"\"result\"">>, 1000)
+  let stopped =
+    process.new_selector()
+    |> process.select_specific_monitor(monitor, fn(_) { Nil })
+    |> process.selector_receive(1000)
+  let _ = abort_connection(connection)
+  http.stop(listener)
+  alive |> should.be_true
+  result |> should.be_ok
+  stopped |> should.equal(Ok(Nil))
+}
+
+pub fn expired_observer_cannot_start_application_handler_test() {
+  let blocked = process.new_subject()
+  let invoked = process.new_subject()
+  let answered = process.new_subject()
+  let label = "blocked-start-observer"
+  let attachment =
+    sinal.observe(telemetry.invocation_started_event(), fn(_, meta) {
+      case meta.listener {
+        Some(found) if found == label -> {
+          let release = process.new_subject()
+          process.send(blocked, release)
+          let _ = process.receive(release, 2000)
+          Nil
+        }
+        _ -> Nil
+      }
+    })
+  let work =
+    tool.define("observer_probe", no_input(), no_input())
+    |> tool.handle(fn(_) {
+      process.send(invoked, Nil)
+      Ok(Nil)
+    })
+  let endpoint =
+    http.new(server.new([work]))
+    |> http.with_label(label)
+    |> http.with_request_timeout(duration.milliseconds(30))
+    |> http.with_cancellation_grace(duration.milliseconds(500))
+    |> mounted
+  let caller =
+    process.spawn_unlinked(fn() {
+      http.handle(
+        endpoint,
+        testing.request("tools/call", [
+          #("name", json.string("observer_probe")),
+          #("arguments", json.object([])),
+        ]),
+      )
+      |> fn(reply) { process.send(answered, reply.status) }
+    })
+  let assert Ok(release) = process.receive(blocked, 1000)
+  let reply = process.receive(answered, 1000)
+  process.send(release, Nil)
+  let late = process.receive(invoked, 100)
+  let assert Ok(Nil) = sinal.detach(attachment)
+  http.stop(endpoint)
+  process.kill(caller)
+  reply |> should.equal(Ok(504))
+  late |> should.equal(Error(Nil))
+}
+
+pub fn blocked_cancellation_observer_preserves_handler_grace_test() {
+  let blocked = process.new_subject()
+  let cancelled = process.new_subject()
+  let started = process.new_subject()
+  let answered = process.new_subject()
+  let label = "blocked-cancellation-observer"
+  let hold = fn(listener) {
+    case listener {
+      Some(found) if found == label -> {
+        let release = process.new_subject()
+        process.send(blocked, release)
+        let _ = process.receive(release, 2000)
+        Nil
+      }
+      _ -> Nil
+    }
+  }
+  let attachments = [
+    sinal.observe(telemetry.invocation_cancelled_event(), fn(_, meta) {
+      hold(meta.listener)
+    }),
+    sinal.observe(telemetry.invocation_crashed_event(), fn(_, meta) {
+      hold(meta.listener)
+    }),
+  ]
+  let work =
+    tool.define("cancel_observer", no_input(), no_input())
+    |> tool.handle_call(fn(call, _) {
+      let finish = process.new_subject()
+      process.send(started, finish)
+      let cancellation = process.selector_receive(tool.cancelled(call), 2000)
+      process.send(cancelled, cancellation)
+      let _ = process.receive(finish, 2000)
+      Ok(tool.complete(Nil))
+    })
+  let endpoint =
+    http.new(server.new([work]))
+    |> http.with_label(label)
+    |> http.with_request_timeout(duration.milliseconds(30))
+    |> http.with_cancellation_grace(duration.milliseconds(300))
+    |> mounted
+  let caller =
+    process.spawn_unlinked(fn() {
+      http.handle(
+        endpoint,
+        testing.request("tools/call", [
+          #("name", json.string("cancel_observer")),
+          #("arguments", json.object([])),
+        ]),
+      )
+      |> fn(reply) { process.send(answered, reply.status) }
+    })
+  let assert Ok(finish) = process.receive(started, 1000)
+  let assert Ok(release) = process.receive(blocked, 1000)
+  let observed = process.receive(cancelled, 100)
+  process.send(release, Nil)
+  process.send(finish, Nil)
+  let reply = process.receive(answered, 1000)
+  list.each(attachments, fn(attachment) {
+    let assert Ok(Nil) = sinal.detach(attachment)
+  })
+  http.stop(endpoint)
+  process.kill(caller)
+  reply |> should.equal(Ok(504))
+  observed |> should.equal(Ok(Ok(Nil)))
+}
+
+pub fn killed_invocation_keeps_the_protocol_failure_response_test() {
+  let started = process.new_subject()
+  let answered = process.new_subject()
+  let work =
+    tool.define("killed_invocation", no_input(), no_input())
+    |> tool.handle(fn(_) {
+      process.send(started, process.self())
+      process.sleep_forever()
+      Ok(Nil)
+    })
+  let endpoint = http.new(server.new([work])) |> mounted
+  let caller =
+    process.spawn_unlinked(fn() {
+      http.handle(
+        endpoint,
+        testing.request("tools/call", [
+          #("name", json.string("killed_invocation")),
+          #("arguments", json.object([])),
+        ]),
+      )
+      |> process.send(answered, _)
+    })
+  let assert Ok(worker) = process.receive(started, 1000)
+  process.kill(worker)
+  let reply = process.receive(answered, 1000)
+  http.stop(endpoint)
+  process.kill(caller)
+  let assert Ok(reply) = reply
+  reply.status |> should.equal(200)
+  testing.body_text(reply) |> string.contains("-32603") |> should.be_true
+}

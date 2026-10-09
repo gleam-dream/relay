@@ -1,6 +1,8 @@
 -module(relay_http_ffi).
 -export([
     request/4,
+    suspend_stream_writer/1,
+    resume_stream_writer/1,
     disconnect_after_first_sse_event/4,
     send_and_hold/4,
     read_until/3,
@@ -269,3 +271,19 @@ with_unlistened_port(Callback) ->
     after
         socket:close(Socket)
     end.
+
+%% Locate the actual loopback connection's owning process after a streamed
+%% event was received, then suspend it to model a writer unable to progress.
+suspend_stream_writer(Port) ->
+    Owners = [Pid || Socket <- erlang:ports(),
+        {ok, {_, LocalPort}} <- [catch inet:sockname(Socket)], LocalPort =:= Port,
+        {ok, _} <- [catch inet:peername(Socket)],
+        {connected, Pid} <- [erlang:port_info(Socket, connected)]],
+    case Owners of
+        [Pid] -> erlang:suspend_process(Pid), {ok, Pid};
+        _ -> {error, format({unexpected_connection_owners, Owners})}
+    end.
+
+resume_stream_writer(Pid) ->
+    catch erlang:resume_process(Pid),
+    nil.

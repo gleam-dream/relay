@@ -16,7 +16,8 @@
 ////
 //// The context builder sees the request, so a context can carry a tenant
 //// or a principal; an `Error(response)` answers the request before Relay
-//// reads the body. `new_protected` reads the bearer token, admits it with
+//// dispatches protocol work. The host reads the bounded body before slot
+//// admission. `new_protected` reads the bearer token, admits it with
 //// `relay/authorization`, answers a refusal with its RFC 6750 challenge, and
 //// serves the RFC 9728 metadata document at
 //// `authorization.metadata_path(protection)`.
@@ -39,7 +40,7 @@
 //// | Host and Origin allow-lists | loopback and the bind host | `with_allowed_hosts`, `with_allowed_origins` |
 //// | request body | 1 MiB | `with_max_body_bytes` |
 //// | response, or one stream's events | 1 MiB | `with_max_response_bytes` |
-//// | request timeout (and handler timeout) | 30 s | `with_request_timeout` |
+//// | admitted-request deadline | 30 s | `with_request_timeout` |
 //// | cancellation grace | 5 s | `with_cancellation_grace` |
 //// | SSE keepalive | 15 s | `with_sse_keepalive` |
 //// | concurrent requests | 1,024, then 503 | `with_max_concurrent_requests` |
@@ -47,7 +48,7 @@
 //// | JSON nesting depth | 64 | `with_max_json_depth` |
 //// | request correlation | the client's `x-correlation-id`, else fresh | `with_correlation` |
 ////
-//// Every request has one `sinal/correlation`, read before the body: the
+//// Every admitted request has one `sinal/correlation`: the
 //// `with_correlation` builder's value, else the client's `x-correlation-id`
 //// header (1 to 128 visible ASCII characters; Relay's client sends its
 //// `relay/client.with_correlation` there), else a fresh one. The request's
@@ -62,6 +63,17 @@
 //// A buffered `handle` cannot see the socket, so its requests end at the
 //// request timeout instead, and it answers `subscriptions/listen` with 406;
 //// use `mist_handler` or `start` for streaming.
+////
+//// The deadline starts at slot admission, before correlation, verification,
+//// and context callbacks. Those callbacks run in a managed request worker,
+//// which remains alive through finite output or an established subscription.
+//// Expiry returns 504 before dispatch; late admission cannot start a handler.
+//// Callback failure returns 500 without terminating the buffered caller.
+//// Cleanup has its own cancellation grace and retains capacity until owned
+//// processes stop. Borrowed application actors remain application-owned;
+//// detached children, exit-trapping children, and remote effects are not
+//// automatically adopted or undone. Callback-created Subjects belong to the
+//// request worker, not to the process calling buffered `handle`.
 
 import gleam/bit_array
 import gleam/bytes_tree.{type BytesTree}
@@ -91,6 +103,7 @@ import relay/internal/emit
 import relay/internal/http_mist
 import relay/internal/jsonrpc
 import relay/internal/protocol/v2026_07_28 as v2026
+import relay/internal/request_owner
 import relay/reducer
 import relay/runtime
 import relay/server.{type RegisterError, type Server}
@@ -153,8 +166,9 @@ pub fn new(server: Server(Nil)) -> Config(Nil) {
 }
 
 /// An endpoint that builds each request's context from the request. An
-/// `Error(response)` answers the request as is, before the body is read by
-/// the server.
+/// `Error(response)` answers the request as is, before protocol dispatch.
+/// The host has already read the bounded body. The callback runs in a
+/// Relay-owned worker, retained through the exchange or established stream.
 pub fn new_with_context(
   server: Server(context),
   context: fn(Request(BitArray)) -> Result(context, Response(BytesTree)),
@@ -291,7 +305,10 @@ pub fn with_max_response_bytes(
   Config(..config, max_response_bytes: bytes)
 }
 
-/// How long a request may take, and how long a handler may run.
+/// One deadline from slot admission through correlation, verification, native
+/// context, finite execution and response writes. Admission consumes the same
+/// budget as execution. Body reading precedes admission. An acknowledged
+/// subscription retains its stream lifetime and bounded per-write waits.
 pub fn with_request_timeout(
   config: Config(context),
   timeout: Duration,
@@ -302,7 +319,8 @@ pub fn with_request_timeout(
 /// How long a cancelled handler may keep running after its
 /// `relay/tool.cancelled` selector fires (the client disconnected, or the
 /// handler timed out, or the endpoint stopped), before Relay kills it. Zero
-/// kills it at once.
+/// kills it at once. This also bounds cleanup of request callbacks and runtime
+/// resources. Active and retiring work retain capacity until termination.
 pub fn with_cancellation_grace(
   config: Config(context),
   grace: Duration,
@@ -525,11 +543,11 @@ fn allowed_hosts(config: Config(context)) -> List(String) {
 pub opaque type Message(context) {
   Acquire(
     owner: Pid,
+    cancel: fn() -> Nil,
     stream: Bool,
     reply: Subject(Result(Lease(context), Refusal)),
   )
-  Transfer(slot: Int, owner: Pid)
-  Release(slot: Int)
+  RequestSettled(slot: Int, reply: Subject(Nil))
   AddStream(slot: Int, runtime: runtime.Runtime(context), generation: Int)
   OwnerDown(down: process.Down)
   NotifyStreams(notification: Notification)
@@ -546,6 +564,7 @@ type Lease(context) {
     server: Server(context),
     config: Config(context),
     generation: Int,
+    deadline: Int,
   )
 }
 
@@ -557,6 +576,7 @@ type Refusal {
 type Slot(context) {
   Slot(
     monitor: process.Monitor,
+    cancel: fn() -> Nil,
     stream: Bool,
     runtime: Option(runtime.Runtime(context)),
   )
@@ -696,7 +716,8 @@ pub fn port(handler: Handler(context)) -> Int {
 }
 
 /// Stops the endpoint: closes its streams, stops its listener and its
-/// actor without terminating its linked caller. Waits at most 5 s.
+/// actor without terminating its linked caller. Initiates request cleanup,
+/// which may continue after this call returns. Waits at most 5 s.
 /// Unexpected listener failure still reaches the caller through the link.
 pub fn stop(handler: Handler(context)) -> Nil {
   let reply = process.new_subject()
@@ -733,7 +754,7 @@ fn handle_hub(
   message: Message(context),
 ) -> actor.Next(Hub(context), Message(context)) {
   case message {
-    Acquire(owner, stream, reply) -> {
+    Acquire(owner, cancel, stream, reply) -> {
       let refusal = case hub.requests >= hub.config.max_concurrent_requests {
         True -> Some(Overloaded)
         False ->
@@ -752,12 +773,23 @@ fn handle_hub(
           let monitor = process.monitor(owner)
           process.send(
             reply,
-            Ok(Lease(slot, hub.server, hub.config, hub.generation)),
+            Ok(Lease(
+              slot,
+              hub.server,
+              hub.config,
+              hub.generation,
+              monotonic_ms()
+                + duration.to_milliseconds(hub.config.request_timeout),
+            )),
           )
           actor.continue(
             Hub(
               ..hub,
-              slots: dict.insert(hub.slots, slot, Slot(monitor, stream, None)),
+              slots: dict.insert(
+                hub.slots,
+                slot,
+                Slot(monitor, cancel, stream, None),
+              ),
               requests: hub.requests + 1,
               streams: hub.streams
                 + case stream {
@@ -769,25 +801,18 @@ fn handle_hub(
         }
       }
     }
-    Transfer(slot, owner) ->
+    RequestSettled(slot, reply) -> {
       case dict.get(hub.slots, slot) {
-        Error(Nil) -> actor.continue(hub)
         Ok(entry) -> {
           let _ = process.demonitor_process(entry.monitor)
-          let monitor = process.monitor(owner)
-          actor.continue(
-            Hub(
-              ..hub,
-              slots: dict.insert(
-                hub.slots,
-                slot,
-                Slot(..entry, monitor: monitor),
-              ),
-            ),
-          )
+          Nil
         }
+        Error(Nil) -> Nil
       }
-    Release(slot) -> actor.continue(release_slot(hub, slot, True))
+      let hub = release_slot(hub, slot)
+      process.send(reply, Nil)
+      actor.continue(hub)
+    }
     OwnerDown(process.ProcessDown(monitor: monitor, ..)) ->
       case
         dict.to_list(hub.slots)
@@ -796,7 +821,7 @@ fn handle_hub(
           slot.monitor == monitor
         })
       {
-        Ok(#(slot, _)) -> actor.continue(release_slot(hub, slot, False))
+        Ok(#(slot, _)) -> actor.continue(release_slot(hub, slot))
         Error(Nil) -> actor.continue(hub)
       }
     OwnerDown(_) -> actor.continue(hub)
@@ -870,6 +895,7 @@ fn handle_hub(
       actor.continue(hub)
     }
     StopEndpoint(reply) -> {
+      dict.each(hub.slots, fn(_, slot) { slot.cancel() })
       each_stream(hub, runtime.close)
       case hub.listener {
         Some(listener) -> http_mist.stop(listener)
@@ -893,17 +919,10 @@ fn each_stream(
   })
 }
 
-fn release_slot(hub: Hub(context), slot: Int, demonitor: Bool) -> Hub(context) {
+fn release_slot(hub: Hub(context), slot: Int) -> Hub(context) {
   case dict.get(hub.slots, slot) {
     Error(Nil) -> hub
     Ok(entry) -> {
-      case demonitor {
-        True -> {
-          let _ = process.demonitor_process(entry.monitor)
-          Nil
-        }
-        False -> Nil
-      }
       Hub(
         ..hub,
         slots: dict.delete(hub.slots, slot),
@@ -983,18 +1002,15 @@ fn endpoint(
 fn acquire(
   handler: Handler(context),
   stream: Bool,
+  cancel: fn() -> Nil,
 ) -> Result(Lease(context), Option(Refusal)) {
   let reply = process.new_subject()
-  process.send(handler.subject, Acquire(process.self(), stream, reply))
+  process.send(handler.subject, Acquire(process.self(), cancel, stream, reply))
   case process.receive(reply, hub_timeout) {
     Ok(Ok(lease)) -> Ok(lease)
     Ok(Error(refusal)) -> Error(Some(refusal))
     Error(Nil) -> Error(None)
   }
-}
-
-fn release(handler: Handler(context), slot: Int) -> Nil {
-  process.send(handler.subject, Release(slot))
 }
 
 fn serve(
@@ -1003,42 +1019,64 @@ fn serve(
   closed: process.Selector(Nil),
   streaming: Bool,
 ) -> http_mist.Reply {
-  let listen = is_listen(request.body)
-  case acquire(handler, listen) {
-    Error(None) ->
+  case process.subject_owner(handler.subject) {
+    Error(Nil) ->
       http_mist.Buffered(plain(503, "Relay HTTP endpoint is unavailable"))
-    Error(Some(Overloaded)) -> {
-      emit.http_rejected(
-        503,
-        telemetry.TooManyRequests,
-        sent_correlation(request),
-        None,
-      )
-      http_mist.Buffered(
-        plain(503, "Too many concurrent requests")
-        |> response.set_header("retry-after", "1"),
-      )
-    }
-    Error(Some(StreamsExhausted)) -> {
-      emit.http_rejected(
-        503,
-        telemetry.TooManyStreams,
-        sent_correlation(request),
-        None,
-      )
-      http_mist.Buffered(
-        plain(503, "Too many open subscription streams")
-        |> response.set_header("retry-after", "1"),
-      )
-    }
-    Ok(lease) -> {
-      let reply = serve_leased(handler, lease, request, closed, streaming)
-      case reply {
-        http_mist.Buffered(_) -> release(handler, lease.slot)
-        http_mist.Streamed(..) -> Nil
-      }
-      reply
-    }
+    Ok(endpoint) ->
+      request_owner.run(endpoint, closed, fn(cancel) {
+        let listen = is_listen(request.body)
+        case acquire(handler, listen, cancel) {
+          Error(None) ->
+            Error(
+              http_mist.Buffered(plain(
+                503,
+                "Relay HTTP endpoint is unavailable",
+              )),
+            )
+          Error(Some(refusal)) -> {
+            let #(reason, message) = case refusal {
+              Overloaded -> #(
+                telemetry.TooManyRequests,
+                "Too many concurrent requests",
+              )
+              StreamsExhausted -> #(
+                telemetry.TooManyStreams,
+                "Too many open subscription streams",
+              )
+            }
+            emit.http_rejected(503, reason, sent_correlation(request), None)
+            Error(http_mist.Buffered(
+              plain(503, message) |> response.set_header("retry-after", "1"),
+            ))
+          }
+          Ok(lease) ->
+            Ok(
+              request_owner.Setup(
+                lease.deadline,
+                duration.to_milliseconds(lease.config.cancellation_grace),
+                listen,
+                fn() {
+                  let reply = process.new_subject()
+                  process.send(
+                    handler.subject,
+                    RequestSettled(lease.slot, reply),
+                  )
+                  process.receive(
+                    reply,
+                    int.max(
+                      0,
+                      int.min(hub_timeout, lease.deadline - monotonic_ms()),
+                    ),
+                  )
+                  == Ok(Nil)
+                },
+                fn(scope) {
+                  serve_leased(handler, lease, request, scope, streaming)
+                },
+              ),
+            )
+        }
+      })
   }
 }
 
@@ -1069,7 +1107,7 @@ fn serve_leased(
   handler: Handler(context),
   lease: Lease(context),
   request: Request(BitArray),
-  closed: process.Selector(Nil),
+  scope: request_owner.Scope,
   streaming: Bool,
 ) -> http_mist.Reply {
   let config = lease.config
@@ -1108,7 +1146,7 @@ fn serve_leased(
                         request,
                         context,
                         correlation,
-                        closed,
+                        scope,
                         streaming && accepts_sse,
                       )
                   }
@@ -1229,7 +1267,7 @@ fn dispatch(
   request: Request(BitArray),
   context: context,
   correlation: Correlation,
-  closed: process.Selector(Nil),
+  scope: request_owner.Scope,
   stream: Bool,
 ) -> http_mist.Reply {
   let config = lease.config
@@ -1282,7 +1320,7 @@ fn dispatch(
                     body,
                     context,
                     correlation,
-                    closed,
+                    scope,
                     stream,
                   )
               }
@@ -1298,19 +1336,50 @@ fn run(
   body: BitArray,
   context: context,
   correlation: Correlation,
-  closed: process.Selector(Nil),
+  scope: request_owner.Scope,
   stream: Bool,
 ) -> http_mist.Reply {
   let config = lease.config
-  let timeout_ms = duration.to_milliseconds(config.request_timeout)
-  case start_broker(config.max_response_bytes) {
+  let timeout_ms = int.max(1, request_owner.remaining(scope))
+  case
+    request_owner.start_child(
+      scope,
+      fn() {
+        start_broker(config.max_response_bytes)
+        |> result.try(fn(broker) {
+          process.subject_owner(broker)
+          |> result.map(fn(pid) { #(pid, broker) })
+        })
+      },
+      stop_broker,
+    )
+  {
     Error(Nil) ->
       http_mist.Buffered(plain(500, "Relay could not answer the request"))
     Ok(broker) ->
       case
-        runtime.start(lease.server, runtime_config(config), fn(output) {
-          deliver(broker, output, timeout_ms)
-        })
+        request_owner.start_child(
+          scope,
+          fn() {
+            runtime.start_scoped(
+              lease.server,
+              runtime_config(config)
+                |> runtime.with_invocation_timeout(duration.milliseconds(
+                  timeout_ms,
+                )),
+              fn(output) {
+                deliver(
+                  broker,
+                  output,
+                  duration.to_milliseconds(config.request_timeout),
+                )
+              },
+              scope,
+            )
+            |> result.replace_error(Nil)
+          },
+          runtime.shutdown,
+        )
       {
         Error(_) -> {
           stop_broker(broker)
@@ -1374,11 +1443,14 @@ fn run(
                               )
                             False -> Nil
                           }
-                          transfer(broker, handler, lease.slot)
                           streamed(broker, config)
                         }
                         False ->
-                          buffered(broker, rt, exchange, closed, timeout_ms)
+                          buffered(
+                            broker,
+                            rt,
+                            int.max(1, request_owner.remaining(scope)),
+                          )
                       }
                   }
               }
@@ -1401,32 +1473,22 @@ fn streamed(
     next: fn(wait_ms) { next(broker, wait_ms) },
     close: fn() { client_gone(broker) },
     keepalive_ms: duration.to_milliseconds(config.sse_keepalive),
-    write_timeout_ms: duration.to_milliseconds(config.request_timeout),
+    write_budget: fn() { Ok(duration.to_milliseconds(config.request_timeout)) },
+    written: fn(_) { Nil },
+    attached: fn(_) { True },
   )
 }
 
 fn buffered(
   broker: Broker(context),
   rt: runtime.Runtime(context),
-  exchange: reducer.ExchangeId,
-  closed: process.Selector(Nil),
   timeout_ms: Int,
 ) -> http_mist.Reply {
   let deadline = monotonic_ms() + timeout_ms
-  case collect(broker, closed, deadline, []) {
+  case collect(broker, deadline, []) {
     Collected(frames) -> {
       finish(broker, rt)
       http_mist.Buffered(respond_with_frames(frames))
-    }
-    ClientClosed -> {
-      // The same reducer path as a stdio cancellation: the exchange closes,
-      // its invocation is cancelled, and no response is written.
-      runtime.exchange_closed(rt, exchange)
-      finish(broker, rt)
-      http_mist.Buffered(
-        plain(499, "Client closed the request")
-        |> response.set_header("connection", "close"),
-      )
     }
     TooLate -> {
       finish(broker, rt)
@@ -1440,7 +1502,6 @@ fn buffered(
 
 type Collection {
   Collected(List(BitArray))
-  ClientClosed
   TooLate
 }
 
@@ -1448,34 +1509,28 @@ const poll_ms = 50
 
 fn collect(
   broker: Broker(context),
-  closed: process.Selector(Nil),
   deadline: Int,
   frames: List(BitArray),
 ) -> Collection {
-  case process.selector_receive(closed, 0) {
-    Ok(Nil) -> ClientClosed
-    Error(Nil) -> {
-      let remaining = deadline - monotonic_ms()
-      case remaining <= 0 {
-        True -> TooLate
-        False ->
-          case next(broker, int.min(remaining, poll_ms)) {
-            http_mist.Idle -> collect(broker, closed, deadline, frames)
-            http_mist.Ended ->
-              case frames {
-                [] -> TooLate
-                _ -> Collected(list.reverse(frames))
-              }
-            http_mist.Data(bytes) -> {
-              let frames = [bytes, ..frames]
-              case v2026.is_response_frame(bytes) {
-                True -> Collected(list.reverse(frames))
-                False -> collect(broker, closed, deadline, frames)
-              }
-            }
+  let remaining = deadline - monotonic_ms()
+  case remaining <= 0 {
+    True -> TooLate
+    False ->
+      case next(broker, int.min(remaining, poll_ms)) {
+        http_mist.Idle -> collect(broker, deadline, frames)
+        http_mist.Ended ->
+          case frames {
+            [] -> TooLate
+            _ -> Collected(list.reverse(frames))
           }
+        http_mist.Data(bytes) -> {
+          let frames = [bytes, ..frames]
+          case v2026.is_response_frame(bytes) {
+            True -> Collected(list.reverse(frames))
+            False -> collect(broker, deadline, frames)
+          }
+        }
       }
-    }
   }
 }
 
@@ -1491,7 +1546,6 @@ type BrokerMessage(context) {
   WaitExpired(ref: Int)
   Peek(reply: Subject(#(List(BitArray), Bool)))
   AttachRuntime(runtime: runtime.Runtime(context), exchange: reducer.ExchangeId)
-  TransferSlot(hub: Subject(Message(context)), slot: Int)
   ClientGone
   Finish
 }
@@ -1506,7 +1560,6 @@ type BrokerState(context) {
     limit: Int,
     waiting: Option(#(Int, Subject(http_mist.Event))),
     runtime: Option(#(runtime.Runtime(context), reducer.ExchangeId)),
-    slot: Option(#(Subject(Message(context)), Int)),
   )
 }
 
@@ -1524,7 +1577,6 @@ fn start_broker(limit: Int) -> Result(Broker(context), Nil) {
       limit: limit,
       waiting: None,
       runtime: None,
-      slot: None,
     )
     |> actor.initialised
     |> actor.returning(self)
@@ -1542,18 +1594,6 @@ fn attach_runtime(
   exchange: reducer.ExchangeId,
 ) -> Nil {
   process.send(broker, AttachRuntime(rt, exchange))
-}
-
-fn transfer(
-  broker: Broker(context),
-  handler: Handler(context),
-  slot: Int,
-) -> Nil {
-  process.send(broker, TransferSlot(handler.subject, slot))
-  case process.subject_owner(broker) {
-    Ok(pid) -> process.send(handler.subject, Transfer(slot, pid))
-    Error(Nil) -> Nil
-  }
 }
 
 // The runtime calls this synchronously, so it must not wait on a broker
@@ -1585,11 +1625,20 @@ fn deliver(
 }
 
 fn next(broker: Broker(context), wait_ms: Int) -> http_mist.Event {
-  let reply = process.new_subject()
-  process.send(broker, Next(wait_ms, reply))
-  case process.receive(reply, wait_ms + hub_timeout) {
-    Ok(event) -> event
+  case process.subject_owner(broker) {
     Error(Nil) -> http_mist.Ended
+    Ok(owner) -> {
+      let monitor = process.monitor(owner)
+      let reply = process.new_subject()
+      process.send(broker, Next(wait_ms, reply))
+      let answer =
+        process.new_selector()
+        |> process.select(reply)
+        |> process.select_specific_monitor(monitor, fn(_) { http_mist.Ended })
+        |> process.selector_receive(wait_ms + hub_timeout)
+      let _ = process.demonitor_process(monitor)
+      result.unwrap(answer, http_mist.Ended)
+    }
   }
 }
 
@@ -1603,12 +1652,10 @@ fn client_gone(broker: Broker(context)) -> Nil {
   process.send(broker, ClientGone)
 }
 
-// Ends a buffered request's runtime without holding its response: `close`
-// cancels whatever still runs, and the runtime stops itself once each
-// cancelled handler has returned or its grace has ended.
+// Starts buffered runtime cleanup. The request owner waits for owned processes
+// to terminate and for slot release before delivering a normal response.
 fn finish(broker: Broker(context), rt: runtime.Runtime(context)) -> Nil {
-  runtime.close(rt)
-  let _ = process.spawn_unlinked(fn() { runtime.stop(rt) })
+  runtime.shutdown(rt)
   process.send(broker, Finish)
 }
 
@@ -1688,8 +1735,6 @@ fn handle_broker(
     }
     AttachRuntime(rt, exchange) ->
       actor.continue(BrokerState(..state, runtime: Some(#(rt, exchange))))
-    TransferSlot(hub, slot) ->
-      actor.continue(BrokerState(..state, slot: Some(#(hub, slot))))
     ClientGone -> {
       case state.runtime {
         Some(#(rt, exchange)) -> runtime.exchange_closed(rt, exchange)
@@ -1701,27 +1746,15 @@ fn handle_broker(
   }
 }
 
-// Ends a stream the broker owns: stops its runtime without waiting on it
-// and frees its endpoint slot.
+// Request ownership counts the broker and runtime until both terminate.
 fn end_stream(
   state: BrokerState(context),
 ) -> actor.Next(BrokerState(context), BrokerMessage(context)) {
-  case state.slot {
-    Some(#(hub, slot)) -> {
-      case state.runtime {
-        Some(#(rt, _)) -> {
-          runtime.close(rt)
-          let _ = process.spawn_unlinked(fn() { runtime.stop(rt) })
-          Nil
-        }
-        None -> Nil
-      }
-      process.send(hub, Release(slot))
-      actor.stop()
-    }
-    // A buffered request finishes the broker itself.
-    None -> actor.continue(state)
+  case state.runtime {
+    Some(#(rt, _)) -> runtime.shutdown(rt)
+    None -> Nil
   }
+  actor.stop()
 }
 
 // --- request checks ----------------------------------------------------------

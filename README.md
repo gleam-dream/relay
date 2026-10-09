@@ -76,11 +76,14 @@ endpoint off loopback requires `http.allow_unauthenticated`; use
 `http.new_protected` to admit bearer tokens through your verifier. Stdio relies
 on a trusted parent process and provides no authorization.
 
-Requests and responses default to 1 MiB. The HTTP invocation and response waits
-and client request timeout default to 30 seconds. Context builders and bearer
-verifiers run before the HTTP budgets start, so callers must bound their work
-separately. The [complete defaults](docs/usage.md#defaults) identify each limit
-and its setting.
+Requests and responses default to 1 MiB. The HTTP admitted-request deadline and
+client request timeout default to 30 seconds. One HTTP deadline covers
+correlation, verification, context construction, finite execution and response
+writes. Relay owns each callback worker through the exchange; cleanup has a
+separate cancellation grace and retains capacity until owned work stops.
+Body reading precedes admission; established subscriptions retain their stream
+lifetime. See [callback ownership](docs/usage.md#request-deadlines-and-callback-ownership)
+and the [complete defaults](docs/usage.md#defaults).
 
 The [usage guide](docs/usage.md) retains examples for stdio, mounting in Wisp or
 Mist, bearer protection, deadlines, cancellation, headers, correlation and
