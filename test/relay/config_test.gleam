@@ -205,7 +205,12 @@ pub fn http_connect_is_lazy_test() {
   let assert Ok(peer) =
     client.connect(client.with_connect_timeout(config, duration.seconds(1)))
   let assert Error(error) = client.discover(peer)
-  client.reason(error) |> should.equal(client.ConnectFailed)
+  // A bound socket without a listener can refuse or time out, depending on
+  // the OS. Both must preserve evidence that no request was sent.
+  case client.reason(error) {
+    client.ConnectFailed | client.TimedOut(client.NotSent) -> Nil
+    unexpected -> unexpected |> should.equal(client.ConnectFailed)
+  }
   client.evidence(error) |> should.equal(client.NotSent)
   client.close(peer)
 }

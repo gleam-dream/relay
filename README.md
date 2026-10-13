@@ -6,18 +6,17 @@ targets Erlang.
 
 ## Installation
 
-Relay has no published release. It requires Gleam `>= 1.18.0` and sibling
-checkouts of `json_blueprint`, `sinal` and `http_gun`; the expected revisions are
-recorded in [sibling-revisions.txt](sibling-revisions.txt). A standalone checkout
-or Hex installation cannot resolve these local dependencies yet.
+Relay has no published release. It requires Gleam `>= 1.18.0`. Gleam fetches
+JSON Blueprint, Sinal and HTTP Gun from immutable Git references in `gleam.toml`.
+No sibling checkout is needed for package resolution.
 
-With your application beside these checkouts, add Relay and the Blueprint codecs
+For an application beside a local Relay checkout, add Relay and the Blueprint codecs
 used by the example to `gleam.toml`:
 
 ```toml
 [dependencies]
 relay = { path = "../relay" }
-json_blueprint = { path = "../json_blueprint" }
+json_blueprint = { git = "https://github.com/lostbean/json_blueprint.git", ref = "0015fc50ddfd334b9c44253c36dc429d29a5845d" }
 ```
 
 ## Serve a tool and call it
