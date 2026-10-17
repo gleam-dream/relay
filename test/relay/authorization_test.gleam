@@ -20,7 +20,8 @@ import sinal/correlation
 
 const resource_raw = "https://relay.example/mcp"
 
-const metadata_raw = "https://relay.example/.well-known/oauth-protected-resource/mcp"
+const metadata_raw =
+  "https://relay.example/.well-known/oauth-protected-resource/mcp"
 
 fn resource() -> authorization.ProtectedResource {
   let assert Ok(resource) = authorization.protected_resource(resource_raw)

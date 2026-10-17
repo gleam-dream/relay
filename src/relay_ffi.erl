@@ -381,7 +381,7 @@ receive_exit_status(Port, TimeoutMs) ->
     end.
 
 close_child(Port) ->
-    catch erlang:port_close(Port),
+    try erlang:port_close(Port) catch _:_ -> ok end,
     ok.
 
 sha256_hex(Bytes) ->
@@ -400,7 +400,7 @@ git_head(RepoPath) ->
     string:trim(unicode:characters_to_binary(Out)).
 
 stop_supervisor(Pid) when is_pid(Pid) ->
-    _ = catch sys:terminate(Pid, shutdown, 5000),
+    try sys:terminate(Pid, shutdown, 5000) catch _:_ -> ok end,
     nil.
 
 start_stdio_client_port(CmdBin, ArgsList, GleamSubject) ->
@@ -474,10 +474,10 @@ client_port_loop(Port, GleamSubject, ParentMon) ->
             Port ! {self(), {command, Bytes}},
             client_port_loop(Port, GleamSubject, ParentMon);
         {'DOWN', ParentMon, process, _, _} ->
-            catch erlang:port_close(Port),
+            try erlang:port_close(Port) catch _:_ -> ok end,
             ok;
         close ->
-            catch erlang:port_close(Port),
+            try erlang:port_close(Port) catch _:_ -> ok end,
             ok
     end.
 

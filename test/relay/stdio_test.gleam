@@ -10,7 +10,8 @@ import relay/runtime
 import relay/server
 import relay/stdio
 
-const runner = "erl -pa build/dev/erlang/*/ebin -noshell -run relay_stdio_runner main"
+const runner =
+  "erl -pa build/dev/erlang/*/ebin -noshell -run relay_stdio_runner main"
 
 @external(erlang, "relay_ffi", "spawn_stdio_child")
 fn spawn_child(cmd: String) -> Dynamic

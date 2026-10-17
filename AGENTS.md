@@ -10,7 +10,7 @@ Before changing a public facade, read the [public API guidelines](https://github
 
 ## Tooling
 
-- `nix develop` (or direnv): pinned Gleam, Erlang/OTP 28, rebar3, Node/pnpm, Python/jsonschema 4.26.0 and authored-tooling checks.
+- `nix develop` (or direnv): pinned Gleam, Erlang/OTP 29, rebar3, Node/pnpm, Python/jsonschema 4.26.0 and authored-tooling checks.
 - `nix fmt -- PATH...`: formats named authored files via treefmt. Keep formatting scoped; frozen protocol/TLS and negative compiler fixtures are excluded.
 - `lefthook`: pre-commit hook formats staged files and re-stages them.
 - `nix flake check`: fails iff the tree is not formatted (plus any existing checks).

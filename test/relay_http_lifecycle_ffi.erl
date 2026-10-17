@@ -32,8 +32,8 @@ with_listener(Start, Check) ->
         {ready, Owner, Hub, Listener} ->
             try Check(Owner, Hub, Listener)
             after
-                catch erlang:resume_process(Listener),
-                catch erlang:resume_process(Hub),
+                try erlang:resume_process(Listener) catch _:_ -> ok end,
+                try erlang:resume_process(Hub) catch _:_ -> ok end,
                 exit(Owner, kill),
                 demonitor(Ref, [flush])
             end;
@@ -56,7 +56,7 @@ stop_in_order(Owner, Hub, Listener) ->
     erlang:suspend_process(Hub),
     erlang:resume_process(Listener),
     ?assertEqual(shutdown, await_down(ListenerRef, Listener)),
-    catch erlang:resume_process(Hub),
+    try erlang:resume_process(Hub) catch _:_ -> ok end,
     %% The listener's intended shutdown must not become the hub's exit reason.
     ?assertEqual(normal, await_down(HubRef, Hub)),
     receive {stopped, Owner} -> ok

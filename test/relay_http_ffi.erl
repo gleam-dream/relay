@@ -276,8 +276,18 @@ with_unlistened_port(Callback) ->
 %% event was received, then suspend it to model a writer unable to progress.
 suspend_stream_writer(Port) ->
     Owners = [Pid || Socket <- erlang:ports(),
-        {ok, {_, LocalPort}} <- [catch inet:sockname(Socket)], LocalPort =:= Port,
-        {ok, _} <- [catch inet:peername(Socket)],
+        {ok, {_, LocalPort}} <- [try inet:sockname(Socket)
+            catch
+                throw:Value -> Value;
+                exit:Reason -> {'EXIT', Reason};
+                error:Reason:Stack -> {'EXIT', {Reason, Stack}}
+            end], LocalPort =:= Port,
+        {ok, _} <- [try inet:peername(Socket)
+            catch
+                throw:Value -> Value;
+                exit:Reason -> {'EXIT', Reason};
+                error:Reason:Stack -> {'EXIT', {Reason, Stack}}
+            end],
         {connected, Pid} <- [erlang:port_info(Socket, connected)]],
     case Owners of
         [Pid] -> erlang:suspend_process(Pid), {ok, Pid};
@@ -285,5 +295,5 @@ suspend_stream_writer(Port) ->
     end.
 
 resume_stream_writer(Pid) ->
-    catch erlang:resume_process(Pid),
+    try erlang:resume_process(Pid) catch _:_ -> ok end,
     nil.
