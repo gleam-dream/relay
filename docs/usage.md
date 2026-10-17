@@ -200,7 +200,39 @@ pub fn call_with_budget(
 A deadline or a cancellation that ends an HTTP call closes that call's
 connection, so the server stops its handler; the next call reconnects.
 `client.with_headers(config, fn() { [#("authorization", "Bearer " <> token())] })`
-adds headers to every request, computed per request. Over plain `http://`
+adds headers to every request, computed in a temporary request-owned process.
+The request budget includes acquisition, so a blocked callback ends on timeout,
+cancellation, caller exit, or closure of a Relay-owned client. The callback
+returns header values; captured application resources remain borrowed. A callback
+crash returns `InvalidConfig(Headers)` without exception details.
+
+A mutable token source belongs to an application actor. Request its value from
+that actor; a header worker cannot receive from a `Subject` created by the caller.
+For an application-defined `GetToken(reply)` message:
+
+```gleam
+config
+|> client.with_headers(fn() {
+  let token = process.call(token_source, 1000, GetToken)
+  [#("authorization", "Bearer " <> token)]
+})
+```
+
+The application's token actor owns `token_source` and replies to `GetToken`.
+Relay stops only its temporary acquisition worker; it does not stop that actor.
+
+For subscriptions, the same opening budget covers headers, HTTP opening and
+acknowledgement. After acknowledgement the relative timeout no longer applies;
+explicit absolute deadlines and cancellation still apply. Terminal transport or
+notification errors close the stream. Close a successful subscription explicitly.
+Relay retains the HTTP body in the process that called `listen`.
+
+Injected HTTP clients keep their existing cancellation and absolute deadline when
+Relay adds its relative request bound. An explicit Relay cancellation or deadline
+view retains its documented replacement behavior. Closing a Relay client with an
+injected HTTP client does not stop borrowed requests or that client.
+
+Over plain `http://`
 a client with headers reaches only loopback addresses unless
 `client.allow_plaintext_headers`.
 

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- HTTP client header acquisition runs in a request-owned worker. One budget covers acquisition, transport and subscription acknowledgement; cancellation and caller exit stop blocked acquisition without later dispatch. Header callback crashes return sanitized `InvalidConfig(Headers)` failures.
+- Established client subscriptions retain their explicit deadline/cancellation and caller-owned HTTP body. Their relative opening timeout ends at acknowledgement. Borrowed HTTP cancellation remains effective alongside Relay's request cancellation.
+
 - Typed MCP `2026-07-28` server and client: reusable definitions, native contextual handlers, tools, resources, prompts, completion, paged declarations and input-required continuations.
 - Buffered HTTP mounting and streaming Mist serving; stdio and in-process clients; bounded transport and runtime settings, cancellation grace, live registry updates and subscriptions.
 - Bearer admission, exact resource/scopes, RFC 6750 challenges and RFC 9728 metadata through a caller verifier. Per-call correlation, headers, deadlines, cancellation and idempotency metadata retain their distinct authority.

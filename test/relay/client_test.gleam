@@ -400,13 +400,23 @@ pub fn protected_server_answers_401_with_its_challenge_test() {
 
   // Headers are computed for each request: the first token is bad, the
   // second good.
-  let tokens = process.new_subject()
-  process.send(tokens, "bad")
-  process.send(tokens, "good")
+  // The token source owns its mailbox. Header workers request values instead
+  // of receiving from the test process's Subject.
+  let ready = process.new_subject()
+  let _ =
+    process.spawn(fn() {
+      let tokens = process.new_subject()
+      process.send(ready, tokens)
+      let first = process.receive_forever(tokens)
+      process.send(first, "bad")
+      let second = process.receive_forever(tokens)
+      process.send(second, "good")
+    })
+  let assert Ok(tokens) = process.receive(ready, 1000)
   let assert Ok(refreshing) =
     config
     |> client.with_headers(fn() {
-      let assert Ok(token) = process.receive(tokens, 0)
+      let token = process.call(tokens, 1000, fn(reply) { reply })
       [#("authorization", "Bearer " <> token)]
     })
     |> client.connect

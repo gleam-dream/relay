@@ -98,6 +98,7 @@ import json/blueprint/value.{type Value}
 import relay/completion
 import relay/content.{type ContentBlock, type ResourceContents}
 import relay/internal/carrier
+import relay/internal/client_http_owner as http_owner
 import relay/internal/core
 import relay/internal/emit
 import relay/internal/protocol/v2026_07_28 as v2026
@@ -304,7 +305,9 @@ pub fn in_process(server: Server(context), context: context) -> Config {
   )
 }
 
-/// How long one request may take; a view's `with_deadline` can shorten it.
+/// How long one request may take, including dynamic headers. A view's
+/// `with_deadline` can shorten it. For subscriptions this bounds opening and
+/// acknowledgement; an established stream keeps its own lifetime.
 pub fn with_timeout(config: Config, timeout: Duration) -> Config {
   Config(..config, timeout: timeout)
 }
@@ -337,6 +340,13 @@ pub fn with_listing_limits(config: Config, pages: Int, items: Int) -> Config {
 /// Adds headers to every HTTP request, computed per request so a
 /// refreshing token source plugs in:
 /// `with_headers(config, fn() { [#("authorization", "Bearer " <> token())] })`.
+/// The callback runs in a temporary request-owned process within the request
+/// budget. It returns header data; do not return or retain resources whose
+/// lifetime depends on that temporary process. Cancellation and caller exit
+/// terminate blocked acquisition. A callback crash returns
+/// `InvalidConfig(Headers)` without exception details. Captured application
+/// resources remain borrowed; detached work and remote effects are not adopted.
+///
 /// Header names must be lowercase. Over plain `http://`, a client with
 /// headers reaches only loopback addresses unless `allow_plaintext_headers`.
 pub fn with_headers(
@@ -647,7 +657,7 @@ type Outgoing {
 
 type Budget {
   Budget(
-    timeout_ms: Int,
+    opening_deadline: Int,
     deadline: Option(Deadline),
     cancellation: Option(Token),
     correlation: Correlation,
@@ -664,7 +674,11 @@ type Incoming {
 }
 
 type Stream {
-  Stream(next: fn(Int) -> Result(Option(BitArray), Error), close: fn() -> Nil)
+  Stream(
+    next: fn(Int) -> Result(Option(BitArray), Error),
+    close: fn() -> Nil,
+    establish: fn() -> Result(Nil, Error),
+  )
 }
 
 type Peer {
@@ -748,7 +762,8 @@ pub fn connect(config: Config) -> Result(Client, Error) {
 }
 
 /// Closes the connection and every request and stream on it, without
-/// waiting for them. An in-flight call ends with `Cancelled(MaybeSent)`: over
+/// waiting for them. Closing during HTTP header acquisition returns
+/// `Cancelled(NotSent)`; an already-dispatched call retains `MaybeSent`. Over
 /// HTTP its connection closes, which cancels it on the server; over stdio the
 /// child is closed; in process its handler is cancelled and keeps the
 /// runtime's cancellation grace. A caller's HTTP Gun client
@@ -830,8 +845,13 @@ fn check_idempotency_key(
 }
 
 fn budget(client: Client, call: Correlation) -> Budget {
+  let timeout = ms(client.config.timeout)
+  let remaining = case client.deadline {
+    Some(at) -> int.min(timeout, ms(deadline.remaining(at)))
+    None -> timeout
+  }
   Budget(
-    timeout_ms: ms(client.config.timeout),
+    opening_deadline: monotonic_ms() + remaining,
     deadline: client.deadline,
     cancellation: client.cancellation,
     correlation: call,
@@ -840,11 +860,7 @@ fn budget(client: Client, call: Correlation) -> Budget {
 }
 
 fn remaining_ms(budget: Budget) -> Int {
-  case budget.deadline {
-    None -> budget.timeout_ms
-    Some(deadline) ->
-      int.min(budget.timeout_ms, ms(deadline.remaining(deadline)))
-  }
+  int.max(0, budget.opening_deadline - monotonic_ms())
 }
 
 fn is_cancelled(budget: Budget) -> Bool {
@@ -905,15 +921,43 @@ fn http_peer(
       }
     }
   })
+  let lifetime = case owned {
+    True -> Some(http_owner.peer_lifetime())
+    False -> None
+  }
   let scheme = case secure {
     True -> http.Https
     False -> http.Http
   }
-  let build = fn(out: Outgoing, accept: String, budget: Budget) {
-    let extra = case config.headers {
-      Some(headers) -> headers()
-      None -> []
+  let acquire = fn(budget: Budget) {
+    let closed = case lifetime {
+      Some(pid) -> !process.is_alive(pid)
+      None -> False
     }
+    use Nil <- result.try(case closed {
+      True -> Error(Failed(ConnectionClosed(NotSent), budget.correlation))
+      False -> Ok(Nil)
+    })
+    let headers = option.unwrap(config.headers, fn() { [] })
+    let stream_deadline =
+      option.map(budget.deadline, fn(at) {
+        monotonic_ms() + ms(deadline.remaining(at))
+      })
+    http_owner.acquire(
+      headers,
+      budget.opening_deadline,
+      stream_deadline,
+      budget.cancellation,
+      lifetime,
+    )
+    |> result.map_error(header_failure(_, budget.correlation))
+  }
+  let build = fn(
+    out: Outgoing,
+    accept: String,
+    budget: Budget,
+    extra: List(#(String, String)),
+  ) {
     let base =
       request.new()
       |> request.set_method(http.Post)
@@ -954,13 +998,18 @@ fn http_peer(
   Ok(
     Peer(
       send: fn(out, budget) {
+        use #(headers, owner) <- result.try(acquire(budget))
         let client =
           view(
             budget,
-            gun_config.After(duration.milliseconds(budget.timeout_ms)),
+            gun_config.After(duration.milliseconds(remaining_ms(budget))),
           )
           |> http_gun.with_body_limit(budget.max_bytes, http_gun.Fail)
-        case http_gun.send(client, build(out, "application/json", budget)) {
+          |> http_gun.with_additional_cancellation(http_owner.token(owner))
+        let outcome =
+          http_gun.send(client, build(out, "application/json", budget, headers))
+        let stopped = http_owner.finish(owner)
+        case outcome {
           Ok(buffered) ->
             Ok(Incoming(
               buffered.response.status,
@@ -968,25 +1017,44 @@ fn http_peer(
               www_authenticate(buffered.response.headers),
             ))
           Error(failure) ->
-            Error(gun_failure(failure, budget.max_bytes, budget.correlation))
+            Error(owned_failure(
+              gun_failure(failure, budget.max_bytes, budget.correlation),
+              stopped,
+            ))
         }
       },
       listen: fn(out, budget) {
-        let client = view(budget, gun_config.Infinity)
-        case http_gun.open(client, build(out, "text/event-stream", budget)) {
+        use #(headers, owner) <- result.try(acquire(budget))
+        let client =
+          view(budget, gun_config.Infinity)
+          |> http_gun.with_additional_cancellation(http_owner.token(owner))
+        case
+          http_gun.open(
+            client,
+            build(out, "text/event-stream", budget, headers),
+          )
+        {
           Error(failure) ->
-            Error(gun_failure(failure, budget.max_bytes, budget.correlation))
+            Error(owned_failure(
+              gun_failure(failure, budget.max_bytes, budget.correlation),
+              http_owner.finish(owner),
+            ))
           Ok(response) ->
             case response.status {
               200 ->
-                Ok(sse_stream(
-                  response.body,
-                  budget.max_bytes,
+                Ok(owned_stream(
+                  sse_stream(
+                    response.body,
+                    budget.max_bytes,
+                    budget.correlation,
+                  ),
+                  owner,
                   budget.correlation,
                 ))
               status -> {
                 let collected = body.collect(response.body, budget.max_bytes)
                 body.close(response.body)
+                let stopped = http_owner.finish(owner)
                 case collected {
                   Ok(collected) ->
                     Error(status_error(
@@ -998,10 +1066,9 @@ fn http_peer(
                       budget.correlation,
                     ))
                   Error(failure) ->
-                    Error(gun_failure(
-                      failure,
-                      budget.max_bytes,
-                      budget.correlation,
+                    Error(owned_failure(
+                      gun_failure(failure, budget.max_bytes, budget.correlation),
+                      stopped,
                     ))
                 }
               }
@@ -1010,11 +1077,69 @@ fn http_peer(
       },
       close: fn() {
         case owned {
-          True -> http_gun.stop(gun)
+          True -> {
+            option.map(lifetime, process.kill)
+            http_gun.stop(gun)
+          }
           False -> Nil
         }
       },
     ),
+  )
+}
+
+fn header_failure(failure: http_owner.Failure, call: Correlation) -> Error {
+  Failed(
+    case failure {
+      http_owner.TimedOut -> TimedOut(NotSent)
+      http_owner.Cancelled -> Cancelled(NotSent)
+      http_owner.HeadersFailed -> InvalidConfig(Headers)
+    },
+    call,
+  )
+}
+
+fn owned_failure(error: Error, stopped: Option(http_owner.Failure)) -> Error {
+  case error.reason, stopped {
+    Cancelled(evidence), Some(http_owner.TimedOut) ->
+      Failed(TimedOut(evidence), error.correlation)
+    _, _ -> error
+  }
+}
+
+fn owned_stream(
+  stream: Stream,
+  owner: http_owner.Owner,
+  call: Correlation,
+) -> Stream {
+  Stream(
+    next: fn(wait) {
+      case stream.next(wait) {
+        Ok(event) -> Ok(event)
+        Error(error) -> {
+          stream.close()
+          Error(owned_failure(error, http_owner.finish(owner)))
+        }
+      }
+    },
+    close: fn() {
+      stream.close()
+      let _ = http_owner.finish(owner)
+      Nil
+    },
+    establish: fn() {
+      http_owner.establish(owner)
+      |> result.map_error(fn(failure) {
+        Failed(
+          case failure {
+            http_owner.TimedOut -> TimedOut(MaybeSent)
+            http_owner.Cancelled -> Cancelled(MaybeSent)
+            http_owner.HeadersFailed -> InvalidConfig(Headers)
+          },
+          call,
+        )
+      })
+    },
   )
 }
 
@@ -1053,6 +1178,7 @@ fn sse_stream(stream: body.Body, limit: Int, call: Correlation) -> Stream {
   let buffer = process.new_subject()
   process.send(buffer, <<>>)
   Stream(
+    establish: fn() { Ok(Nil) },
     next: fn(wait_ms) {
       let assert Ok(pending) = process.receive(buffer, 0)
       let #(event, rest, outcome) =
@@ -1186,6 +1312,7 @@ fn stdio_peer(
               let first = process.new_subject()
               process.send(first, Some(acknowledgement))
               Stream(
+                establish: fn() { Ok(Nil) },
                 next: fn(wait_ms) {
                   case process.receive(first, 0) {
                     Ok(Some(frame)) -> {
@@ -1332,6 +1459,7 @@ fn in_process_peer(
         let call = budget.correlation
         use #(exchange, outputs) <- result.map(open(out, call))
         Stream(
+          establish: fn() { Ok(Nil) },
           next: fn(wait_ms) {
             case process.receive(outputs, wait_ms) {
               Error(Nil) -> Ok(None)
@@ -2455,7 +2583,10 @@ pub opaque type Subscription {
 }
 
 /// Opens a stream for these notifications; `ResourceUpdated(uri)` subscribes
-/// to one resource. Returns once the server acknowledged it.
+/// to one resource. Returns once the server acknowledged it. One request budget
+/// covers dynamic headers, transport opening and acknowledgement. The relative
+/// timeout stops applying after acknowledgement; explicit absolute deadlines
+/// and cancellation continue to apply to the established stream.
 pub fn listen(
   client: Client,
   notifications: List(Notification),
@@ -2467,11 +2598,12 @@ pub fn listen(
     envelope(client, id, "subscriptions/listen", [
       #("notifications", v2026.filter_to_json(subs.filter_of(notifications))),
     ])
+  let budget = budget(client, call)
   use stream <- result.try(client.peer.listen(
     Outgoing(body, id, "subscriptions/listen", None),
-    budget(client, call),
+    budget,
   ))
-  let wait = remaining_ms(budget(client, call))
+  let wait = remaining_ms(budget)
   case stream.next(wait) {
     Error(error) -> {
       stream.close()
@@ -2483,7 +2615,14 @@ pub fn listen(
     }
     Ok(Some(frame)) ->
       case acknowledgement(frame, id, call) {
-        Ok(confirmed) -> Ok(Subscription(stream, id, confirmed, call))
+        Ok(confirmed) ->
+          case stream.establish() {
+            Ok(Nil) -> Ok(Subscription(stream, id, confirmed, call))
+            Error(error) -> {
+              stream.close()
+              Error(error)
+            }
+          }
         Error(error) -> {
           stream.close()
           Error(error)
@@ -2498,7 +2637,8 @@ pub fn listening(subscription: Subscription) -> List(Notification) {
 }
 
 /// Waits at most `wait` for the next notification; `Ok(None)` means none
-/// arrived. The stream stays open after a wait.
+/// arrived. The stream stays open after a wait. A terminal transport or
+/// protocol failure closes the stream and releases its request owner.
 pub fn next_notification(
   subscription: Subscription,
   wait: Duration,
@@ -2507,8 +2647,13 @@ pub fn next_notification(
     Error(error) -> Error(error)
     Ok(None) -> Ok(None)
     Ok(Some(frame)) ->
-      notification(frame, subscription.id, subscription.call)
-      |> result.map(Some)
+      case notification(frame, subscription.id, subscription.call) {
+        Ok(notification) -> Ok(Some(notification))
+        Error(error) -> {
+          subscription.stream.close()
+          Error(error)
+        }
+      }
   }
 }
 

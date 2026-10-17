@@ -6,18 +6,26 @@ targets Erlang.
 
 ## Installation
 
-Relay has no published release. It requires Gleam `>= 1.18.0`. Gleam fetches
-JSON Blueprint, Sinal and HTTP Gun from immutable Git references in `gleam.toml`.
-No sibling checkout is needed for package resolution.
+Relay has no published release. It requires Gleam `>= 1.18.0`. The package
+manifest pins its sibling dependencies to immutable Git revisions; the expected
+revisions are also recorded in [sibling-revisions.txt](sibling-revisions.txt).
+Application manifests should use a reviewed immutable Relay revision and the
+same Blueprint revision when importing its codecs.
 
-For an application beside a local Relay checkout, add Relay and the Blueprint codecs
-used by the example to `gleam.toml`:
+Coordinated unpublished changes require a separate local-source experiment.
+Overriding only Relay with a path does not override its transitive Git
+requirements. From the sibling Oversight checkout, capture the entire current
+source graph and run the retained consumer:
 
-```toml
-[dependencies]
-relay = { path = "../relay" }
-json_blueprint = { git = "https://github.com/lostbean/json_blueprint.git", ref = "0015fc50ddfd334b9c44253c36dc429d29a5845d" }
+```sh
+nix develop --command python3 -B scripts/local_sources.py --output /tmp/relay-local-sources
+nix develop --command sh -c 'cd /tmp/relay-local-sources/oversight/playground/relay_admission && ERL_FLAGS="+S 4:4" gleam test'
 ```
+
+Choose a new output directory for each capture. The
+[consumer instructions](../oversight/playground/relay_admission/README.md)
+distinguish this unpublished evidence from the immutable dependency baseline.
+The source manifests and recorded revisions remain unchanged by the capture.
 
 ## Serve a tool and call it
 
@@ -84,6 +92,13 @@ separate cancellation grace and retains capacity until owned work stops.
 Body reading precedes admission; established subscriptions retain their stream
 lifetime. See [callback ownership](docs/usage.md#request-deadlines-and-callback-ownership)
 and the [complete defaults](docs/usage.md#defaults).
+
+Client header callbacks also run in temporary request-owned processes. The client
+request timeout covers header acquisition and transport; subscription opening
+includes acknowledgement. Established subscriptions keep their explicit deadline,
+cancellation and caller-owned response body. Closing a Relay-owned HTTP client
+signals blocked acquisition as well as its transport requests. Injected clients
+remain application-owned. See [client controls](docs/usage.md#call-with-a-deadline-cancellation-and-headers).
 
 The [usage guide](docs/usage.md) retains examples for stdio, mounting in Wisp or
 Mist, bearer protection, deadlines, cancellation, headers, correlation and
