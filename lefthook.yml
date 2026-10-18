@@ -1,5 +1,5 @@
-# Seed template for lefthook. Install the hooks with `lefthook install`
-# (lefthook is provided by the flake devShell).
+# Git hooks for Relay. Install them with `lefthook install` (lefthook is
+# provided by the flake devShell).
 #
 # The pre-commit hook formats only STAGED files via `nix fmt` and re-stages
 # the results (stage_fixed: true). A commit with unformatted code is fixed
