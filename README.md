@@ -6,11 +6,10 @@ targets Erlang.
 
 ## Installation
 
-Relay has no published release. It requires Gleam `>= 1.18.0`. The package
-manifest pins its sibling dependencies to immutable Git revisions, which
-[sibling-revisions.txt](sibling-revisions.txt) also records. Application
-manifests should use a reviewed immutable Relay revision and the same Blueprint
-revision when importing its codecs.
+Relay has no published release. It requires Gleam `>= 1.18.0`. Its unpublished
+siblings, Sinal, HTTP Gun and JSON Blueprint, are Git dependencies on `main`;
+`manifest.toml` locks the resolved commits, and `gleam update <package>` moves
+one by hand. Application manifests import Relay and Blueprint the same way.
 
 Overriding only Relay with a path does not override its transitive Git
 requirements. A coordinated change across siblings is tested by capturing the

@@ -41,10 +41,8 @@ records how the gate runs it. [AGENTS.md](../AGENTS.md) lists the commands.
 - **Compiler controls.** `scripts/check_negative_fixtures.py` requires every
   positive control to compile and every negative fixture to fail with the
   diagnostic fragments listed beside it.
-- **Checksums and pins.** `test/relay/provenance_test.gleam` asserts the schema
-  checksum and that the resolved Sinal, HTTP Gun and JSON Blueprint packages match
-  [`sibling-revisions.txt`](../sibling-revisions.txt) in revision, version and licence.
-  `scripts/check.py` rejects a malformed or incomplete pin file before any check runs.
+- **Schema checksum.** `test/relay/provenance_test.gleam` asserts the schema
+  checksum.
 
 ## Exclusions and deliberate differences
 
