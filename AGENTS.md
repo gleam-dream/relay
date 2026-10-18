@@ -1,35 +1,40 @@
 # Agent Instructions
 
-## About this repo
+`relay` implements frozen MCP `2026-07-28` server and client behavior for Gleam over stdio and Streamable HTTP. The design layer under `docs/` owns contracts, vocabulary and rationale; read it and the relevant ADR before changing behavior.
 
-`relay` implements frozen MCP `2026-07-28` server/client behavior for Gleam over stdio and Streamable HTTP. The native pending ledger preserves unbuilt full-scope capabilities and unresolved guarantees.
-
-Ports/wraps: Model Context Protocol. Design: [docs/design/design.typ](docs/design/design.typ), [rendered design](docs/design/design-layer.pdf), [vocabulary](docs/design/CONTEXT.typ), and [decision rationale](docs/adr/).
-
-Before changing a public facade, read the [public API guidelines](https://github.com/gleam-dream/oversight/blob/main/PUBLIC-API-GUIDELINES.md). Check common use, advanced configuration, caller-owned types and failure handling through a separate consumer. Preserve full intended capability scope.
+Before changing a public facade, read the public API guidelines in the [Oversight repository](https://github.com/gleam-dream/oversight). Check common use, advanced configuration, caller-owned types and failure handling through a separate consumer. Preserve the full intended capability scope.
 
 ## Tooling
 
 - `nix develop` (or direnv): pinned Gleam, Erlang/OTP 29, rebar3, Node/pnpm, Python/jsonschema 4.26.0 and authored-tooling checks.
 - `nix fmt -- PATH...`: formats named authored files via treefmt. Keep formatting scoped; frozen protocol/TLS and negative compiler fixtures are excluded.
 - `lefthook`: pre-commit hook formats staged files and re-stages them.
-- `nix flake check`: fails iff the tree is not formatted (plus any existing checks).
+- `nix flake check`: fails iff the tree is not formatted.
 - `gleam test`: runs the test suite.
 
 ## Verification
 
-Use the authoritative registry from this checkout:
+Run the shared registry from this checkout:
 
 ```sh
 nix develop --command python3 -B scripts/check.py fast
 nix develop --command python3 -B scripts/check.py full
 ```
 
-`fast` checks formatting/static tools, gate regressions and strict root
-build/tests. `full` also checks compiler controls, frozen schema and checksum
-evidence, the complete pinned MCP server suite and the native design layer.
-CI splits the same registry into `ci` and `design` jobs and requires both.
-See docs/usage.md's verification inventory and its explicit conformance limits.
+- `fast`: tree formatting, Ruff correctness lint, ShellCheck, actionlint, gate regressions, strict native/Gleam build, all root tests, and the format, build and tests of the compiled usage examples in `examples/relay_usage`.
+- `ci`: all `fast` checks plus paired compiler controls, the jsonschema 4.26.0 frozen corpus and mutations, checksums and pins, and the complete pinned server conformance suite.
+- `design`: render freshness, vocabulary, links and layer integrity.
+- `full`: all `ci` and `design` obligations. CI requires the `ci` and `design` jobs.
+
+Focused commands: `cd examples/relay_usage && gleam test` (usage examples; `gleam run -m relay_usage/<module>` runs one), `sh scripts/conformance/run-server-suite.sh` (server suite), `python3 -B scripts/check_negative_fixtures.py` (compiler controls), `sh scripts/verify_checksums.sh` (frozen fixtures), and the design-gate commands in the fence below.
+
+Local-source experiments run from the [Oversight](https://github.com/gleam-dream/oversight) checkout, which captures the whole sibling source graph into a new output directory per run.
+
+## References
+
+- [docs/ORACLE.md](docs/ORACLE.md): the frozen MCP `2026-07-28` schema, the pinned `@modelcontextprotocol/conformance` server suite, the jsonschema validator and the scoped peers Relay is compared with, with their pins, classification rules and limits. Update it with any change to a pin, the corpus or the suite.
+- [examples/relay_usage](examples/relay_usage/README.md): compiled and run usage recipes. Change them with any public API change, because the fast gate builds and runs them.
+- Relay has no benchmark harness and makes no latency claim, so there is no `docs/BENCHMARKS.md`. Add one, linked from here and from `docs/ORACLE.md`, if a benchmark is introduced.
 
 <!-- agent-skills:begin -->
 <!-- framework-commit: cab7c0590036edaa66d8430cc5016399a9fd2c71 origin: git@github.com:lostbean/skills.git -->

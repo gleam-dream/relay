@@ -15,19 +15,19 @@
   ])
 
   #pending-ledger(
-    pending-entry(title: "Bind paging and input state to the admitted view", kind: "ruling", adr: [#adr(4)])[
+    pending-entry(title: "Bind paging and input state to the admitted view", kind: "ruling", since: "2026-10-06", adr: [#adr(4)])[
       The implemented cursor authenticates family and offset with the server key; continuation state authenticates the operation family and a nonce, without binding arguments, principal or outstanding response keys. The retained design requires catalog revision, tenant and authorized visible-view binding. Cross-trust-domain grant reuse, anonymous access, and policy changes between rounds need explicit semantics before claiming these stronger guarantees.
     ],
-    pending-entry(title: "Broaden dynamic schema interoperability deliberately", kind: "ruling", adr: [#adr(2)])[
-      MCP declarations may contain valid JSON Schema outside Blueprint's finite input-contract profile. UnsupportedSchema remains explicit; valid default-open schemas currently expose a Blueprint admission defect. Choosing a broader bounded contract port or an enlarged profile requires separate approval and external peer evidence.
+    pending-entry(title: "Broaden dynamic schema interoperability deliberately", kind: "ruling", since: "2026-10-06", adr: [#adr(2)])[
+      MCP declarations may contain valid JSON Schema outside Blueprint's finite input-contract profile. UnsupportedSchema remains explicit; valid default-open schemas outside that profile are refused by Blueprint admission. Choosing a broader bounded contract port or an enlarged profile requires separate approval and external peer evidence.
     ],
-    pending-entry(title: "Implement retained revision and OAuth strategies", kind: "build", adr: [#adr(1)])[
+    pending-entry(title: "Implement retained revision and OAuth strategies", kind: "build", since: "2026-10-06", adr: [#adr(1)])[
       Legacy 2025-11-25 sessions and their transport strategy, older retained revisions, client OAuth discovery/registration/PKCE/refresh flows, and selected extensions remain designed scope. Modern readiness never invents a legacy handshake.
     ],
-    pending-entry(title: "Complete protocol and public test support", kind: "build", adr: [#adr(7)])[
+    pending-entry(title: "Complete protocol and public test support", kind: "build", since: "2026-10-06", adr: [#adr(7)])[
       Resource-read continuation, an approved typed logging emitter, expanded paired/scripted/fake-clock transport and authorization-server helpers, and independently pinned client/auth/interoperability acceptance remain incomplete. Tasks, Apps, sender constraints, workload identity, target expansion, and release hardening require their scoped requirements and evidence.
     ],
-    pending-entry(title: "Verify resource claims at their actual boundaries", kind: "verify", adr: [#adr(3)])[
+    pending-entry(title: "Verify resource claims at their actual boundaries", kind: "verify", since: "2026-10-06", adr: [#adr(3)])[
       Request slots are acquired after Mist reads the bounded body; mounted callers pre-read it themselves. These limits do not establish a bound on incomplete body readers or all network processes. Comprehensive owner-death/process-count evidence, SSE reconnection/resumption where supported, and continuous drift/soak/fuzz coverage remain separate obligations.
     ],
   )
@@ -69,6 +69,19 @@
       [Bearer validity], [Configured verifier], [Attestation asserted by trusted adapter; Relay checks resource/scopes.],
       [Execution history], [Runtime actor], [One interpreter starts each admitted invocation; copied pure values do not prove exactly-once effects.],
       [Business retry and durability], [Application], [Submission evidence and cancellation never establish rollback.],
+    ))
+    #md-table(2, (
+      [*Public module*], [*Purpose*],
+      [`relay/tool`], [Tool definitions, handlers, the `Call` a handler sees, and declarations.],
+      [`relay/resources`, `relay/prompts`, `relay/completion`], [The other server services.],
+      [`relay/content`, `relay/subscriptions`], [Protocol data.],
+      [`relay/server`], [The server description.],
+      [`relay/http`, `relay/stdio`], [The server transports.],
+      [`relay/client`, `relay/client/output`], [The client and its optional typed-output projection.],
+      [`relay/authorization`], [Bearer tokens, admission, challenges and metadata.],
+      [`relay/telemetry`], [Sinal event descriptors.],
+      [`relay/runtime`, `relay/reducer`], [Custom transports: the runtime actor and the pure reducer.],
+      [`relay/testing`], [An in-process client, MCP requests for a mounted handler, and test verifiers.],
     ))
   ])
 
@@ -252,9 +265,9 @@
     #answers(title: "Endpoint owns admitted work and cleanup", responsibility: [Own current registry, admission slots, streams, optional listener and shutdown ordering.], interface: [new / new_with_context / new_protected, setters, handler, handle, mist_handler, start, supervised, stop; live registration and notify.], interactions: [Mist owns socket reads/writes; the endpoint leases a server snapshot and supervises each admitted request owner; the application router owns mounted endpoint lifetime.], invariants: [Validate completed config before binding; loopback default; nonloopback unprotected bind requires explicit opt-in; header/media/Host/Origin validation and byte/depth limits precede protocol work.], failure: [Typed startup settings/actor/listener failures; HTTP rejections with telemetry; capacity 503; body 413; buffered listen 406; pre-dispatch deadline expiry 504.])
     #points(
       [Each #term("term-request-owner") remains responsive to deadline expiry, serving-process death, peer disconnect where observable, and endpoint shutdown while a managed worker runs application callbacks. The worker remains alive through the admitted exchange, including finite streaming output and any successfully established subscription.],
-      [Slot admission establishes one absolute deadline before application correlation, context construction, or bearer verification. Admission consumes that budget; dispatch receives only the remaining duration. The owner checks deadline and cancellation authority before permitting dispatch and ignores late callback results. Actual handler entry rechecks authority after synchronous observations.],
+      [Slot admission establishes the #term("term-admitted-request-deadline") before application correlation, context construction, or bearer verification. Admission consumes that budget; dispatch receives only the remaining duration. The owner checks deadline and cancellation authority before permitting dispatch and ignores late callback results. Actual handler entry rechecks authority after synchronous observations.],
       [Expiry before dispatch returns HTTP 504 while the connection remains usable. Disconnect suppresses the response. The runtime classifies invocation failures while the request owner accounts for their termination. Expiry after dispatch retains runtime cancellation and protocol outcome semantics; it does not prove application effects never ran.],
-      [Expiry and disconnect begin a separate bounded cleanup interval using #term("term-cancellation-grace"). Normally completed buffered responses wait for owned work termination and acknowledged slot release within the original deadline. Retiring workers retain their request slots until owned request work terminates; capacity release never requires the callback to return voluntarily. Endpoint stop signals cancellation before listener shutdown. Owner death also cancels owned request work; a scoped handler receives cancellation once even when its runtime is blocked in an observation.],
+      [Expiry and disconnect begin a separate bounded cleanup interval using #term("term-cancellation-grace"). Normally completed buffered responses wait for owned work termination and acknowledged slot release within the original deadline. Retiring workers retain their request slots until owned request work terminates; capacity release never requires the callback to return voluntarily. Endpoint stop signals cancellation before listener shutdown and waits at most five seconds; it does not promise that every configured cleanup grace has elapsed before returning. Owner death also cancels owned request work; a scoped handler receives cancellation once even when its runtime is blocked in an observation.],
       [The deadline bounds finite response production and response waits. Mist registers its stream writer before the first pull; headers, events, keepalives and stream finalization check the current write budget. Writing the initial subscription acknowledgement successfully ends the finite request timer and uses the existing stream-capacity contract; the callback worker remains alive until that subscription closes. Mist's preceding body read remains outside this deadline.],
     )
     #state-type(id: "endpoint-phase", title: "Endpoint phase", variants: ("Configured", "Running", "Stopping", "Stopped", "Failed"))
@@ -291,7 +304,7 @@
     #behavior(title: "Blocked admission expires before dispatch", area: "HTTP admission timing", level: "interface")[
       #given[A configured callback remains blocked after its admitted request deadline.]
       #when[The deadline expires while the client remains connected.]
-      #then[The owner returns HTTP 504 and revokes dispatch authority without waiting for the callback.]
+      #then[The owner answers with a timeout refusal and revokes dispatch authority without waiting for the callback.]
       #then[No callback result from that request may invoke a tool.]
     ]
     #behavior(title: "Admission consumes the execution budget", area: "HTTP admission timing", level: "interface")[
@@ -306,7 +319,7 @@
       #then[Queued admission results cannot restore dispatch authority.]
     ]
     #behavior(title: "Disconnect closes blocked admission authority", area: "HTTP cancellation", level: "interface")[
-      #given[A streaming-capable HTTP connection closes while its callback is blocked.]
+      #given[A streaming-capable client connection closes while its callback is blocked.]
       #when[The request owner observes that closure.]
       #then[It suppresses output, revokes dispatch authority, and begins bounded cleanup.]
       #then[Late admission success cannot start a tool invocation.]
@@ -314,20 +327,20 @@
     #behavior(title: "Retiring work remains capacity bounded", area: "HTTP cleanup", level: "interface")[
       #given[All request slots are held by active or retiring owned work.]
       #when[Another request attempts admission.]
-      #then[The endpoint returns HTTP 503 until a slot's owned work terminates.]
+      #then[The server answers with an overload refusal until a slot's owned work terminates.]
       #then[Cleanup expiry forces termination without waiting for the callback to return.]
     ]
     #behavior(title: "Endpoint shutdown owns admitted callback work", area: "HTTP cleanup", level: "interface")[
-      #given[An endpoint has a request blocked in context creation or verification.]
-      #when[The endpoint stops or the serving owner dies.]
+      #given[A server has a request blocked in context creation or verification.]
+      #when[The server stops or the serving owner dies.]
       #then[The request loses dispatch authority and its owned work terminates within cancellation grace.]
       #then[Borrowed application resources retain their application-owned lifetime.]
     ]
     #behavior(title: "Callback failure isolates the mounted caller", area: "HTTP callback ownership", level: "interface")[
       #given[An application invokes the buffered mount from a live caller process.]
       #when[The managed callback crashes.]
-      #then[The request returns HTTP 500 and its owned work is cleaned up.]
-      #then[The caller remains alive and the endpoint can admit subsequent requests.]
+      #then[The request answers with a server-error refusal and its owned work is cleaned up.]
+      #then[The caller remains alive and the server can admit subsequent requests.]
     ]
     #behavior(title: "Callback resources retain the request worker", area: "HTTP callback ownership", level: "interface")[
       #given[A callback creates a Subject in its managed request worker.]
@@ -389,7 +402,7 @@
     #answers(title: "HTTP client request ownership", responsibility: [Bound dynamic header acquisition and transport under one request budget while preserving caller-owned HTTP bodies.], interface: [with_headers retains its callback signature; request timeout and per-call deadline/cancellation apply before dispatch.], interactions: [A request-owned worker computes headers. A responsive owner watches caller death, owned-peer closure and cancellation. The calling process opens and reads HTTP Gun bodies.], invariants: [Each wire request starts one relative budget before header acquisition. A supplied absolute deadline can shorten the budget. Header work ends before dispatch; timeout or cancellation prevents late dispatch. HTTP Gun submission evidence remains authoritative after dispatch.], failure: [Header callback failure becomes InvalidConfig(Headers) without exception details. Pre-dispatch timeout/cancellation carries NotSent. Owned work terminates on result, cancellation or caller death.])
     #points(
       [A Relay-owned HTTP peer retains a closure signal until explicit close or connector exit. Request owners monitor that signal. Injected HTTP clients have no Relay-owned closure signal.],
-      [Header callbacks run in a temporary request-owned process. They return header data, not process-affine resources. Application resources captured by the callback remain borrowed; arbitrary detached children and remote effects are not adopted. See #adr(11).],
+      [#term("term-header-acquisition") runs header callbacks in a temporary request-owned process. They return header data, not process-affine resources. Application resources captured by the callback remain borrowed; arbitrary detached children and remote effects are not adopted. See #adr(11).],
       [Subscription opening uses the same budget for headers, HTTP opening and the acknowledgement. Successful acknowledgement removes the relative opening limit. The explicit absolute deadline and cancellation continue to bound the established subscription. Closing or failing the stream releases its request owner.],
       [An injected HTTP Gun client's existing absolute deadline remains intact unless the caller explicitly installs a Relay deadline view. A relative Relay timeout never replaces that HTTP deadline. Per-page request budgets and separate continuation requests retain their existing boundaries.],
     )
@@ -456,6 +469,40 @@
     ]
   ])
 
+  #section(title: "Configuration surface", lead: "Every transport read, wait and retained queue has an explicit bound with a named setter.", body: [
+    #points([Callback execution and host body allocation have separate owners, described in the HTTP and client sections. A mounted host allocates its own request body before Relay sees it.])
+    #md-table(3, (
+      [*Setting*], [*Default*], [*Change with*],
+      [HTTP bind], [`127.0.0.1`, ephemeral port], [`http.with_bind`],
+      [HTTP bind off loopback without protection], [`start` fails], [`http.new_protected` or `http.allow_unauthenticated`],
+      [Host and Origin allow-lists], [Loopback names and the bind host], [`http.with_allowed_hosts`, `http.with_allowed_origins`],
+      [HTTP request body], [1 MiB, then 413], [`http.with_max_body_bytes`],
+      [HTTP response, or one stream's events], [1 MiB], [`http.with_max_response_bytes`],
+      [HTTP admitted-request deadline], [30 s from slot admission], [`http.with_request_timeout`],
+      [SSE keepalive], [15 s], [`http.with_sse_keepalive`],
+      [Concurrent HTTP requests], [1,024, then 503], [`http.with_max_concurrent_requests`],
+      [Concurrent `subscriptions/listen` streams], [64, then 503], [`http.with_max_listen_streams`],
+      [JSON nesting depth], [64, then 400], [`http.with_max_json_depth`, `runtime.with_max_json_depth`],
+      [Runtime live exchanges, frame size], [100; 1 MiB], [`runtime.with_max_live_exchanges`, `runtime.with_max_frame_bytes`],
+      [Runtime handler timeout], [30 s], [`runtime.with_invocation_timeout`],
+      [Cancelled handler grace before kill], [5 s], [`runtime.with_cancellation_grace`],
+      [Tombstones], [60 s, at most 10,000], [`runtime.with_tombstone_retention`, `runtime.with_max_tombstones`],
+      [Closed exchange records per connection], [About 10,000], [Fixed],
+      [Stdio read chunk], [4 KiB], [`stdio.with_chunk_size`],
+      [Client request timeout], [30 s], [`client.with_timeout`; per call `client.with_deadline`],
+      [Client connect], [10 s], [`client.with_connect_timeout`],
+      [Client response size], [1 MiB], [`client.with_max_response_bytes`],
+      [Client listings], [256 pages, 10,000 items], [`client.with_listing_limits`],
+      [Client stdio pending calls], [64, then `TooManyPendingCalls`], [`client.with_max_pending_calls`],
+      [Client input methods advertised], [None], [`client.with_input_methods`],
+      [Client headers over plain HTTP off loopback], [Refused], [`client.allow_plaintext_headers`],
+      [Client retries], [None; decide with `client.evidence`], [Not configurable],
+      [Request correlation], [The client's, else a fresh one], [`http.with_correlation`, `client.with_correlation`],
+      [Request idempotency key], [None], [`client.with_idempotency_key`],
+      [Completion values per response], [100], [`completion.Values(total:, has_more:)`],
+    ))
+  ])
+
   #section(title: "Bearer admission and tool policy", lead: "A trusted verifier supplies claims; Relay admits resource authority and applies current request policy.", body: [
     #points([The configured verifier's #term("term-attestation") is admitted against #term("term-protection") to produce a #term("term-grant"). The caller translates that grant into #term("term-context"); it does not replace endpoint admission with a web-login identity.])
     #answers(title: "Resource-server authorization", responsibility: [Parse bearer headers, admit exact resource/scopes, render challenges and metadata.], interface: [BearerToken/ProtectedResource/Scope constructors; verifier(name, fn(token,correlation)); attestation; admit; Grant readers; Protection; challenge and resource_metadata.], interactions: [new_protected calls the selected verifier and builds native context from Grant; Warden may supply an independently configured verifier recipe but Relay does not import it.], invariants: [Singleton exact resource audience; all endpoint scopes present; retain actual scopes; correlation never affects admission; token not retained as Grant field.], failure: [MissingToken, VerificationFailed, ResourceNotGranted and MissingEndpointScope produce distinct internal decisions; public HTTP status/challenge is sanitized.])
@@ -468,10 +515,10 @@
       [Hidden/denied/unknown tool], [One inaccessible protocol outcome], [No tool-existence disclosure; handler and decoder untouched.],
     ))
     #points(
-      [The verifier owns signature, issuer, expiry, status, algorithm, key rotation, introspection and sender-constraint checks. Its Attestation constructor can assert arbitrary claims; the application selects and trusts that implementation. Empty audience/scope strings are filtered before exact admission; duplicate/additional audiences still fail the singleton profile.],
+      [The #term("term-verifier") owns signature, issuer, expiry, status, algorithm, key rotation, introspection and sender-constraint checks. Its Attestation constructor can assert arbitrary claims; the application selects and trusts that implementation. Empty audience/scope strings are filtered before exact admission; duplicate/additional audiences still fail the singleton profile.],
       [Protection stores an absolute HTTP(S) resource URI without fragment, nonempty exact scopes and declared authorization servers. URI and scope equality are exact configured strings; no path, case, alias or audience-set normalization grants authority.],
       [BearerToken captures raw value inside a closure to reduce accidental inspect disclosure; token_value intentionally reveals it to the verifier. A caller-owned principal can still retain secrets, so token redaction remains an adapter and observation obligation.],
-      [new_protected runs admission on each HTTP request before building context. The historical protected-registry wrapper is superseded; grants are translated into native context and server.with_tool_access filters listings and rechecks visible+callable before argument decode. Per-input permissions remain in typed handlers.],
+      [new_protected runs admission on each HTTP request before building context. Grants are translated into native context and server.with_tool_access filters listings and rechecks visible+callable before argument decode. Per-input permissions remain in typed handlers.],
       [The metadata GET at `/.well-known/oauth-protected-resource` plus resource path reports resource, authorization servers, scopes and header bearer method. Challenge header escaping and status behavior belong to Relay; token validity remains outside it.],
       [A Warden web identity cannot substitute for a Relay grant. Relating a login identity to bearer principal, tenant and business access is explicit application policy. Multiple trust domains sharing resource and principal type need explicit verifier-origin reuse rules. See #adr(4).],
     )
@@ -497,7 +544,7 @@
       [Fabric invoke owns principal+key run identity, matching-input reopen, wait, cancellation and durable outcome. A Relay recipe copies request correlation/key, builds invoke request from native principal/input, sets its wait shorter than Relay's invocation budget, and returns native result plus application run metadata.],
       [For an unkeyed request the recipe forwards tool.cancelled to the owned invoke wait; keyed work may retain its durable run under application policy. Relay's JSON-RPC id and InvocationId never identify that durable run.],
       [Discovery has separate listing and schema/name admission boundaries. The application decides peer trust before treating readOnlyHint as evidence that MaybeSent work is safe to repeat. tool_hub trusts the inventory endpoint it owns; this is not a general trust policy for arbitrary remote peers.],
-      [Secure MCP uses a Warden resource-verifier recipe and native principal context. Warden validates token cryptography/introspection with its own limits; Relay maps resource/scope admission and challenges. Independent Warden bounds do not repair Relay's callback budget gap.],
+      [Secure MCP uses a Warden resource-verifier recipe and native principal context. Warden validates token cryptography/introspection with its own limits; Relay maps resource/scope admission and challenges. Relay's request deadline bounds verifier and context callbacks independently of Warden's own limits.],
     )
     #answers(title: "Correlation and telemetry", responsibility: [Carry request observation identity and emit typed protocol facts after transitions.], interface: [client.with_correlation, http.with_correlation, tool.correlation, telemetry event descriptors; Sinal observers.], interactions: [HTTP x-correlation-id and `_meta` io.github.gleam-dream/correlation join client, endpoint, verifier, handler and downstream events.], invariants: [Every request gets a Correlation; precedence is transport override, valid carried value, then fresh; accepted wire value is 1–128 visible ASCII; correlation never authorizes.], failure: [Invalid carried correlation is ignored rather than refusing the call; before-call errors carry a fresh local-only correlation; rejected frame has no admitted request correlation.])
     #md-table(2, (
@@ -509,6 +556,7 @@
       [authorization.decided], [Configured verifier/resource admission decision],
       [client.call], [Call outcome and elapsed duration with outgoing correlation],
     ))
+    #points([A handler reads the JSON-RPC id with `tool.request_id`, which returns the id as the client sent it, may repeat across clients and is fresh on a retry. `tool.invocation_id` is Relay's own id, new for every request, and joins the call's telemetry. Neither identifies a durable operation.])
     #points([Observation callbacks do not choose protocol results. Request ids, correlation and idempotency keys are untrusted independent values; the authenticated principal controls business authority. The optional idempotency metadata key is io.github.gleam-dream/idempotency-key, accepted only for 1–128 visible ASCII. See #adr(5).])
   ])
 
@@ -521,11 +569,25 @@
       [Pure/property/race histories], [One authoritative transition history, ids, terminal suppression], [Exclusive interpreter ownership or stopped external effects],
       [Runtime / real HTTP / child tests], [Measured process cleanup, acknowledged backpressure, disconnect and FIFO behavior], [All OS/library versions or untested admission/allocation bounds],
       [Pinned server conformance], [Emitted assertions for frozen 2026-07-28 server scenarios], [Client/auth/legacy support or zero-check scenario coverage],
-      [External consumers], [Common and advanced public usage with caller-native types and failure handling], [General third-party schema/peer trust or production provider acceptance],
+      [Compiled usage examples], [Each documented recipe builds and runs against the public API from a separate package, with caller-native types and failure handling], [General third-party schema/peer trust or production provider acceptance],
+    ))
+    #md-table(2, (
+      [*Validation profile*], [*Obligations and evidence*],
+      [`fast`], [Tree formatting, Ruff correctness lint, ShellCheck, actionlint, gate regressions, strict native and Gleam build, all root tests, and the format, strict build and tests of the usage examples package.],
+      [`ci`], [All `fast` checks plus paired compiler controls, the jsonschema 4.26.0 frozen corpus and mutations, checksums and pins, and the complete pinned server suite.],
+      [`design`], [Native render freshness, vocabulary, links and layer integrity.],
+      [`full`], [All `ci` and `design` obligations.],
     ))
     #points(
-      [test/fixtures/mcp_2026 retains upstream raw bytes, checksum, commit and MIT license. scripts/conformance retains package and lockfile; acceptance uses the pinned 0.2.0-alpha.10 requirement anchor. See #adr(7).],
-      [The pinned server gate requires assertions for every selected scenario and rejects missing results, skips, failures and warnings. The unpublished fixture validates its requested elicitation response, mutates the live tool catalog and publishes prompt notifications through the endpoint owner. See #adr(9).],
+      [One registry defines every #term("term-validation-profile") and CI requires the `ci` and `design` jobs, so a local and a CI pass mean the same. Each profile retains per-check logs, results, dependency revisions and environment and lock metadata; gates check the tree and never repair it. Builds treat Gleam warnings as errors and compile authored Erlang under `src`, `test` and `dev` independently with `erlc -Werror`. See #adr(12).],
+      [Generated dependencies, frozen MCP and TLS fixtures, the pnpm lockfile and deliberate negative compiler fixtures are excluded from authored formatting and lint. Ruff checks syntax, imports and undefined names and is not a type checker. Shell checks include authored extensionless stdio peers. No benchmark harness or latency claim exists.],
+      [The server check runs the pinned conformance package against all server scenarios of spec 2026-07-28 and retains structured results and the local server log on success or failure. A machine-result validator requires every selected scenario, rejects missing or skipped cases, failures, warnings and empty selections, and requires assertions from every selected scenario. Emitted assertions establish their tested scope; zero-assertion output establishes no coverage and fails the gate.],
+      [Each #term("term-sibling-revision-pin") for Sinal, HTTP Gun and JSON Blueprint is an immutable Git revision recorded in the manifest and in sibling-revisions.txt. CI checks out each sibling at its recorded ref with a read-only token and persists no credentials; fork pull requests run the same jobs. A change that spans Relay and a sibling is verified by a whole-graph local-source capture rather than a path override of Relay alone. See #adr(13).],
+    )
+    #points(
+      [test/fixtures/mcp_2026 retains upstream raw bytes, checksum, commit and MIT license. scripts/conformance retains package and lockfile; acceptance uses the pinned 0.2.0-alpha.10 requirement anchor. The reference pins, comparison classification and limits are kept in the #lnk("../ORACLE.md")[oracle document]. See #adr(7).],
+      [Usage is kept as compiled, runnable recipes in the #lnk("../../examples/relay_usage/README.md")[usage examples package], one module per recipe, mirrored by the README. The registry gives the package a gate owner, so an API change that breaks a recipe fails the gate. No standalone usage guide exists. See #adr(14).],
+      [Pinned #term("term-conformance-evidence") requires assertions for every selected scenario and rejects missing results, skips, failures and warnings. The unpublished fixture validates its requested elicitation response, mutates the live tool catalog and publishes prompt notifications through the endpoint owner. See #adr(9).],
       [Keep split UTF-8/large frames, broken stdout with idle stdin, owner/child death, equal wire ids, duplicate admission, cancellation races, tombstones, held-writer mailbox bounds, burst disconnect, registry-generation barriers, FIFO subscription timeout and overflow fixtures. Source assertion names supply reproduction points, not a test-run diary.],
       [Revision codecs, custom template matcher, generic verifier and reducer interpreter are extension contracts with different ownership. A new transport must prove framing, limits, disconnect/cancellation and cleanup from an external consumer; a buffering interface cannot fabricate socket ownership.],
       [A new protocol revision carries its schema, requirements, supported-method set and independent lifecycle strategy. Supported-version removal requires a major version; deprecation lasts at least a minor release. Older than 2025-03-26 is excluded.],
@@ -534,6 +596,7 @@
   ])
 
   #section(title: "Retained protocol strategies", lead: "Full scope includes separately modeled compatibility and authorization flows.", body: [
+    #points([Each #term("term-protocol-strategy") shares native definitions and ports with the others and keeps its own codec and lifecycle. The modern per-request strategy is implemented; the retained strategies below are designed scope.])
     #answers(title: "Legacy compatibility strategy", responsibility: [Admit a session through initialize, negotiate revision/capabilities and gate requests on initialized readiness.], interface: [Intended revision-bound client/server codecs and session owner; no legacy public runtime is implemented.], interactions: [Share native definitions, results and application ports; keep session registry, idle/max-session limits, transport resumption and revision notifications separate from modern POST-only execution.], invariants: [Reject repeated initialize, stale/unknown session, early normal calls and post-initialization version disagreement; resultType remains absent.], failure: [Revision-specific protocol failures, cleanup, unsupported capability and session termination outcomes; initialize cancellation rules must match the frozen revision.])
     #state-type(id: "legacy-phase", title: "Legacy session phase", variants: ("AwaitingInitialize", "AwaitingInitialized", "Ready", "Closed"))
     #entity(id: "legacy-session", title: "Legacy session", description: [Retained design for negotiated 2025-11-25 lifecycle, absent from modern state.], kind: "aggregate", owner: "legacy session runtime", lifecycle: "stateful", domain: "MCP", tint: "blue")[
@@ -546,11 +609,11 @@
     ), caption: [No transition from modern discovery creates this session. Early or repeated handshake messages reject without changing the phase.])
     #answers(title: "MCP client authorization strategy", responsibility: [Own MCP-specific resource discovery, issuer-bound credentials, scope step-up and bounded reauthorization.], interface: [Intended static bearer, authorization-code PKCE, client credentials and private-key-JWT modes; preregistration, permitted dynamic registration and client metadata documents; pluggable memory/file token custody.], interactions: [Challenge → RFC 9728 resource metadata → RFC 8414 or permitted OIDC metadata → registration → authorization/token exchange; application callback handles user interaction.], invariants: [Bind state, PKCE verifier, selected issuer, callback issuer, resource, redirect and scopes; reject replay/forged state; persist rotation before using refresh credentials; coalesce concurrent 401 flows.], failure: [Discovery/issuer/registration/token/PKCE/callback/step-up failures remain explicit; repeated 401 retry is bounded; malicious discovery cannot relax credential or network policy.])
     #points(
-      [Legacy 2025-03-26 and 2025-06-18 remain deferred supported-target ambitions. Deprecated dual-endpoint HTTP+SSE is optional compatibility; GET notification streams, Last-Event-ID, reconnect hints, ordered event replay and duplicate suppression require separate revision evidence. Parser carry-over alone does not prove exactly-once delivery.],
-      [Logging retains an approved typed request-scoped emitter and legacy set-level behavior where defined. Arbitrary handler JSON logging was rejected in prior automatic review and remains absent; no indirect sender may be treated as approved.],
+      [Legacy 2025-03-26 and 2025-06-18 are retained target ambitions. Deprecated dual-endpoint HTTP+SSE is optional compatibility; GET notification streams, Last-Event-ID, reconnect hints, ordered event replay and duplicate suppression require separate revision evidence. Parser carry-over alone does not prove exactly-once delivery.],
+      [Logging retains an approved typed request-scoped emitter and legacy set-level behavior where defined. Arbitrary handler JSON logging is absent; no indirect sender is an approved emitter.],
       [Retained resource-read continuation, rich client interactions, form/URL elicitation outcomes, roots, sampling and extension methods are capability checked and revision scoped. Deprecated server-initiated behavior is not transplanted into modern wire methods.],
       [Tasks, Apps, DPoP, mTLS sender constraints, replay checks and workload identity require explicit pinned models and consumers. Public helpers retain paired transports, fake clock, scripted peers and configurable authorization metadata/JWKS server as unbuilt support.],
-      [The retained eight-distribution and dual-target ambitions change no capability responsibility: one package remains the implemented distribution; independent package/target splits require consumer and dependency evidence. See #adr(1) and #adr(7).],
+      [Relay is one distribution on one target; independent package or target splits require consumer and dependency evidence and change no capability responsibility. See #adr(1) and #adr(7).],
     )
   ])
 
@@ -562,7 +625,7 @@
       [The endpoint allocates an exchange, the runtime admits one invocation and the handler receives Call with native context, correlation and cancellation. It performs lookup or explicitly maps a durable invoke port, whose wait must fit inside the transport budget.],
       [A successful structured answer has native output plus content mirror; a safe application failure becomes ToolFailed; a required input round returns an originating continuation. On lost delivery the client receives MaybeSent and must consult business identity/reconciliation before retrying a mutation.],
       [A streaming peer disconnect closes publication and signals cancellation; the worker gets grace to stop work it owns elsewhere. Client close releases Relay-owned resources; endpoint stop disconnects its listener failure link before intentional termination. Shared HTTP Gun and business receipts retain their own application owners.],
-      [The boundary gap is visible even in this path: verifier/context time is outside Relay's current invocation budget. A caller needing an end-to-end bound must bound those callbacks independently until the admission model is decided. No evidence above proves that an external business effect was undone.],
+      [One admitted-request deadline covers correlation, verification, context construction and finite execution; a callback that outlasts it loses dispatch authority. A caller needing a tighter bound sets the request timeout. No evidence above proves that an external business effect was undone.],
     )
   ])
 ]

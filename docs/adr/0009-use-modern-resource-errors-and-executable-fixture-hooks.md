@@ -19,4 +19,4 @@
 
 - [Resource renderer](../../src/relay/internal/jsonrpc.gleam), [modern reducer paths](../../src/relay/reducer.gleam), [resource regression](../../test/relay/service_test.gleam), [real HTTP check](../../test/relay/http_test.gleam), [fixture consumer](../../test/relay/conformance_fixture_test.gleam) and [machine-result validator](../../scripts/check_conformance_results.py) retain executable controls.
 - The prompt diagnostic proves the public owner's notification contract. It does not introduce live prompt catalog replacement. Client, authorization, legacy and other oracle requirements retain their independent evidence boundaries.
-- Raw MCP schema, upstream package/lock, negative compiler fixture and license bytes remain frozen. The full registry is the reproduction command in [usage verification](../usage.md#verification).
+- Raw MCP schema, upstream package/lock, negative compiler fixture and license bytes remain frozen. The full registry is the reproduction command in [verification instructions](../../AGENTS.md).

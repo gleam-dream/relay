@@ -22,7 +22,7 @@
 - [Focused backpressure acceptance](https://github.com/gleam-dream/oversight/blob/3baff7030a96d5b6cf78b2335c16d8c203727da5/docs/implementation/relay-llm-wire/relay-wave2-final-review.md) accepted held-writer mailbox and burst-disconnect evidence, not complete package conformance.
 - Current owners are [HTTP](../../src/relay/http.gleam), [runtime](../../src/relay/runtime.gleam), [Mist adapter](../../src/relay/internal/http_mist.gleam), [client](../../src/relay/client.gleam), [stdio framer](../../src/relay/internal/stdio_frames.gleam) and [FFI](../../src/relay_ffi.erl). [Runtime](../../test/relay/runtime_test.gleam), [HTTP](../../test/relay/http_test.gleam), [HTTP lifecycle](../../test/relay/http_lifecycle_test.gleam) and [stdio tests](../../test/relay/stdio_test.gleam) retain executable evidence.
 - Mist body reads precede Relay slot acquisition. Mounted callers allocate the body before `handle`. Incomplete body-reader count and full network allocation remain unmeasured; two FFI helpers inspect Mist's Connection record and require upgrade-specific regression checks.
-- [Admission timing](0008-admission-budget-remains-unresolved.md) remains unresolved; existing limits do not establish a whole-request callback bound.
+- [Admission timing](0008-admission-budget-remains-unresolved.md) was unresolved when these limits were accepted; [ADR 0010](0010-own-admission-and-execution-under-one-deadline.md) now owns the whole-request deadline.
 
 ## Current contract
 

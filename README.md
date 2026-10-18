@@ -7,29 +7,30 @@ targets Erlang.
 ## Installation
 
 Relay has no published release. It requires Gleam `>= 1.18.0`. The package
-manifest pins its sibling dependencies to immutable Git revisions; the expected
-revisions are also recorded in [sibling-revisions.txt](sibling-revisions.txt).
-Application manifests should use a reviewed immutable Relay revision and the
-same Blueprint revision when importing its codecs.
+manifest pins its sibling dependencies to immutable Git revisions, which
+[sibling-revisions.txt](sibling-revisions.txt) also records. Application
+manifests should use a reviewed immutable Relay revision and the same Blueprint
+revision when importing its codecs.
 
-Coordinated unpublished changes require a separate local-source experiment.
 Overriding only Relay with a path does not override its transitive Git
-requirements. From the sibling Oversight checkout, capture the entire current
-source graph and run the retained consumer:
+requirements. A coordinated change across siblings is tested by capturing the
+whole source graph from the [Oversight](https://github.com/gleam-dream/oversight)
+checkout:
 
 ```sh
-nix develop --command python3 -B scripts/local_sources.py --output /tmp/relay-local-sources
-nix develop --command sh -c 'cd /tmp/relay-local-sources/oversight/playground/relay_admission && ERL_FLAGS="+S 4:4" gleam test'
+nix develop --command python3 -B scripts/local_sources.py --output /tmp/relay-local-sources  # run in the Oversight checkout
 ```
 
-Choose a new output directory for each capture. The
-[consumer instructions](../oversight/playground/relay_admission/README.md)
-distinguish this unpublished evidence from the immutable dependency baseline.
-The source manifests and recorded revisions remain unchanged by the capture.
+Choose a new output directory for each capture. The capture leaves the source
+manifests and recorded revisions unchanged.
 
 ## Serve a tool and call it
 
-One `Definition` contains the input and output codecs used by both the server
+Every recipe below mirrors a module in [examples/relay_usage](examples/relay_usage/README.md),
+which the gate compiles and runs, so a recipe cannot drift from the API.
+This one is `serve_and_call`.
+
+One `Definition` holds the input and output codecs used by both the server
 handler and the client call.
 
 ```gleam
@@ -67,46 +68,106 @@ pub fn main() {
 
 The example binds an ephemeral loopback port and closes the client and endpoint
 after the call. In application code, handle each `Result` and close resources
-you created when a later operation fails. `http.stop` closes the endpoint
-without terminating its linked caller; unexpected listener failure still
-propagates through that link.
+you created when a later operation fails.
 
-`client.call` distinguishes success, tool failure, a request for input, and a
+`client.call` distinguishes success, tool failure, a request for input and a
 client error. Read `client.kind(error)` and `client.evidence(error)` before
-retrying: `MaybeSent` means the operation may have run. Relay does not retry
-automatically. The [usage guide](docs/usage.md#handle-failed-calls) explains
-failure details and result handling.
+retrying: `MaybeSent` means the operation may have run. Relay never retries
+automatically. Log `client.describe_error(error)` with
+`client.error_correlation(error)`.
 
-## Configuration and ownership
+## Serve over stdio
 
-HTTP defaults to `127.0.0.1` on an ephemeral port. Binding an unprotected
-endpoint off loopback requires `http.allow_unauthenticated`; use
-`http.new_protected` to admit bearer tokens through your verifier. Stdio relies
-on a trusted parent process and provides no authorization.
+Example: `stdio_server`.
 
-Requests and responses default to 1 MiB. The HTTP admitted-request deadline and
-client request timeout default to 30 seconds. One HTTP deadline covers
-correlation, verification, context construction, finite execution and response
-writes. Relay owns each callback worker through the exchange; cleanup has a
-separate cancellation grace and retains capacity until owned work stops.
-Body reading precedes admission; established subscriptions retain their stream
-lifetime. See [callback ownership](docs/usage.md#request-deadlines-and-callback-ownership)
-and the [complete defaults](docs/usage.md#defaults).
+```gleam
+import relay/server
+import relay/stdio
 
-Client header callbacks also run in temporary request-owned processes. The client
-request timeout covers header acquisition and transport; subscription opening
-includes acknowledgement. Established subscriptions keep their explicit deadline,
-cancellation and caller-owned response body. Closing a Relay-owned HTTP client
-signals blocked acquisition as well as its transport requests. Injected clients
-remain application-owned. See [client controls](docs/usage.md#call-with-a-deadline-cancellation-and-headers).
+pub fn main() {
+  let assert Ok(Nil) = stdio.serve(server.new([]), Nil)
+}
+```
 
-The [usage guide](docs/usage.md) retains examples for stdio, mounting in Wisp or
-Mist, bearer protection, deadlines, cancellation, headers, correlation and
-idempotency. Its [module map](docs/usage.md#modules) covers resources, prompts,
-completion, subscriptions, testing and custom transports. For native output,
-media and discovered tools, see [typed result composition](docs/usage.md#composing-typed-tool-calls).
+A client launches the server with `client.stdio("my_server", ["--flag"])`.
+Stdio enforces no authorization: run it under a trusted parent process.
 
-## Supported scope
+## Mount the endpoint in an application
+
+Example: `mount`.
+
+`http.handler` starts the endpoint without a listener. `http.handle` takes a
+`gleam_http` `Request(BitArray)` and returns a buffered `Response(BytesTree)`,
+so it mounts in Wisp in one line; `http.mist_handler` mounts the streaming
+endpoint in Mist. Buffered mounting drops progress notifications, cannot
+observe client disconnects and answers `subscriptions/listen` with 406.
+
+```gleam
+// In a wisp router:
+["mcp"] -> {
+  use body <- wisp.require_bit_array_body(req)
+  http.handle(mcp, request.set_body(req, body)) |> response.map(wisp.Bytes)
+}
+```
+
+`http.new_with_context` builds a native context from each request, for example
+a tenant. Call `http.stop(mcp)` when the router or supervisor stops.
+
+## Protect the endpoint
+
+Example: `protect`.
+
+`http.new_protected` reads the bearer token, asks your verifier, admits the
+request for the protected resource and its scopes, answers refusals with the
+RFC 6750 challenge and serves the RFC 9728 metadata document. Relay never
+parses tokens; the verifier owns signatures, expiry and issuers.
+
+```gleam
+let verifier = {
+  use token, _correlation <- authorization.verifier("jwt")
+  validate(authorization.token_value(token))
+  |> result.map(fn(c) { authorization.attestation(c, c.audiences, c.scopes) })
+  |> result.replace_error(authorization.BearerRejected)
+}
+http.new_protected(service, verifier, protection, fn(_request, grant) {
+  Ok(authorization.grant_principal(grant))
+})
+```
+
+## Call with a deadline, cancellation and headers
+
+Example: `call_controls`.
+
+```gleam
+use token <- cancellation.with_token
+peer
+|> client.with_deadline(deadline.after(duration.seconds(10)))
+|> client.with_cancellation(token)
+|> client.call(definition, "Ada")
+```
+
+`client.with_headers` adds headers to every request. The request budget covers
+header acquisition, so a blocked callback ends on timeout or cancellation.
+`client.with_correlation` and `client.with_idempotency_key` carry the
+correlation and an optional idempotency key through every transport.
+
+## Follow a call and compose results
+
+`client.with_correlation` carries a correlation and `client.with_idempotency_key`
+an optional idempotency key through every transport. The handler reads
+`tool.correlation(call)` and `tool.idempotency_key(call)`; both are untrusted
+client input. Example: `correlation`.
+
+`relay/client/output` folds a call result and a client error into one `Result`
+for non-interactive callers, keeping the evidence of whether a request may have
+run. Example: `typed_output`.
+
+## Defaults and scope
+
+HTTP binds `127.0.0.1` on an ephemeral port. Binding off loopback without
+protection requires `http.allow_unauthenticated`. Request and response bodies
+default to 1 MiB, and the admitted-request deadline and client request timeout
+default to 30 seconds. The design lists every default with its setter.
 
 Relay implements MCP `2026-07-28` only. Legacy `2025-11-25` sessions,
 `logging/setLevel`, resource-read continuation, MCP client authorization flows
@@ -115,23 +176,24 @@ one simple `{name}` variable per segment; other syntax needs
 `resources.template_with_matcher`.
 
 The pinned `@modelcontextprotocol/conformance@0.2.0-alpha.10` server suite
-supplies evidence for its emitted assertions. Client, authorization and legacy
-conformance require separate evidence. Schema revision, checksum and license
-remain beside the [frozen fixture](test/fixtures/mcp_2026/README.md).
+supplies evidence for its emitted assertions ([docs/ORACLE.md](docs/ORACLE.md)). Client, authorization and legacy
+conformance need separate evidence.
 
-## Verification
+## Development
 
-From the Relay checkout:
-
-```bash
+```sh
 nix develop --command python3 -B scripts/check.py fast
 nix develop --command python3 -B scripts/check.py full
 ```
 
-The [full verification commands](docs/usage.md#verification) also cover compiler
-negative fixtures, schemas, checksums and the pinned server conformance suite.
+[AGENTS.md](AGENTS.md) describes the gate. The [design](docs/design/design.typ)
+states responsibilities and contracts, [CONTEXT.typ](docs/design/CONTEXT.typ)
+defines the vocabulary, [COVERAGE.md](docs/COVERAGE.md) maps repository parts
+to design owners, and [docs/adr/](docs/adr/) records decisions and their
+rationale.
 
-The [native design](docs/design/design.typ), [rendered design](docs/design/design-layer.pdf)
-and [vocabulary](docs/design/CONTEXT.typ) describe responsibilities and retained
-requirements. See [design coverage](docs/COVERAGE.md), [ADRs](docs/adr/) and
-[CHANGELOG.md](CHANGELOG.md) for design ownership, decisions and release notes.
+## References
+
+[docs/ORACLE.md](docs/ORACLE.md) records the frozen schema, the pinned
+conformance suite and the other references Relay is compared with. Relay has no
+benchmark harness and makes no latency claim.

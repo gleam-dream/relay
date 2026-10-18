@@ -2,6 +2,8 @@
 
 <a id="adr-0008"></a>
 
+Superseded by [ADR 0010](0010-own-admission-and-execution-under-one-deadline.md), which accepted the end-to-end request deadline and assigned its ownership. This record retains the gap that motivated that decision.
+
 ## Observed gap
 
 - At Relay `d448fe2e1dd7898d699fa2f13bf5cc5d86beaff5`, the request process synchronously constructs native context before dispatch starts the invocation and response wait budgets. `new_protected` runs bearer verification inside that callback.

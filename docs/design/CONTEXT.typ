@@ -23,4 +23,11 @@
   (slug: "term-cancellation-grace", title: [Cancellation grace], body: [The bounded interval between cancellation of Relay-owned request or invocation work and forced termination of work that has not stopped.]),
   (slug: "term-protocol-schema", title: [Protocol schema], body: [The frozen revision's authority for JSON-RPC envelopes, method parameters, declarations, and result fields.]),
   (slug: "term-input-contract", title: [Input contract], body: [A Blueprint contract loaded from a tool's application input schema for local argument validation. Admission to Blueprint's finite profile is separate from MCP protocol validity.]),
+  (slug: "term-verifier", title: [Verifier], body: [The application-supplied function that decides a bearer token's validity and returns an attestation. Relay never parses tokens itself.]),
+  (slug: "term-admitted-request-deadline", title: [Admitted request deadline], body: [The single absolute deadline an HTTP endpoint starts at slot admission. It covers correlation, verification, context construction, finite execution and response writes. _Avoid_: request timeout — names the setter, not the interval it bounds.]),
+  (slug: "term-header-acquisition", title: [Header acquisition], body: [The client's computation of dynamic request headers in a temporary request-owned process, bounded by the same budget as the request it serves.]),
+  (slug: "term-protocol-strategy", title: [Protocol strategy], body: [A revision-bound codec and lifecycle pair, such as the modern per-request strategy or the retained initialized-session strategy, that shares native definitions and ports with other strategies.]),
+  (slug: "term-validation-profile", title: [Validation profile], body: [A named selection of obligations from the verification registry: fast, ci, design or full.]),
+  (slug: "term-sibling-revision-pin", title: [Sibling revision pin], body: [The immutable Git revision of a sibling library that the manifest and the CI checkout both record.]),
+  (slug: "term-conformance-evidence", title: [Conformance evidence], body: [The assertions an external suite actually emitted for the scenarios it ran. It establishes only that tested scope.]),
 )
