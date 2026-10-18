@@ -41,9 +41,10 @@ records how the gate runs it. [AGENTS.md](../AGENTS.md) lists the commands.
 - **Compiler controls.** `scripts/check_negative_fixtures.py` requires every
   positive control to compile and every negative fixture to fail with the
   diagnostic fragments listed beside it.
-- **Checksums and pins.** `scripts/verify_checksums.sh` verifies the schema
+- **Checksums and pins.** `test/relay/provenance_test.gleam` asserts the schema
   checksum and that the resolved Sinal, HTTP Gun and JSON Blueprint packages match
-  [`sibling-revisions.txt`](../sibling-revisions.txt).
+  [`sibling-revisions.txt`](../sibling-revisions.txt) in revision, version and licence.
+  `scripts/check.py` rejects a malformed or incomplete pin file before any check runs.
 
 ## Exclusions and deliberate differences
 
@@ -67,7 +68,7 @@ Focused commands:
 nix develop --command sh scripts/conformance/run-server-suite.sh
 nix develop --command python3 -B scripts/relay_schema_check.py
 nix develop --command python3 -B scripts/check_negative_fixtures.py
-nix develop --command bash scripts/verify_checksums.sh
+nix develop --command python3 -B scripts/check.py pins
 ```
 
 The suite keeps structured results and the server log under

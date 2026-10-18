@@ -22,11 +22,11 @@ nix develop --command python3 -B scripts/check.py full
 ```
 
 - `fast`: tree formatting, Ruff correctness lint, ShellCheck, actionlint, gate regressions, strict native/Gleam build, all root tests, and the format, build and tests of the compiled usage examples in `examples/relay_usage`.
-- `ci`: all `fast` checks plus paired compiler controls, the jsonschema 4.26.0 frozen corpus and mutations, checksums and pins, and the complete pinned server conformance suite.
+- `ci`: all `fast` checks plus paired compiler controls, the jsonschema 4.26.0 frozen corpus and mutations, and the complete pinned server conformance suite. Every profile validates `sibling-revisions.txt` first, and the root tests assert the schema checksum and the resolved sibling revisions, versions and licences.
 - `design`: render freshness, vocabulary, links and layer integrity.
 - `full`: all `ci` and `design` obligations. CI requires the `ci` and `design` jobs.
 
-Focused commands: `cd examples/relay_usage && gleam test` (usage examples; `gleam run -m relay_usage/<module>` runs one), `sh scripts/conformance/run-server-suite.sh` (server suite), `python3 -B scripts/check_negative_fixtures.py` (compiler controls), `sh scripts/verify_checksums.sh` (frozen fixtures), and the design-gate commands in the fence below.
+Focused commands: `cd examples/relay_usage && gleam test` (usage examples; `gleam run -m relay_usage/<module>` runs one), `sh scripts/conformance/run-server-suite.sh` (server suite), `python3 -B scripts/check_negative_fixtures.py` (compiler controls), and the design-gate commands in the fence below.
 
 Local-source experiments run from the [Oversight](https://github.com/gleam-dream/oversight) checkout, which captures the whole sibling source graph into a new output directory per run.
 

@@ -110,9 +110,6 @@ def checks(root: Path, profile: str) -> list[Check]:
                     ("python3", "-B", "scripts/relay_schema_check.py"),
                 ),
                 Check(
-                    "checksums-and-pins", ".", ("bash", "scripts/verify_checksums.sh")
-                ),
-                Check(
                     "server-conformance",
                     ".",
                     ("bash", "scripts/conformance/run-server-suite.sh"),
