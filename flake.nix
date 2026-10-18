@@ -59,7 +59,6 @@
             "**/.artifacts/**"
             "**/node_modules/**"
             "fixtures/negative/**"
-            "test/fixtures/mcp_2026/**"
             "test/fixtures/tls/**"
             "scripts/conformance/pnpm-lock.yaml"
           ];
