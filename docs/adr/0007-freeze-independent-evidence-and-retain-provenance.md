@@ -12,7 +12,7 @@
 
 - Valid schema output establishes shape, not transport behavior. A clean server harness establishes its emitted assertions, not untested client/auth/legacy features or a scenario that emits no checks.
 - Historical selected-scenario and expected-failure milestones are development evidence only. Full frozen acceptance has no expected-failure claim; uncovered requirements need independent local assertions.
-- Keeping each wave report beside current design created competing status and public-signature descriptions. Retaining immutable original revision links preserves the complete old records while one native layer describes responsibilities and one ADR set describes rationale.
+- Keeping each implementation report beside current design created competing status and public-signature descriptions. Retaining immutable original revision links preserves the complete old records while one native layer describes responsibilities and one ADR set describes rationale.
 - Logging emission requires a typed approved data-exposure contract. The historical arbitrary handler-JSON callback was automatically rejected and reverted; this migration does not restore or indirectly approve it.
 
 ## Source pins

@@ -17,8 +17,8 @@
 
 ## Evidence and limits
 
-- [Generation correction acceptance](https://github.com/gleam-dream/oversight/blob/3baff7030a96d5b6cf78b2335c16d8c203727da5/docs/implementation/relay-llm-wire/relay-wave3-final-review.md) records same-name barriers, empty catalog, churn and owner failure. The exact correction commit is not identified in that review.
-- [Stdio correction acceptance](https://github.com/gleam-dream/oversight/blob/3baff7030a96d5b6cf78b2335c16d8c203727da5/docs/implementation/relay-llm-wire/relay-wave4-rereview.md) records FIFO, timeout, per-subscription cancellation and 257-frame overflow. Current source is [stdio child owner](../../src/relay/internal/transport/stdio_client.gleam); fixtures remain in [stdio fixtures](../../test/fixtures/stdio).
+- A generation-correction review recorded same-name barriers, empty catalog, churn and owner failure. The review does not identify the exact correction commit.
+- A stdio-correction review recorded FIFO, timeout, per-subscription cancellation and 257-frame overflow. Current source is [stdio child owner](../../src/relay/internal/transport/stdio_client.gleam); fixtures remain in [stdio fixtures](../../test/fixtures/stdio).
 - Intentional shutdown repair is [2e015df](https://github.com/gleam-dream/relay/commit/2e015df87d816f5187ce0e5f09730eabe5657899), with explanatory follow-up [d448fe2](https://github.com/gleam-dream/relay/commit/d448fe2e1dd7898d699fa2f13bf5cc5d86beaff5). [HTTP lifecycle tests](../../test/relay/http_lifecycle_test.gleam) force the actual listener-exit order and retain the unexpected-failure control.
 - Historical initial-flush failure inspection did not have a dedicated subscription-specific injection. General delivery failure and disconnect tests remain useful evidence, not a retrospective claim that every branch was measured.
 

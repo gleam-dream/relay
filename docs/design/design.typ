@@ -30,6 +30,9 @@
     pending-entry(title: "Verify resource claims at their actual boundaries", kind: "verify", since: "2026-10-06", adr: [#adr(3)])[
       Request slots are acquired after Mist reads the bounded body; mounted callers pre-read it themselves. These limits do not establish a bound on incomplete body readers or all network processes. Comprehensive owner-death/process-count evidence, SSE reconnection/resumption where supported, and continuous drift/soak/fuzz coverage remain separate obligations.
     ],
+    pending-entry(title: "Check carried-over configuration claims against the code", kind: "verify", since: "2026-10-17")[
+      The defaults, setters and module map in Configuration surface, and the profile rules in Validation and extension ownership, were moved from retired guides. Only some defaults were compared with the source. Each value and setter name is a claim to confirm against the code, section by section.
+    ],
   )
 
   #section(title: "System at a glance", lead: "One MCP context has separate wire, admission, execution, and application owners.", visual: diagram(
