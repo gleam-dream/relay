@@ -528,7 +528,7 @@ pub fn tool_access_follows_the_principal_in_the_context_test() {
   |> should.be_true
 }
 
-// --- wave 5: audience refusals and correlation ---------------------------------
+// --- audience refusals and correlation -----------------------------------------
 
 /// A verifier that checks the audience itself reports
 /// `IssuedForAnotherResource`, and Relay answers with the same challenge and
@@ -620,7 +620,7 @@ fn correlation_tool() -> tool.Tool(String) {
   })
 }
 
-/// Wave 5: the verifier, the authorization decision and the handler see the
+/// The verifier, the authorization decision and the handler see the
 /// one correlation of the request, whether the client sent it or Relay
 /// minted it.
 pub fn verifier_decision_and_handler_share_the_request_correlation_test() {

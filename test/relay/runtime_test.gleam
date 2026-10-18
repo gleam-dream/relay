@@ -906,7 +906,7 @@ fn carried_discover(id: String, carried: json.Json) -> BitArray {
   request_frame(id, "server/discover", [], [#(carrier_key, carried)])
 }
 
-/// Wave 5: a client's `_meta` correlation names every server event of the
+/// A client's `_meta` correlation names every server event of the
 /// request, `exchange.closed` included, and reaches the handler.
 pub fn carried_meta_correlation_names_the_request_test() {
   let label = "carried"
@@ -947,7 +947,7 @@ pub fn carried_meta_correlation_names_the_request_test() {
   let assert Ok(Nil) = sinal.detach(closed_attachment)
 }
 
-/// Wave 5: a carried correlation is untrusted input. A value that is empty,
+/// A carried correlation is untrusted input. A value that is empty,
 /// longer than 128 bytes, not visible ASCII or not a string is ignored and
 /// the request gets a fresh one; the transport's own value wins over it.
 pub fn carried_meta_correlation_is_validated_test() {

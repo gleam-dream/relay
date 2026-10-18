@@ -1108,7 +1108,7 @@ pub fn mounted_handler_sees_registered_tools_test() {
   string.contains(testing.body_text(gone), "-32602") |> should.be_true
 }
 
-// --- wave 5: correlation and request ids across the wire -----------------------
+// --- correlation and request ids across the wire -------------------------------
 
 type Seen {
   Seen(
@@ -1206,7 +1206,7 @@ pub fn client_correlation_names_the_server_side_of_the_call_test() {
   })
 }
 
-/// Wave 5: a client view's idempotency key reaches the handler, so a retry
+/// A client view's idempotency key reaches the handler, so a retry
 /// through the same view is recognisable; the JSON-RPC id stays fresh.
 pub fn idempotency_key_view_reaches_the_handler_test() {
   let seen = process.new_subject()
@@ -1354,7 +1354,7 @@ pub fn endpoint_correlation_precedence_test() {
   let assert 32 = whoami_request() |> answer |> string.length
 }
 
-/// Wave 5 (SMCP): a view without a correlation mints one per call, sends
+/// A view without a correlation mints one per call, sends
 /// it, and tags its own `client.call` event with it, so client and server
 /// share one correlation; two calls get two.
 pub fn uncorrelated_client_mints_the_call_correlation_test() {
