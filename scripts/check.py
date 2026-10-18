@@ -17,7 +17,7 @@ import tomllib
 import quality
 
 ROOT = Path(__file__).resolve().parents[1]
-PACKAGES = (".",)
+PACKAGES = (".", "examples/relay_usage")
 
 
 @dataclass(frozen=True)
@@ -84,6 +84,17 @@ def checks(root: Path, profile: str) -> list[Check]:
         Check("core-format", ".", ("gleam", "format", "--check", "src", "test", "dev")),
         Check("core-build", ".", ("python3", "-B", "scripts/check.py", "build")),
         Check("core-tests", ".", ("gleam", "test")),
+        Check(
+            "examples-format",
+            "examples/relay_usage",
+            ("gleam", "format", "--check", "src", "test"),
+        ),
+        Check(
+            "examples-build",
+            "examples/relay_usage",
+            ("python3", "-B", "../../scripts/check.py", "build"),
+        ),
+        Check("examples-tests", "examples/relay_usage", ("gleam", "test")),
     ]
     if profile != "fast":
         selected.extend(

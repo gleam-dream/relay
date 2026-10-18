@@ -96,6 +96,18 @@ class GateTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "examples/unowned"):
                 check.checks(root, "ci")
 
+    def test_fast_profile_gates_the_usage_examples(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for package in check.PACKAGES:
+                directory = root / package
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / "gleam.toml").write_text('name = "fixture"\n')
+            names = {item.name for item in check.checks(root, "fast")}
+            self.assertLessEqual(
+                {"examples-format", "examples-build", "examples-tests"}, names
+            )
+
     def test_missing_local_dependency_fails_by_name(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
