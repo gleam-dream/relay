@@ -14,4 +14,4 @@ Relay by path, so a change that breaks a recipe fails the examples gate.
 | `typed_output`   | Fold a call result into one typed `Result`                      | `gleam run -m relay_usage/typed_output`   |
 
 Run them all with `gleam test` from this directory inside `nix develop`. The
-gate runs the same tests through `python3 -B scripts/check.py fast`.
+gate runs the same tests through `bash scripts/test.sh`.

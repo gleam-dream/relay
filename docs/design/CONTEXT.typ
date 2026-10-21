@@ -27,7 +27,6 @@
   (slug: "term-admitted-request-deadline", title: [Admitted request deadline], body: [The single absolute deadline an HTTP endpoint starts at slot admission. It covers correlation, verification, context construction, finite execution and response writes. _Avoid_: request timeout — names the setter, not the interval it bounds.]),
   (slug: "term-header-acquisition", title: [Header acquisition], body: [The client's computation of dynamic request headers in a temporary request-owned process, bounded by the same budget as the request it serves.]),
   (slug: "term-protocol-strategy", title: [Protocol strategy], body: [A revision-bound codec and lifecycle pair, such as the modern per-request strategy or the retained initialized-session strategy, that shares native definitions and ports with other strategies.]),
-  (slug: "term-validation-profile", title: [Validation profile], body: [A named selection of obligations from the verification registry: fast, ci, design or full.]),
   (slug: "term-sibling-dependency", title: [Sibling dependency], body: [An unpublished library of the same ecosystem that Relay imports as a Git dependency on its main branch. The manifest lock records the resolved commit.]),
   (slug: "term-conformance-evidence", title: [Conformance evidence], body: [The assertions an external suite actually emitted for the scenarios it ran. It establishes only that tested scope.]),
 )

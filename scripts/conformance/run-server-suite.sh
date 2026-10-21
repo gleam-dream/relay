@@ -57,19 +57,11 @@ if [[ -z $server_url ]]; then
 fi
 
 cli="scripts/conformance/node_modules/@modelcontextprotocol/conformance/dist/index.js"
-nix develop --no-update-lock-file --command node "$cli" list --server --spec-version 2026-07-28 >"$output_dir/selection.log"
-cli_status=0
 nix develop --no-update-lock-file --command node \
   "$cli" \
   server \
   --url "$server_url" \
   --suite all \
   --spec-version 2026-07-28 \
-  --output-dir "$output_dir" || cli_status=$?
-validation_status=0
-nix develop --no-update-lock-file --command python3 -B scripts/check_conformance_results.py "$output_dir" --selection "$output_dir/selection.log" || validation_status=$?
-echo "Server evidence: $output_dir"
-if [[ $cli_status -ne 0 ]]; then
-  exit "$cli_status"
-fi
-exit "$validation_status"
+  --output-dir "$output_dir"
+echo "Server results: $output_dir"

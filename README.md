@@ -181,8 +181,9 @@ conformance need separate evidence.
 ## Development
 
 ```sh
-nix develop --command python3 -B scripts/check.py fast
-nix develop --command python3 -B scripts/check.py full
+nix flake check
+nix run .#design-gate-check -- docs/design .
+nix develop --command bash scripts/test.sh
 ```
 
 [AGENTS.md](AGENTS.md) describes the gate. The [design](docs/design/design.typ)

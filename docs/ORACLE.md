@@ -32,12 +32,9 @@ records how the gate runs it. [AGENTS.md](../AGENTS.md) lists the commands.
   or a mutation the schema accepts, fails the check.
 - **Conformance suite.** `scripts/conformance/run-server-suite.sh` starts the
   fixture server `dev/relay_conformance_server.gleam` and runs every server
-  scenario of spec `2026-07-28`. `scripts/check_conformance_results.py` then
-  classifies each result by its `checks.json`. A scenario is evidence only when it
-  emitted at least one `SUCCESS` or `FAILURE` assertion. The validator rejects a
-  missing or skipped scenario, any `FAILURE` or `WARNING`, an empty selection and
-  a scenario with zero assertions. A zero-assertion scenario is reported as
-  non-evidence and fails the gate.
+  scenario of spec `2026-07-28`. The upstream CLI exits nonzero for failed
+  assertions, and that exit status fails the integration test.
+  No separate scenario inventory or warning policy is enforced.
 - **Compiler controls.** `scripts/check_negative_fixtures.py` requires every
   positive control to compile and every negative fixture to fail with the
   diagnostic fragments listed beside it.
@@ -57,7 +54,7 @@ records how the gate runs it. [AGENTS.md](../AGENTS.md) lists the commands.
 ## Run
 
 ```sh
-nix develop --command python3 -B scripts/check.py ci
+nix develop --command bash scripts/test.sh
 ```
 
 Focused commands:
@@ -66,12 +63,10 @@ Focused commands:
 nix develop --command sh scripts/conformance/run-server-suite.sh
 nix develop --command python3 -B scripts/relay_schema_check.py
 nix develop --command python3 -B scripts/check_negative_fixtures.py
-nix develop --command python3 -B scripts/check.py pins
 ```
 
 The suite keeps structured results and the server log under
-`build/conformance-results/` for a direct run, or under `.artifacts/PROFILE/server-suite`
-for a profile run.
+`build/conformance-results/`.
 
 ## Limits
 

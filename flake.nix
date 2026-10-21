@@ -88,9 +88,7 @@
             beam29Packages.erlang
             beam29Packages.rebar3
             ruff
-            shellcheck
             shfmt
-            actionlint
             coreutils
             (python3.withPackages (ps: [ ps.jsonschema ]))
           ];
