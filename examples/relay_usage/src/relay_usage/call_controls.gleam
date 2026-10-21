@@ -36,11 +36,13 @@ pub fn call_with_budget(
   peer: client.Client,
   definition: tool.Definition(String, String),
 ) -> Result(client.ToolResult(String), client.Error) {
+  // snips-start: call-controls
   use token <- cancellation.with_token
   peer
   |> client.with_deadline(deadline.after(duration.seconds(10)))
   |> client.with_cancellation(token)
   |> client.call(definition, "Ada")
+  // snips-end: call-controls
 }
 
 /// `client.with_headers` adds headers to every request, computed per request

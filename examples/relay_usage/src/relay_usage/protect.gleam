@@ -34,6 +34,7 @@ pub fn protect(
   let protection =
     authorization.protection(resource, [reports])
     |> authorization.with_authorization_servers(["https://login.example.com"])
+  // snips-start: protect
   let verifier = {
     use token, _correlation <- authorization.verifier("jwt")
     validate(authorization.token_value(token))
@@ -43,6 +44,7 @@ pub fn protect(
   http.new_protected(service, verifier, protection, fn(_request, grant) {
     Ok(authorization.grant_principal(grant))
   })
+  // snips-end: protect
 }
 
 /// The verifier also receives the request's correlation, so an introspection

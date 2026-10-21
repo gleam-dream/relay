@@ -2,6 +2,7 @@
 ////
 //// Run: `gleam run -m relay_usage/serve_and_call`
 
+// snips-start: serve-and-call
 import gleam/int
 import gleam/io
 import gleam/string
@@ -40,6 +41,7 @@ pub fn serve_and_call() -> Nil {
   http.stop(mcp)
 }
 
+// snips-end: serve-and-call
 /// `client.call` separates success, a tool that reported a failure, a request
 /// for input and a client error. A refusal inside the tool is not a transport
 /// failure, and a transport failure carries evidence of whether the request

@@ -22,6 +22,7 @@ pub type Tenant {
   Tenant(id: String)
 }
 
+// snips-start: mount
 pub fn mount(service: server.Server(Tenant)) -> http.Handler(Tenant) {
   let assert Ok(mcp) =
     http.new_with_context(service, fn(req) {
@@ -35,6 +36,8 @@ pub fn mount(service: server.Server(Tenant)) -> http.Handler(Tenant) {
     |> http.handler
   mcp
 }
+
+// snips-end: mount
 
 // In a Wisp router the mounted handler is one clause. Buffered mounting drops
 // progress notifications, cannot observe client disconnects and answers

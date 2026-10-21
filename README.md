@@ -27,19 +27,26 @@ manifests and recorded revisions unchanged.
 
 Every recipe below mirrors a module in [examples/relay_usage](examples/relay_usage/README.md),
 which the gate compiles and runs, so a recipe cannot drift from the API.
-This one is `serve_and_call`.
+Call `serve_and_call()` from this example to run the round trip.
 
 One `Definition` holds the input and output codecs used by both the server
 handler and the client call.
 
+<!-- prettier-ignore-start -->
+
+<!-- snips: examples/relay_usage/src/relay_usage/serve_and_call.gleam#serve-and-call -->
 ```gleam
 import gleam/int
+import gleam/io
+import gleam/string
 import json/blueprint/codec
 import relay/client
 import relay/http
 import relay/server
 import relay/tool
 
+/// One `Definition` holds the input and output codecs used by both the server
+/// handler and the client call.
 pub fn greet() -> tool.Definition(String, String) {
   let input = {
     use name <- codec.field("name", codec.string(), get: fn(name) { name })
@@ -50,7 +57,10 @@ pub fn greet() -> tool.Definition(String, String) {
   |> tool.with_read_only_hint(True)
 }
 
-pub fn main() {
+/// Binds an ephemeral loopback port, calls the tool and closes everything.
+/// Application code handles each `Result` and closes resources it created when
+/// a later operation fails.
+pub fn serve_and_call() -> Nil {
   let service =
     server.new([tool.handle(greet(), fn(name) { Ok("Hello, " <> name <> "!") })])
   let assert Ok(mcp) = http.start(http.new(service))
@@ -63,7 +73,10 @@ pub fn main() {
   client.close(peer)
   http.stop(mcp)
 }
+
 ```
+
+<!-- prettier-ignore-end -->
 
 The example binds an ephemeral loopback port and closes the client and endpoint
 after the call. In application code, handle each `Result` and close resources
@@ -79,21 +92,28 @@ automatically. Log `client.describe_error(error)` with
 
 Example: `stdio_server`.
 
+<!-- prettier-ignore-start -->
+
+<!-- snips: examples/relay_usage/src/relay_usage/stdio_server.gleam#stdio-server -->
 ```gleam
 import relay/server
 import relay/stdio
 
-pub fn main() {
+pub fn main() -> Nil {
   let assert Ok(Nil) = stdio.serve(server.new([]), Nil)
+  Nil
 }
 ```
+
+<!-- prettier-ignore-end -->
 
 A client launches the server with `client.stdio("my_server", ["--flag"])`.
 Stdio enforces no authorization: run it under a trusted parent process.
 
 ## Mount the endpoint in an application
 
-Example: `mount`.
+Example: `mount`. The tested function below constructs a buffered handler
+with a tenant context; the application router passes requests to `http.handle`.
 
 `http.handler` starts the endpoint without a listener. `http.handle` takes a
 `gleam_http` `Request(BitArray)` and returns a buffered `Response(BytesTree)`,
@@ -101,13 +121,27 @@ so it mounts in Wisp in one line; `http.mist_handler` mounts the streaming
 endpoint in Mist. Buffered mounting drops progress notifications, cannot
 observe client disconnects and answers `subscriptions/listen` with 406.
 
+<!-- prettier-ignore-start -->
+
+<!-- snips: examples/relay_usage/src/relay_usage/mount.gleam#mount -->
 ```gleam
-// In a wisp router:
-["mcp"] -> {
-  use body <- wisp.require_bit_array_body(req)
-  http.handle(mcp, request.set_body(req, body)) |> response.map(wisp.Bytes)
+pub fn mount(service: server.Server(Tenant)) -> http.Handler(Tenant) {
+  let assert Ok(mcp) =
+    http.new_with_context(service, fn(req) {
+      case request.get_header(req, "x-tenant") {
+        Ok(id) -> Ok(Tenant(id))
+        Error(Nil) ->
+          Error(response.new(400) |> response.set_body(bytes_tree.new()))
+      }
+    })
+    |> http.with_allowed_hosts(["mcp.example.com", "127.0.0.1"])
+    |> http.handler
+  mcp
 }
+
 ```
+
+<!-- prettier-ignore-end -->
 
 `http.new_with_context` builds a native context from each request, for example
 a tenant. Call `http.stop(mcp)` when the router or supervisor stops.
@@ -121,6 +155,9 @@ request for the protected resource and its scopes, answers refusals with the
 RFC 6750 challenge and serves the RFC 9728 metadata document. Relay never
 parses tokens; the verifier owns signatures, expiry and issuers.
 
+<!-- prettier-ignore-start -->
+
+<!-- snips: examples/relay_usage/src/relay_usage/protect.gleam#protect -->
 ```gleam
 let verifier = {
   use token, _correlation <- authorization.verifier("jwt")
@@ -133,10 +170,15 @@ http.new_protected(service, verifier, protection, fn(_request, grant) {
 })
 ```
 
+<!-- prettier-ignore-end -->
+
 ## Call with a deadline, cancellation and headers
 
 Example: `call_controls`.
 
+<!-- prettier-ignore-start -->
+
+<!-- snips: examples/relay_usage/src/relay_usage/call_controls.gleam#call-controls -->
 ```gleam
 use token <- cancellation.with_token
 peer
@@ -144,6 +186,8 @@ peer
 |> client.with_cancellation(token)
 |> client.call(definition, "Ada")
 ```
+
+<!-- prettier-ignore-end -->
 
 `client.with_headers` adds headers to every request. The request budget covers
 header acquisition, so a blocked callback ends on timeout or cancellation.
