@@ -1,27 +1,19 @@
 #!/usr/bin/env python3
 """Validate actual Relay output against the pinned upstream MCP 2026-07-28 schema.
 
-The schema is fetched at run time into the gitignored `.artifacts/oracle-inputs/`
-and verified against its recorded SHA-256 before use; it is never committed.
+The comparison lazily realizes the hash-pinned Nix input; Nix caches it in the
+store. Entering the development shell does not fetch oracle inputs.
 """
 
 import copy
-import hashlib
 import json
 from pathlib import Path
 import subprocess
 import sys
-import urllib.request
 
 from jsonschema import Draft202012Validator
 
 ROOT = Path(__file__).resolve().parent.parent
-SCHEMA_URL = (
-    "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/"
-    "5f5440bb26a62e2cf3440b92da5a667efa03b267/schema/2026-07-28/schema.json"
-)
-SCHEMA = ROOT / ".artifacts/oracle-inputs/mcp-2026-07-28-schema.json"
-SHA256 = "ef70b61f99b6d2e5e3b46863822eab08dff6a45bedc7a08914e0e5b133f40203"
 REQUIRED_DEFINITIONS = {
     "DiscoverResultResponse",
     "ListToolsResultResponse",
@@ -72,27 +64,12 @@ DELIVERED_RESULT_DEFINITIONS = {
 }
 
 
-def fetch_schema():
-    """Return the pinned schema bytes, fetching them once into the gitignored cache."""
-    if SCHEMA.exists():
-        cached = SCHEMA.read_bytes()
-        if hashlib.sha256(cached).hexdigest() == SHA256:
-            return cached
-    try:
-        with urllib.request.urlopen(SCHEMA_URL, timeout=60) as response:
-            raw = response.read()
-    except OSError as error:
-        sys.exit(f"FAIL: could not fetch {SCHEMA_URL}: {error}")
-    digest = hashlib.sha256(raw).hexdigest()
-    if digest != SHA256:
-        sys.exit(f"FAIL: MCP schema checksum mismatch: got {digest}, expected {SHA256}")
-    SCHEMA.parent.mkdir(parents=True, exist_ok=True)
-    SCHEMA.write_bytes(raw)
-    return raw
-
-
 def main():
-    raw = fetch_schema()
+    schema_path = subprocess.check_output(
+        ["nix", "run", "--no-update-lock-file", f"{ROOT}#oracle-mcp-schema"],
+        text=True,
+    ).strip()
+    raw = Path(schema_path).read_bytes()
     schema = json.loads(raw)
     Draft202012Validator.check_schema(schema)
 

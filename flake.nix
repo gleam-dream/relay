@@ -22,33 +22,6 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
-        # The upstream apps pin the renderer; authored imports also need its
-        # generated local projection on a fresh checkout.
-        designApp =
-          name:
-          let
-            wrapper = pkgs.writeShellApplication {
-              name = "design-gate-${name}";
-              runtimeInputs = [ pkgs.coreutils ];
-              text = ''
-                project_layer() {
-                  if [ -f "$1/design.typ" ]; then
-                    mkdir -p "$1/.render"
-                    cp -RL --remove-destination --no-preserve=mode ${
-                      design-layer.packages.${system}.gate-bundle
-                    }/render/. "$1/.render/"
-                  fi
-                }
-                project_layer "''${1:-docs/design}"
-                exec ${design-layer.apps.${system}.${name}.program} "$@"
-              '';
-            };
-          in
-          {
-            type = "app";
-            program = "${wrapper}/bin/design-gate-${name}";
-          };
-
         treefmtEval = treefmt-nix.lib.evalModule pkgs {
           projectRootFile = "flake.nix";
           settings.global.excludes = [
@@ -74,10 +47,23 @@
         };
       in
       {
+        # Realized only when the schema comparison invokes this app.
+        apps.oracle-mcp-schema = {
+          type = "app";
+          program = "${pkgs.writeShellScript "oracle-mcp-schema" ''
+            printf '%s\n' ${
+              pkgs.fetchurl {
+                name = "mcp-2026-07-28-schema.json";
+                url = "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/5f5440bb26a62e2cf3440b92da5a667efa03b267/schema/2026-07-28/schema.json";
+                sha256 = "ef70b61f99b6d2e5e3b46863822eab08dff6a45bedc7a08914e0e5b133f40203";
+              }
+            }
+          ''}";
+        };
         apps.snips = design-layer.apps.${system}.snips;
-        apps.design-gate-check = designApp "check";
-        apps.design-gate-render = designApp "render";
-        apps.design-gate-context = designApp "context";
+        apps.design-gate-check = design-layer.apps.${system}.check;
+        apps.design-gate-render = design-layer.apps.${system}.render;
+        apps.design-gate-context = design-layer.apps.${system}.context;
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
