@@ -1,36 +1,55 @@
-# relay
+# Relay
 
-Relay provides MCP servers and clients for Gleam, with typed tool calls over
-stdio or Streamable HTTP. It implements the frozen `2026-07-28` revision and
-targets Erlang.
+Relay is an unreleased Gleam MCP server and client for Erlang. It implements the frozen MCP `2026-07-28` revision over stdio and Streamable HTTP.
 
-## Installation
+## Capabilities
 
-Relay has no published release. It requires Gleam `>= 1.18.0`. Its unpublished
-siblings, Sinal, HTTP Gun and JSON Blueprint, are Git dependencies on `main`;
-`manifest.toml` locks the resolved commits, and `gleam update <package>` moves
-one by hand. Application manifests import Relay and Blueprint the same way.
+- Typed tool definitions reused for server declarations, handlers, and client calls. Calls distinguish success, tool refusal, and a request for more input.
+- Server resources and URI templates, prompts, completion, and text, image, audio, and resource content.
+- HTTP and stdio servers, plus HTTP, stdio, and in-process client connections.
+- Client discovery, bounded listings, calls, resource reads, prompt retrieval, completion, and notification subscriptions.
+- Live tool registration and notifications to active subscribers when the catalog changes.
+- Per-request context and optional bearer resource admission. The application supplies the verifier and chooses how context becomes business policy.
+- Deadlines, cancellation, headers, correlation, and optional idempotency keys. Client failures retain evidence about whether a request may have been sent.
 
-Overriding only Relay with a path does not override its transitive Git
-requirements. A coordinated change across siblings is tested by capturing the
-whole source graph from the [Oversight](https://github.com/gleam-dream/oversight)
-checkout:
+## When Relay fits
 
-```sh
-nix develop --command python3 -B scripts/local_sources.py --output /tmp/relay-local-sources  # run in the Oversight checkout
+Use Relay when a Gleam application needs to expose typed operations to MCP peers, or call an existing MCP server while retaining native Gleam values and explicit failure information. Common setups are:
+
+- An HTTP MCP endpoint exposing application operations to an agent or other remote client.
+- An endpoint mounted in an existing application router, with each request supplying tenant or caller context and an application-owned verifier when bearer protection is needed.
+- A local tool process launched over stdio, or an application that calls an MCP peer over HTTP or stdio.
+
+## Install
+
+Relay, Sinal, HTTP Gun, and JSON Blueprint are unpublished Git dependencies. Add Relay and JSON Blueprint directly; add Sinal or HTTP Gun directly when your application imports their modules or types.
+
+```toml
+[dependencies]
+relay = { git = "https://github.com/gleam-dream/relay.git", ref = "main" }
+json_blueprint = { git = "https://github.com/lostbean/json_blueprint.git", ref = "main" }
 ```
 
-Choose a new output directory for each capture. The capture leaves the source
-manifests and recorded revisions unchanged.
+Use Gleam `>= 1.18.0` with the Erlang target. Build your application to resolve dependencies, then check in the generated `manifest.toml` so builds use the same resolved commits. These Git refs track `main` and can move.
 
-## Serve a tool and call it
+## Server flow and ownership
 
-Every recipe below mirrors a module in [examples/relay_usage](examples/relay_usage/README.md),
-which the gate compiles and runs, so a recipe cannot drift from the API.
-Call `serve_and_call()` from this example to run the round trip.
+On the server, the transport admits a request to a runtime actor. The actor serializes protocol state through a pure reducer and starts isolated workers for application handlers. HTTP can build request context and ask a verifier before dispatch; stdio trusts its parent process.
 
-One `Definition` holds the input and output codecs used by both the server
-handler and the client call.
+```mermaid
+flowchart LR
+  App[Application definitions and handlers] --> Catalog[Service catalog]
+  Peer[MCP peer] --> Transport[HTTP or stdio transport]
+  Catalog --> Runtime[Runtime actor]
+  Transport --> Runtime
+  Runtime <-->|events and effects| Reducer[Pure reducer]
+  Runtime --> Worker[Isolated handler worker]
+  Worker --> Runtime
+```
+
+## Serve and call a typed tool
+
+This runnable example defines one typed tool and reuses its definition on both sides of a local HTTP round trip.
 
 <!-- prettier-ignore-start -->
 
@@ -78,48 +97,11 @@ pub fn serve_and_call() -> Nil {
 
 <!-- prettier-ignore-end -->
 
-The example binds an ephemeral loopback port and closes the client and endpoint
-after the call. In application code, handle each `Result` and close resources
-you created when a later operation fails.
+## Mount in an application
 
-`client.call` distinguishes success, tool failure, a request for input and a
-client error. Read `client.kind(error)` and `client.evidence(error)` before
-retrying: `MaybeSent` means the operation may have run. Relay never retries
-automatically. Log `client.describe_error(error)` with
-`client.error_correlation(error)`.
-
-## Serve over stdio
-
-Example: `stdio_server`.
-
-<!-- prettier-ignore-start -->
-
-<!-- snips: examples/relay_usage/src/relay_usage/stdio_server.gleam#stdio-server -->
-```gleam
-import relay/server
-import relay/stdio
-
-pub fn main() -> Nil {
-  let assert Ok(Nil) = stdio.serve(server.new([]), Nil)
-  Nil
-}
-```
-
-<!-- prettier-ignore-end -->
-
-A client launches the server with `client.stdio("my_server", ["--flag"])`.
-Stdio enforces no authorization: run it under a trusted parent process.
-
-## Mount the endpoint in an application
-
-Example: `mount`. The tested function below constructs a buffered handler
-with a tenant context; the application router passes requests to `http.handle`.
-
-`http.handler` starts the endpoint without a listener. `http.handle` takes a
-`gleam_http` `Request(BitArray)` and returns a buffered `Response(BytesTree)`,
-so it mounts in Wisp in one line; `http.mist_handler` mounts the streaming
-endpoint in Mist. Buffered mounting drops progress notifications, cannot
-observe client disconnects and answers `subscriptions/listen` with 406.
+Use `http.handler` when the host router should own HTTP listening. The [complete example](examples/relay_usage/src/relay_usage/mount.gleam) supplies
+the imports and `Tenant` type. It reads a tenant header as example input; derive
+trusted tenant authority through your application's authentication and policy. This buffered interface cannot stream progress or observe client disconnects and returns 406 for `subscriptions/listen`; mount `http.mist_handler` when streaming and disconnect cancellation matter. Call `http.stop` when the mounted endpoint shuts down.
 
 <!-- prettier-ignore-start -->
 
@@ -143,101 +125,19 @@ pub fn mount(service: server.Server(Tenant)) -> http.Handler(Tenant) {
 
 <!-- prettier-ignore-end -->
 
-`http.new_with_context` builds a native context from each request, for example
-a tenant. Call `http.stop(mcp)` when the router or supervisor stops.
+For bearer-protected endpoints, see the [protection recipe](examples/relay_usage/src/relay_usage/protect.gleam). Relay checks the verifier's attested resource and scopes and formats challenges and metadata; the verifier owns token authenticity, issuer, and expiry checks.
 
-## Protect the endpoint
+## Limits to plan for
 
-Example: `protect`.
+- Only MCP `2026-07-28` is implemented. Legacy `2025-11-25` sessions, MCP client OAuth flows, tasks, resource-read continuation, and `logging/setLevel` are not implemented.
+- Tool input schemas use Blueprint's finite admitted profile. Unsupported schemas are reported explicitly; Relay does not claim to accept every valid JSON Schema.
+- Stdio provides no bearer authorization. Run it under a trusted parent process.
+- A client error with `MaybeSent` evidence means the operation may have run. Relay never retries automatically and does not provide durable idempotency receipts; the application owns retry and reconciliation policy.
+- The built-in resource-template matcher supports one simple `{name}` variable per segment. Use `resources.template_with_matcher` for other patterns.
 
-`http.new_protected` reads the bearer token, asks your verifier, admits the
-request for the protected resource and its scopes, answers refusals with the
-RFC 6750 challenge and serves the RFC 9728 metadata document. Relay never
-parses tokens; the verifier owns signatures, expiry and issuers.
+## Learn more
 
-<!-- prettier-ignore-start -->
-
-<!-- snips: examples/relay_usage/src/relay_usage/protect.gleam#protect -->
-```gleam
-let verifier = {
-  use token, _correlation <- authorization.verifier("jwt")
-  validate(authorization.token_value(token))
-  |> result.map(fn(c) { authorization.attestation(c, c.audiences, c.scopes) })
-  |> result.replace_error(authorization.BearerRejected)
-}
-http.new_protected(service, verifier, protection, fn(_request, grant) {
-  Ok(authorization.grant_principal(grant))
-})
-```
-
-<!-- prettier-ignore-end -->
-
-## Call with a deadline, cancellation and headers
-
-Example: `call_controls`.
-
-<!-- prettier-ignore-start -->
-
-<!-- snips: examples/relay_usage/src/relay_usage/call_controls.gleam#call-controls -->
-```gleam
-use token <- cancellation.with_token
-peer
-|> client.with_deadline(deadline.after(duration.seconds(10)))
-|> client.with_cancellation(token)
-|> client.call(definition, "Ada")
-```
-
-<!-- prettier-ignore-end -->
-
-`client.with_headers` adds headers to every request. The request budget covers
-header acquisition, so a blocked callback ends on timeout or cancellation.
-`client.with_correlation` and `client.with_idempotency_key` carry the
-correlation and an optional idempotency key through every transport.
-
-## Follow a call and compose results
-
-`client.with_correlation` carries a correlation and `client.with_idempotency_key`
-an optional idempotency key through every transport. The handler reads
-`tool.correlation(call)` and `tool.idempotency_key(call)`; both are untrusted
-client input. Example: `correlation`.
-
-`relay/client/output` folds a call result and a client error into one `Result`
-for non-interactive callers, keeping the evidence of whether a request may have
-run. Example: `typed_output`.
-
-## Defaults and scope
-
-HTTP binds `127.0.0.1` on an ephemeral port. Binding off loopback without
-protection requires `http.allow_unauthenticated`. Request and response bodies
-default to 1 MiB, and the admitted-request deadline and client request timeout
-default to 30 seconds. The design lists every default with its setter.
-
-Relay implements MCP `2026-07-28` only. Legacy `2025-11-25` sessions,
-`logging/setLevel`, resource-read continuation, MCP client authorization flows
-and tasks are unimplemented. The built-in resource-template matcher supports
-one simple `{name}` variable per segment; other syntax needs
-`resources.template_with_matcher`.
-
-The pinned `@modelcontextprotocol/conformance@0.2.0-alpha.10` server suite
-supplies evidence for its emitted assertions ([docs/ORACLE.md](docs/ORACLE.md)). Client, authorization and legacy
-conformance need separate evidence.
-
-## Development
-
-```sh
-nix flake check
-nix run .#design-gate-check -- docs/design .
-nix develop --command bash scripts/test.sh
-```
-
-[AGENTS.md](AGENTS.md) describes the gate. The [design](docs/design/design.typ)
-states responsibilities and contracts, [CONTEXT.typ](docs/design/CONTEXT.typ)
-defines the vocabulary, [COVERAGE.md](docs/COVERAGE.md) maps repository parts
-to design owners, and [docs/adr/](docs/adr/) records decisions and their
-rationale.
-
-## References
-
-[docs/ORACLE.md](docs/ORACLE.md) records the frozen schema, the pinned
-conformance suite and the other references Relay is compared with. Relay has no
-benchmark harness and makes no latency claim.
+- [Runnable usage recipes](examples/relay_usage/README.md)
+- [Public API modules](src/relay/): `tool`, `server`, `http`, `stdio`, `client`, and `authorization`
+- [Design and contracts](docs/design/design-layer.pdf)
+- [Protocol and conformance evidence, including its limits](docs/ORACLE.md)
