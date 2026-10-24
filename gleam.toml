@@ -1,0 +1,29 @@
+name = "relay"
+version = "0.1.0"
+target = "erlang"
+gleam = ">= 1.18.0"
+internal_modules = ["relay/internal", "relay/internal/*"]
+licenses = ["Apache-2.0"]
+description = "A Gleam MCP server and client for the frozen 2026-07-28 revision, with stdio and Streamable HTTP transports."
+repository = { type = "github", user = "gleam-dream", repo = "relay" }
+
+[dependencies]
+gleam_stdlib = ">= 0.70.0 and < 2.0.0"
+gleam_json = ">= 3.0.0 and < 4.0.0"
+gleam_http = ">= 4.4.0 and < 5.0.0"
+gleam_erlang = ">= 1.0.0 and < 2.0.0"
+gleam_otp = ">= 1.0.0 and < 2.0.0"
+gleam_time = ">= 1.11.0 and < 2.0.0"
+json_blueprint = { git = "https://github.com/lostbean/json_blueprint.git", ref = "main" }
+sinal = { git = "https://github.com/gleam-dream/sinal.git", ref = "main" }
+http_gun = { git = "https://github.com/gleam-dream/http_gun.git", ref = "main" }
+# Streaming uses mist's public `chunked` API. Two optional helpers in
+# relay_ffi.erl read mist's `Connection` record (body, socket, transport,
+# factory_name): a socket send timeout for event streams and the closure
+# watch that cancels a buffered request when its client disconnects. Both
+# fall back safely on another record shape; recheck them and the disconnect
+# tests when a new mist 6.x release appears.
+mist = ">= 6.0.2 and < 7.0.0"
+
+[dev-dependencies]
+gleeunit = ">= 1.0.0 and < 2.0.0"
