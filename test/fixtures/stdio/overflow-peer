@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+IFS= read -r _request
+i=1
+while [ "$i" -le 257 ]; do
+  printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":"overflow"}}}'
+  i=$((i + 1))
+done
+while IFS= read -r _request; do
+  :
+done
