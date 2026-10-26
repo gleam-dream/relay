@@ -1,6 +1,6 @@
 # Relay
 
-Relay is an unreleased Gleam MCP server and client for Erlang. It implements the frozen MCP `2026-07-28` revision over stdio and Streamable HTTP.
+Relay is a Gleam MCP server and client for Erlang. It implements the frozen MCP `2026-07-28` revision over stdio and Streamable HTTP.
 
 ## Capabilities
 
@@ -22,15 +22,14 @@ Use Relay when a Gleam application needs to expose typed operations to MCP peers
 
 ## Install
 
-Relay, Sinal, HTTP Gun, and JSON Blueprint are unpublished Git dependencies. Add Relay and JSON Blueprint directly; add Sinal or HTTP Gun directly when your application imports their modules or types.
+Add Relay and JSON Blueprint from Hex; add Sinal or HTTP Gun directly when your application imports their modules or types.
 
-```toml
-[dependencies]
-relay = { git = "https://github.com/gleam-dream/relay.git", ref = "main" }
-json_blueprint = { git = "https://github.com/lostbean/json_blueprint.git", ref = "main" }
+```sh
+gleam add relay json_blueprint@2
 ```
 
-Use Gleam `>= 1.18.0` with the Erlang target. Build your application to resolve dependencies, then check in the generated `manifest.toml` so builds use the same resolved commits. These Git refs track `main` and can move.
+Use Gleam `>= 1.18.0` with the Erlang target. Commit `gleam.toml` and
+`manifest.toml` so builds use the same resolved versions.
 
 ## Server flow and ownership
 
