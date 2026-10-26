@@ -33,7 +33,7 @@ Focused commands: `cd examples/relay_usage && gleam test` (usage examples),
 `python3 -B scripts/check_negative_fixtures.py` (compiler controls).
 
 Dependencies: Sinal, HTTP Gun and JSON Blueprint are unpublished Git dependencies
-on `main`, locked by `manifest.toml`; update one by hand with `gleam update <package>`.
+pinned to verified commits, locked by `manifest.toml`; update one by hand with `gleam update <package>`.
 Oracle comparisons fetch hash-pinned inputs lazily into the Nix store, never on shell entry.
 Local-source experiments run from the Oversight checkout, which captures the whole
 sibling source graph into a new output directory per run.
