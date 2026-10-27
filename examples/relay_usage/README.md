@@ -1,5 +1,9 @@
 # Relay usage examples
 
+[![CI](https://github.com/gleam-dream/relay/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gleam-dream/relay/actions/workflows/ci.yml)
+[![relay on Hex](https://img.shields.io/hexpm/v/relay?label=Hex%3A%20relay)](https://hex.pm/packages/relay)
+[![Gleam](https://img.shields.io/badge/Gleam-FFAFF3?logo=gleam&logoColor=000000)](https://gleam.run/)
+
 Runnable, compiled recipes for the public Relay API. The package depends on
 Relay by path, so a change that breaks a recipe fails the examples gate.
 

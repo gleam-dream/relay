@@ -1,5 +1,9 @@
 # Relay
 
+[![CI](https://github.com/gleam-dream/relay/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gleam-dream/relay/actions/workflows/ci.yml)
+[![relay on Hex](https://img.shields.io/hexpm/v/relay?label=Hex%3A%20relay)](https://hex.pm/packages/relay)
+[![Gleam](https://img.shields.io/badge/Gleam-FFAFF3?logo=gleam&logoColor=000000)](https://gleam.run/)
+
 Relay is a Gleam MCP server and client for Erlang. It implements the frozen MCP `2026-07-28` revision over stdio and Streamable HTTP.
 
 ## Capabilities
