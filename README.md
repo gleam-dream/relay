@@ -18,7 +18,7 @@ Relay is a Gleam MCP server and client for Erlang. It implements the frozen MCP 
 
 ## When Relay fits
 
-Use Relay when a Gleam application needs to expose typed operations to MCP peers, or call an existing MCP server while retaining native Gleam values and explicit failure information. Common setups are:
+Use Relay to expose typed Gleam operations to MCP peers or call an MCP server with native Gleam values and explicit failures. Common setups are:
 
 - An HTTP MCP endpoint exposing application operations to an agent or other remote client.
 - An endpoint mounted in an existing application router, with each request supplying tenant or caller context and an application-owned verifier when bearer protection is needed.
