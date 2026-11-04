@@ -1,5 +1,5 @@
 name = "relay"
-version = "0.1.0"
+version = "0.2.0"
 target = "erlang"
 gleam = ">= 1.18.0"
 internal_modules = ["relay/internal", "relay/internal/*"]
