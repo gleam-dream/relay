@@ -37,7 +37,7 @@
 //// | --- | --- | --- |
 //// | bind | `127.0.0.1`, ephemeral port | `with_bind` |
 //// | non-loopback bind without protection | refused by `start` | `allow_unauthenticated` |
-//// | Host and Origin allow-lists | loopback and the bind host | `with_allowed_hosts`, `with_allowed_origins` |
+//// | Host and Origin allow-lists | loopback and the bind host; Origin also matches the port | `with_allowed_hosts`, `with_allowed_origins` |
 //// | request body | 1 MiB | `with_max_body_bytes` |
 //// | response, or one stream's events | 1 MiB | `with_max_response_bytes` |
 //// | admitted-request deadline | 30 s | `with_request_timeout` |
@@ -102,6 +102,7 @@ import relay/internal/carrier
 import relay/internal/emit
 import relay/internal/http_mist
 import relay/internal/jsonrpc
+import relay/internal/origin
 import relay/internal/protocol/v2026_07_28 as v2026
 import relay/internal/request_owner
 import relay/reducer
@@ -151,7 +152,7 @@ pub opaque type Config(context) {
     cancellation_grace: Duration,
     sse_keepalive: Duration,
     allowed_hosts: Option(List(String)),
-    allowed_origins: List(String),
+    allowed_origins: Option(List(String)),
     max_concurrent_requests: Int,
     max_listen_streams: Int,
     max_json_depth: Int,
@@ -186,7 +187,7 @@ pub fn new_with_context(
     cancellation_grace: duration.seconds(5),
     sse_keepalive: duration.seconds(15),
     allowed_hosts: None,
-    allowed_origins: ["http://localhost", "http://127.0.0.1", "http://[::1]"],
+    allowed_origins: None,
     max_concurrent_requests: 1024,
     max_listen_streams: 64,
     max_json_depth: 64,
@@ -347,12 +348,25 @@ pub fn with_allowed_hosts(
 }
 
 /// The `Origin` header values the endpoint accepts, such as
-/// `"https://app.example.com"`. A request without `Origin` is accepted.
+/// `"https://app.example.com"` or `"http://localhost:3000"`. An `Origin`
+/// matches only an entry with the same scheme, host and port; an entry
+/// without a port means the scheme's default (80 for `http`, 443 for
+/// `https`), so list every non-default port explicitly. The default admits
+/// `http://localhost`, `http://127.0.0.1` and `http://[::1]` on port 80.
+/// A listener from `start` or `supervised` also admits its own origin on
+/// the bound port: for a loopback bind, the bind host and those loopback
+/// names; for a wildcard bind (`0.0.0.0`, `::`), the loopback names; for
+/// any other bind, only the bind host. Setting a list replaces the whole
+/// default. A request without `Origin` is accepted. A request carrying more
+/// than one `Origin` header is refused when the transport preserves
+/// repeated headers, as a mounted `handler` may. Mist 6.0.3 keeps only the
+/// last repeated header, so a listener from `start` or `supervised` checks
+/// that last value; browsers never send more than one `Origin`.
 pub fn with_allowed_origins(
   config: Config(context),
   origins: List(String),
 ) -> Config(context) {
-  Config(..config, allowed_origins: origins)
+  Config(..config, allowed_origins: Some(origins))
 }
 
 /// How many requests, streams included, may be in flight; beyond it the
@@ -537,6 +551,32 @@ fn allowed_hosts(config: Config(context)) -> List(String) {
   }
 }
 
+// The default admits the loopback names on the scheme's default port. A
+// listener also admits its own origin on the bound port.
+fn allowed_origins(config: Config(context)) -> List(String) {
+  case config.allowed_origins {
+    Some(origins) -> origins
+    None -> origin.defaults()
+  }
+}
+
+fn with_listener_origins(
+  config: Config(context),
+  port: Int,
+) -> Config(context) {
+  case config.allowed_origins {
+    Some(_) -> config
+    None ->
+      Config(
+        ..config,
+        allowed_origins: Some(list.append(
+          origin.defaults(),
+          origin.listener_origins(config.host, option.is_some(config.tls), port),
+        )),
+      )
+  }
+}
+
 // --- the endpoint actor ------------------------------------------------------
 
 /// The messages of an endpoint actor; used to name a supervised one.
@@ -635,7 +675,14 @@ fn hub_builder(
             )
           {
             Ok(#(pid, port)) ->
-              Ok(Hub(..hub, port: Some(port), listener: Some(pid)))
+              Ok(
+                Hub(
+                  ..hub,
+                  config: with_listener_origins(config, port),
+                  port: Some(port),
+                  listener: Some(pid),
+                ),
+              )
             Error(Nil) ->
               Error(describe_start_error(BindFailed(config.host, config.port)))
           }
@@ -1767,13 +1814,20 @@ fn validate_headers(
     True -> Ok(Nil)
     False -> Error(#(403, telemetry.HostNotAllowed))
   })
-  use _ <- result.try(case request.get_header(request, "origin") {
-    Error(Nil) -> Ok(Nil)
-    Ok(origin) ->
-      case origin_allowed(origin, config.allowed_origins) {
+  let origins =
+    list.filter(request.headers, fn(header) {
+      string.lowercase(header.0) == "origin"
+    })
+  use _ <- result.try(case origins {
+    [] -> Ok(Nil)
+    [#(_, sent)] ->
+      case origin.allowed(sent, allowed_origins(config)) {
         True -> Ok(Nil)
         False -> Error(#(403, telemetry.OriginNotAllowed))
       }
+    // More than one Origin is ambiguous; no single origin can be checked.
+    // Mist collapses repeated headers, so only a mounted host reaches this.
+    _ -> Error(#(403, telemetry.OriginNotAllowed))
   })
   use _ <- result.try(case request.get_header(request, "content-type") {
     Ok(content_type) ->
@@ -1841,28 +1895,6 @@ fn host_allowed(authority: String, allowed: List(String)) -> Bool {
   list.any(allowed, fn(candidate) {
     host == authority_host(string.lowercase(candidate))
   })
-}
-
-fn origin_allowed(origin: String, allowed: List(String)) -> Bool {
-  let origin = string.lowercase(origin)
-  list.any(allowed, fn(candidate) {
-    case origin_parts(origin), origin_parts(string.lowercase(candidate)) {
-      Some(#(scheme, host)), Some(#(allowed_scheme, allowed_host)) ->
-        scheme == allowed_scheme && host == allowed_host
-      _, _ -> False
-    }
-  })
-}
-
-fn origin_parts(origin: String) -> Option(#(String, String)) {
-  case string.split(origin, on: "://") {
-    [scheme, authority] if scheme != "" && authority != "" ->
-      case string.split(authority, on: "/") {
-        [authority] -> Some(#(scheme, authority_host(authority)))
-        _ -> None
-      }
-    _ -> None
-  }
 }
 
 fn authority_host(authority: String) -> String {

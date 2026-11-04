@@ -128,6 +128,8 @@ pub fn mount(service: server.Server(Tenant)) -> http.Handler(Tenant) {
 
 <!-- prettier-ignore-end -->
 
+Requests that carry an `Origin` header must match an entry in `http.with_allowed_origins` by scheme, host and port. An entry without a port stands for the scheme's default, so a browser page served from `http://localhost:3000` needs `"http://localhost:3000"` listed explicitly. The default admits `http://localhost`, `http://127.0.0.1` and `http://[::1]` on port 80, plus, for a listener from `http.start` or `http.supervised`, its own origin on the bound port (the loopback names for a loopback or wildcard bind, and the bind host itself for a specific bind); a mounted handler knows no port, so list the host application's origins. A request carrying more than one `Origin` header is refused when the transport preserves repeated headers; mist 6.0.3 keeps only the last repeated header, so a listener started by Relay checks that last value (browsers never send more than one `Origin`). `Host` values are compared without their port.
+
 For bearer-protected endpoints, see the [protection recipe](examples/relay_usage/src/relay_usage/protect.gleam). Relay checks the verifier's attested resource and scopes and formats challenges and metadata; the verifier owns token authenticity, issuer, and expiry checks.
 
 ## Limits to plan for
