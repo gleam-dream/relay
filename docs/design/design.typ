@@ -291,7 +291,7 @@
       [Response budget], [1 MiB response or cumulative stream event bytes], [Broker enforces event output budget and acknowledged delivery; existing allocations are not erased by refusal.],
       [Admitted request deadline], [30 s], [One absolute deadline starts at slot admission and covers callbacks, finite execution and response waits.],
       [Cancellation and keepalive], [5 s grace; 15 s SSE keepalive], [Cleanup begins after cancellation; retiring work retains capacity until termination. Keepalive is transport liveness.],
-      [Host and Origin], [Loopback names / bind host and configured origins], [Case-insensitive header names and values; rejection precedes callback; missing Origin is permitted by current policy. Host compares the host name only, because the header carries the bound port. Origin compares scheme, host and port; an entry without a port means the scheme default (80 for http, 443 for https), so other ports are listed explicitly.],
+      [Host and Origin], [Loopback names / bind host and configured origins], [Case-insensitive header names and values; rejection precedes callback; missing Origin is permitted by current policy. Host compares the host name only, because the header carries the bound port. Origin compares scheme, host and port; an entry without a port means the scheme default (80 for http, 443 for https), so other ports are listed explicitly. A port is ASCII digits, a bracketed host is an IPv6 address, and more than one Origin header is refused.],
     ))
     #points(
       [handle consumes Request(BitArray) and returns buffered Response(BytesTree). It drops progress, cannot observe peer disconnect, and rejects subscriptions/listen with 406. mist_handler, start, and supervised retain streaming, keepalive and disconnect cancellation.],
@@ -478,7 +478,7 @@
       [*Setting*], [*Default*], [*Change with*],
       [HTTP bind], [`127.0.0.1`, ephemeral port], [`http.with_bind`],
       [HTTP bind off loopback without protection], [`start` fails], [`http.new_protected` or `http.allow_unauthenticated`],
-      [Host and Origin allow-lists], [Hosts: loopback names and the bind host, any port. Origins: `http://localhost`, `http://127.0.0.1` and `http://[::1]` on port 80, and a listener's bind host and loopback names on its bound port], [`http.with_allowed_hosts`, `http.with_allowed_origins`],
+      [Host and Origin allow-lists], [Hosts: loopback names and the bind host, any port. Origins: `http://localhost`, `http://127.0.0.1` and `http://[::1]` on port 80; a listener adds its bound port for the loopback names when its bind is loopback or wildcard, and for the bind host when that host is specific], [`http.with_allowed_hosts`, `http.with_allowed_origins`],
       [HTTP request body], [1 MiB, then 413], [`http.with_max_body_bytes`],
       [HTTP response, or one stream's events], [1 MiB], [`http.with_max_response_bytes`],
       [HTTP admitted-request deadline], [30 s from slot admission], [`http.with_request_timeout`],

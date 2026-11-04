@@ -869,6 +869,8 @@ pub fn default_origins_require_the_listed_port_test() {
   origin_status(handler, "http://[::1]:8080") |> should.equal(403)
   origin_status(handler, "https://localhost") |> should.equal(403)
   origin_status(handler, "http://localhost:443") |> should.equal(403)
+  origin_status(handler, "http://[localhost]") |> should.equal(403)
+  origin_status(handler, "http://localhost:+80") |> should.equal(403)
 }
 
 pub fn default_origins_admit_the_listener_own_origin_test() {
@@ -892,6 +894,27 @@ pub fn default_origins_admit_the_listener_own_origin_test() {
   status("http://127.0.0.1:" <> int.to_string(port + 1)) |> should.equal(403)
   status("https://127.0.0.1" <> own) |> should.equal(403)
   http.stop(listener)
+}
+
+pub fn more_than_one_origin_header_is_refused_test() {
+  let handler = mounted(http.new(echo_server()))
+  let with_origins = fn(first, second) {
+    echo_call("x")
+    |> request.prepend_header("origin", second)
+    |> request.prepend_header("origin", first)
+  }
+  http.handle(
+    handler,
+    with_origins("http://attacker.invalid", "http://localhost"),
+  ).status
+  |> should.equal(403)
+  http.handle(
+    handler,
+    with_origins("http://localhost", "http://attacker.invalid"),
+  ).status
+  |> should.equal(403)
+  http.handle(handler, with_origins("http://localhost", "http://localhost")).status
+  |> should.equal(403)
 }
 
 pub fn configured_origins_match_scheme_host_and_port_test() {
