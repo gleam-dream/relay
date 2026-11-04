@@ -37,7 +37,7 @@
 //// | --- | --- | --- |
 //// | bind | `127.0.0.1`, ephemeral port | `with_bind` |
 //// | non-loopback bind without protection | refused by `start` | `allow_unauthenticated` |
-//// | Host and Origin allow-lists | loopback and the bind host | `with_allowed_hosts`, `with_allowed_origins` |
+//// | Host and Origin allow-lists | loopback and the bind host; Origin also matches the port | `with_allowed_hosts`, `with_allowed_origins` |
 //// | request body | 1 MiB | `with_max_body_bytes` |
 //// | response, or one stream's events | 1 MiB | `with_max_response_bytes` |
 //// | admitted-request deadline | 30 s | `with_request_timeout` |
@@ -151,7 +151,7 @@ pub opaque type Config(context) {
     cancellation_grace: Duration,
     sse_keepalive: Duration,
     allowed_hosts: Option(List(String)),
-    allowed_origins: List(String),
+    allowed_origins: Option(List(String)),
     max_concurrent_requests: Int,
     max_listen_streams: Int,
     max_json_depth: Int,
@@ -186,7 +186,7 @@ pub fn new_with_context(
     cancellation_grace: duration.seconds(5),
     sse_keepalive: duration.seconds(15),
     allowed_hosts: None,
-    allowed_origins: ["http://localhost", "http://127.0.0.1", "http://[::1]"],
+    allowed_origins: None,
     max_concurrent_requests: 1024,
     max_listen_streams: 64,
     max_json_depth: 64,
@@ -347,12 +347,19 @@ pub fn with_allowed_hosts(
 }
 
 /// The `Origin` header values the endpoint accepts, such as
-/// `"https://app.example.com"`. A request without `Origin` is accepted.
+/// `"https://app.example.com"` or `"http://localhost:3000"`. An `Origin`
+/// matches only an entry with the same scheme, host and port; an entry
+/// without a port means the scheme's default (80 for `http`, 443 for
+/// `https`), so list every non-default port explicitly. The default admits
+/// `http://localhost`, `http://127.0.0.1` and `http://[::1]` on port 80,
+/// and for a listener from `start` or `supervised` also its own origin: the
+/// bind host and those loopback names on the bound port. Setting a list
+/// replaces the whole default. A request without `Origin` is accepted.
 pub fn with_allowed_origins(
   config: Config(context),
   origins: List(String),
 ) -> Config(context) {
-  Config(..config, allowed_origins: origins)
+  Config(..config, allowed_origins: Some(origins))
 }
 
 /// How many requests, streams included, may be in flight; beyond it the
@@ -537,6 +544,47 @@ fn allowed_hosts(config: Config(context)) -> List(String) {
   }
 }
 
+// The default admits the loopback names on the scheme's default port. A
+// listener also admits its own origin: the bind host and the loopback
+// names on the bound port.
+fn allowed_origins(config: Config(context)) -> List(String) {
+  case config.allowed_origins {
+    Some(origins) -> origins
+    None -> ["http://localhost", "http://127.0.0.1", "http://[::1]"]
+  }
+}
+
+fn with_listener_origins(
+  config: Config(context),
+  port: Int,
+) -> Config(context) {
+  case config.allowed_origins {
+    Some(_) -> config
+    None -> {
+      let scheme = case config.tls {
+        Some(_) -> "https://"
+        None -> "http://"
+      }
+      let own =
+        [string.lowercase(config.host), "localhost", "127.0.0.1", "::1"]
+        |> list.unique
+        |> list.map(fn(host) {
+          let host = case
+            string.contains(host, ":") && !string.starts_with(host, "[")
+          {
+            True -> "[" <> host <> "]"
+            False -> host
+          }
+          scheme <> host <> ":" <> int.to_string(port)
+        })
+      Config(
+        ..config,
+        allowed_origins: Some(list.append(allowed_origins(config), own)),
+      )
+    }
+  }
+}
+
 // --- the endpoint actor ------------------------------------------------------
 
 /// The messages of an endpoint actor; used to name a supervised one.
@@ -635,7 +683,14 @@ fn hub_builder(
             )
           {
             Ok(#(pid, port)) ->
-              Ok(Hub(..hub, port: Some(port), listener: Some(pid)))
+              Ok(
+                Hub(
+                  ..hub,
+                  config: with_listener_origins(config, port),
+                  port: Some(port),
+                  listener: Some(pid),
+                ),
+              )
             Error(Nil) ->
               Error(describe_start_error(BindFailed(config.host, config.port)))
           }
@@ -1770,7 +1825,7 @@ fn validate_headers(
   use _ <- result.try(case request.get_header(request, "origin") {
     Error(Nil) -> Ok(Nil)
     Ok(origin) ->
-      case origin_allowed(origin, config.allowed_origins) {
+      case origin_allowed(origin, allowed_origins(config)) {
         True -> Ok(Nil)
         False -> Error(#(403, telemetry.OriginNotAllowed))
       }
@@ -1843,25 +1898,71 @@ fn host_allowed(authority: String, allowed: List(String)) -> Bool {
   })
 }
 
+// An origin is the triple of scheme, host and effective port (RFC 6454): a
+// missing port stands for the scheme's default, so `http://localhost`
+// admits `http://localhost:80` but not `http://localhost:3000`.
 fn origin_allowed(origin: String, allowed: List(String)) -> Bool {
-  let origin = string.lowercase(origin)
-  list.any(allowed, fn(candidate) {
-    case origin_parts(origin), origin_parts(string.lowercase(candidate)) {
-      Some(#(scheme, host)), Some(#(allowed_scheme, allowed_host)) ->
-        scheme == allowed_scheme && host == allowed_host
-      _, _ -> False
-    }
-  })
+  case origin_parts(string.lowercase(origin)) {
+    None -> False
+    Some(origin) ->
+      list.any(allowed, fn(candidate) {
+        origin_parts(string.lowercase(candidate)) == Some(origin)
+      })
+  }
 }
 
-fn origin_parts(origin: String) -> Option(#(String, String)) {
+fn origin_parts(origin: String) -> Option(#(String, String, Option(Int))) {
   case string.split(origin, on: "://") {
     [scheme, authority] if scheme != "" && authority != "" ->
       case string.split(authority, on: "/") {
-        [authority] -> Some(#(scheme, authority_host(authority)))
+        [authority] ->
+          case authority_port(authority) {
+            Ok(port) ->
+              Some(#(
+                scheme,
+                authority_host(authority),
+                option.or(port, default_port(scheme)),
+              ))
+            Error(Nil) -> None
+          }
         _ -> None
       }
     _ -> None
+  }
+}
+
+fn default_port(scheme: String) -> Option(Int) {
+  case scheme {
+    "http" -> Some(80)
+    "https" -> Some(443)
+    _ -> None
+  }
+}
+
+// The explicit port of an authority, `None` when it names none, or an error
+// when the text after the host is not a port.
+fn authority_port(authority: String) -> Result(Option(Int), Nil) {
+  let rest = case string.starts_with(authority, "[") {
+    True ->
+      case string.split_once(authority, on: "]") {
+        Ok(#(_, rest)) -> Ok(rest)
+        Error(Nil) -> Error(Nil)
+      }
+    False ->
+      case string.split_once(authority, on: ":") {
+        Ok(#(_, port)) -> Ok(":" <> port)
+        Error(Nil) -> Ok("")
+      }
+  }
+  use rest <- result.try(rest)
+  case rest {
+    "" -> Ok(None)
+    ":" <> port ->
+      case int.parse(port) {
+        Ok(port) if port >= 0 && port <= 65_535 -> Ok(Some(port))
+        _ -> Error(Nil)
+      }
+    _ -> Error(Nil)
   }
 }
 

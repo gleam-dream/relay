@@ -848,6 +848,75 @@ pub fn mounted_handler_refuses_bad_requests_test() {
   listen.status |> should.equal(406)
 }
 
+fn origin_status(handler: http.Handler(Nil), origin: String) -> Int {
+  http.handle(handler, echo_call("x") |> request.set_header("origin", origin)).status
+}
+
+pub fn default_origins_require_the_listed_port_test() {
+  let handler = mounted(http.new(echo_server()))
+
+  // A default entry names no port, so it admits only the scheme default.
+  origin_status(handler, "http://localhost") |> should.equal(200)
+  origin_status(handler, "http://localhost:80") |> should.equal(200)
+  origin_status(handler, "HTTP://LocalHost") |> should.equal(200)
+  origin_status(handler, "http://127.0.0.1") |> should.equal(200)
+  origin_status(handler, "http://[::1]") |> should.equal(200)
+  origin_status(handler, "http://[::1]:80") |> should.equal(200)
+
+  // Another local server's page is a different origin.
+  origin_status(handler, "http://localhost:3000") |> should.equal(403)
+  origin_status(handler, "http://127.0.0.1:5173") |> should.equal(403)
+  origin_status(handler, "http://[::1]:8080") |> should.equal(403)
+  origin_status(handler, "https://localhost") |> should.equal(403)
+  origin_status(handler, "http://localhost:443") |> should.equal(403)
+}
+
+pub fn default_origins_admit_the_listener_own_origin_test() {
+  let listener = http.new(empty_server()) |> started
+  let port = http.port(listener)
+  let body = envelope("server/discover", True, [])
+  let status = fn(origin) {
+    let assert Ok(#(status, _, _)) =
+      local_request(
+        port,
+        "post",
+        [#("Origin", origin), ..headers("server/discover", "application/json")],
+        body,
+      )
+    status
+  }
+  let own = ":" <> int.to_string(port)
+  status("http://127.0.0.1" <> own) |> should.equal(200)
+  status("http://localhost" <> own) |> should.equal(200)
+  status("http://127.0.0.1") |> should.equal(200)
+  status("http://127.0.0.1:" <> int.to_string(port + 1)) |> should.equal(403)
+  status("https://127.0.0.1" <> own) |> should.equal(403)
+  http.stop(listener)
+}
+
+pub fn configured_origins_match_scheme_host_and_port_test() {
+  let handler =
+    mounted(
+      http.new(echo_server())
+      |> http.with_allowed_origins([
+        "https://app.example.com",
+        "http://localhost:3000",
+      ]),
+    )
+
+  origin_status(handler, "https://app.example.com") |> should.equal(200)
+  origin_status(handler, "https://app.example.com:443") |> should.equal(200)
+  origin_status(handler, "https://APP.example.com") |> should.equal(200)
+  origin_status(handler, "http://localhost:3000") |> should.equal(200)
+
+  origin_status(handler, "https://app.example.com:8443") |> should.equal(403)
+  origin_status(handler, "http://app.example.com") |> should.equal(403)
+  origin_status(handler, "http://localhost") |> should.equal(403)
+  origin_status(handler, "http://localhost:3001") |> should.equal(403)
+  origin_status(handler, "http://localhost:3000/path") |> should.equal(403)
+  origin_status(handler, "null") |> should.equal(403)
+}
+
 fn nested(depth: Int) -> json.Json {
   case depth {
     0 -> json.int(1)
