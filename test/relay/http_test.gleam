@@ -917,6 +917,32 @@ pub fn more_than_one_origin_header_is_refused_test() {
   |> should.equal(403)
 }
 
+// Mist 6.0.3 keeps only the last of repeated headers, so a relay listener
+// sees one Origin and cannot refuse duplicates. This pins that limitation;
+// if mist starts preserving repeated headers, both requests become 403.
+pub fn listener_sees_only_the_last_repeated_origin_test() {
+  let listener = http.new(empty_server()) |> started
+  let port = http.port(listener)
+  let body = envelope("server/discover", True, [])
+  let status = fn(first, second) {
+    let assert Ok(#(status, _, _)) =
+      local_request(
+        port,
+        "post",
+        [
+          #("Origin", first),
+          #("Origin", second),
+          ..headers("server/discover", "application/json")
+        ],
+        body,
+      )
+    status
+  }
+  status("http://attacker.invalid", "http://localhost") |> should.equal(200)
+  status("http://localhost", "http://attacker.invalid") |> should.equal(403)
+  http.stop(listener)
+}
+
 pub fn configured_origins_match_scheme_host_and_port_test() {
   let handler =
     mounted(

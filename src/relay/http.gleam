@@ -357,8 +357,11 @@ pub fn with_allowed_hosts(
 /// the bound port: for a loopback bind, the bind host and those loopback
 /// names; for a wildcard bind (`0.0.0.0`, `::`), the loopback names; for
 /// any other bind, only the bind host. Setting a list replaces the whole
-/// default. A request without `Origin` is accepted; a request with more
-/// than one `Origin` header is refused.
+/// default. A request without `Origin` is accepted. A request carrying more
+/// than one `Origin` header is refused when the transport preserves
+/// repeated headers, as a mounted `handler` may. Mist 6.0.3 keeps only the
+/// last repeated header, so a listener from `start` or `supervised` checks
+/// that last value; browsers never send more than one `Origin`.
 pub fn with_allowed_origins(
   config: Config(context),
   origins: List(String),
@@ -1823,6 +1826,7 @@ fn validate_headers(
         False -> Error(#(403, telemetry.OriginNotAllowed))
       }
     // More than one Origin is ambiguous; no single origin can be checked.
+    // Mist collapses repeated headers, so only a mounted host reaches this.
     _ -> Error(#(403, telemetry.OriginNotAllowed))
   })
   use _ <- result.try(case request.get_header(request, "content-type") {
