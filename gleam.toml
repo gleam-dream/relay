@@ -1,5 +1,5 @@
 name = "relay"
-version = "0.2.0"
+version = "0.2.1"
 target = "erlang"
 gleam = ">= 1.18.0"
 internal_modules = ["relay/internal", "relay/internal/*"]
@@ -16,7 +16,7 @@ gleam_otp = ">= 1.0.0 and < 2.0.0"
 gleam_time = ">= 1.11.0 and < 2.0.0"
 json_blueprint = ">= 2.0.0 and < 3.0.0"
 sinal = ">= 0.1.0 and < 0.2.0"
-http_gun = ">= 0.1.0 and < 0.2.0"
+http_gun = ">= 0.1.0 and < 0.3.0"
 # Streaming uses mist's public `chunked` API. Two optional helpers in
 # relay_ffi.erl read mist's `Connection` record (body, socket, transport,
 # factory_name): a socket send timeout for event streams and the closure
