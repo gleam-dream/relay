@@ -90,6 +90,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
+import gleam/set
 import gleam/string
 import gleam/time/duration.{type Duration}
 import gleam/uri
@@ -100,6 +101,7 @@ import relay/authorization.{
 }
 import relay/internal/carrier
 import relay/internal/emit
+import relay/internal/held.{type Held}
 import relay/internal/http_mist
 import relay/internal/jsonrpc
 import relay/internal/origin
@@ -598,11 +600,12 @@ pub opaque type Message(context) {
   StopEndpoint(reply: Subject(Nil))
 }
 
+// What an admitted request receives: a handle to the endpoint's held
+// configuration and server snapshot, never the catalog itself.
 type Lease(context) {
   Lease(
     slot: Int,
-    server: Server(context),
-    config: Config(context),
+    config: Held(Config(context)),
     generation: Int,
     deadline: Int,
   )
@@ -619,6 +622,8 @@ type Slot(context) {
     cancel: fn() -> Nil,
     stream: Bool,
     runtime: Option(runtime.Runtime(context)),
+    // The registry generation whose snapshot this request leased.
+    generation: Int,
   )
 }
 
@@ -632,6 +637,9 @@ type Hub(context) {
     streams: Int,
     port: Option(Int),
     listener: Option(Pid),
+    // The held configuration with the server of each generation that the
+    // current one or an admitted request still uses.
+    snapshots: Dict(Int, Held(Config(context))),
   )
 }
 
@@ -662,6 +670,7 @@ fn hub_builder(
           streams: 0,
           port: None,
           listener: None,
+          snapshots: dict.new(),
         )
       let started = case listen {
         False -> Ok(hub)
@@ -690,7 +699,7 @@ fn hub_builder(
       case started {
         Error(reason) -> Error(reason)
         Ok(hub) ->
-          actor.initialised(hub)
+          actor.initialised(hold_snapshot(hub))
           |> actor.selecting(selector)
           |> actor.returning(Handler(self))
           |> Ok
@@ -822,8 +831,7 @@ fn handle_hub(
             reply,
             Ok(Lease(
               slot,
-              hub.server,
-              hub.config,
+              current_snapshot(hub),
               hub.generation,
               monotonic_ms()
                 + duration.to_milliseconds(hub.config.request_timeout),
@@ -835,7 +843,7 @@ fn handle_hub(
               slots: dict.insert(
                 hub.slots,
                 slot,
-                Slot(monitor, cancel, stream, None),
+                Slot(monitor, cancel, stream, None, hub.generation),
               ),
               requests: hub.requests + 1,
               streams: hub.streams
@@ -909,7 +917,8 @@ fn handle_hub(
           })
           process.send(reply, Ok(Nil))
           actor.continue(
-            Hub(..hub, server: next, generation: hub.generation + 1),
+            Hub(..hub, server: next, generation: hub.generation + 1)
+            |> hold_snapshot,
           )
         }
       }
@@ -929,7 +938,8 @@ fn handle_hub(
               ..hub,
               server: server.unregister_tool(hub.server, name),
               generation: hub.generation + 1,
-            ),
+            )
+            |> hold_snapshot,
           )
         }
       }
@@ -979,8 +989,47 @@ fn release_slot(hub: Hub(context), slot: Int) -> Hub(context) {
           False -> hub.streams
         },
       )
+      |> release_snapshots
     }
   }
+}
+
+// Holds the configuration with the current server for the current
+// generation, then frees snapshots no request uses any more. A request
+// reads its snapshot only while its slot is admitted, so a snapshot freed
+// here has no reader left. Holding scans the node, which is why only
+// startup and registry changes hold.
+fn hold_snapshot(hub: Hub(context)) -> Hub(context) {
+  let snapshot = held.hold(Config(..hub.config, server: hub.server))
+  Hub(..hub, snapshots: dict.insert(hub.snapshots, hub.generation, snapshot))
+  |> release_snapshots
+}
+
+fn current_snapshot(hub: Hub(context)) -> Held(Config(context)) {
+  let assert Ok(snapshot) = dict.get(hub.snapshots, hub.generation)
+  snapshot
+}
+
+fn release_snapshots(hub: Hub(context)) -> Hub(context) {
+  case dict.size(hub.snapshots) <= 1 {
+    // Only the current generation's snapshot: nothing to free.
+    True -> hub
+    False -> release_unleased(hub)
+  }
+}
+
+fn release_unleased(hub: Hub(context)) -> Hub(context) {
+  let leased =
+    dict.fold(hub.slots, set.new(), fn(leased, _, slot) {
+      set.insert(leased, slot.generation)
+    })
+  let #(kept, freed) =
+    dict.to_list(hub.snapshots)
+    |> list.partition(fn(entry) {
+      entry.0 == hub.generation || set.contains(leased, entry.0)
+    })
+  list.each(freed, fn(entry) { held.release(entry.1) })
+  Hub(..hub, snapshots: dict.from_list(kept))
 }
 
 @external(erlang, "relay_ffi", "unique_integer")
@@ -1100,7 +1149,9 @@ fn serve(
             Ok(
               request_owner.Setup(
                 lease.deadline,
-                duration.to_milliseconds(lease.config.cancellation_grace),
+                duration.to_milliseconds(
+                  held.get(lease.config).cancellation_grace,
+                ),
                 listen,
                 fn() {
                   let reply = process.new_subject()
@@ -1157,7 +1208,7 @@ fn serve_leased(
   scope: request_owner.Scope,
   streaming: Bool,
 ) -> http_mist.Reply {
-  let config = lease.config
+  let config = held.get(lease.config)
   let correlation = request_correlation(config, request)
   case metadata_request(config, request) {
     Some(reply) -> reply
@@ -1317,7 +1368,7 @@ fn dispatch(
   scope: request_owner.Scope,
   stream: Bool,
 ) -> http_mist.Reply {
-  let config = lease.config
+  let config = held.get(lease.config)
   let body = request.body
   case v2026.http_route(body) {
     Error(Nil) ->
@@ -1331,7 +1382,7 @@ fn dispatch(
     Ok(route) ->
       case
         valid_route_headers(request, route)
-        && valid_parameter_headers(request, lease.server, route)
+        && valid_parameter_headers(request, config.server, route)
       {
         False -> {
           emit.http_rejected(
@@ -1386,13 +1437,20 @@ fn run(
   scope: request_owner.Scope,
   stream: Bool,
 ) -> http_mist.Reply {
-  let config = lease.config
+  let config = held.get(lease.config)
   let timeout_ms = int.max(1, request_owner.remaining(scope))
+  // These closures cross into the request owner and the processes it
+  // starts, so they capture plain values and the lease, never `config`.
+  let max_response_bytes = config.max_response_bytes
+  let request_timeout_ms = duration.to_milliseconds(config.request_timeout)
+  let rt_config =
+    runtime_config(config)
+    |> runtime.with_invocation_timeout(duration.milliseconds(timeout_ms))
   case
     request_owner.start_child(
       scope,
       fn() {
-        start_broker(config.max_response_bytes)
+        start_broker(max_response_bytes)
         |> result.try(fn(broker) {
           process.subject_owner(broker)
           |> result.map(fn(pid) { #(pid, broker) })
@@ -1409,18 +1467,9 @@ fn run(
           scope,
           fn() {
             runtime.start_scoped(
-              lease.server,
-              runtime_config(config)
-                |> runtime.with_invocation_timeout(duration.milliseconds(
-                  timeout_ms,
-                )),
-              fn(output) {
-                deliver(
-                  broker,
-                  output,
-                  duration.to_milliseconds(config.request_timeout),
-                )
-              },
+              fn() { held.get(lease.config).server },
+              rt_config,
+              fn(output) { deliver(broker, output, request_timeout_ms) },
               scope,
             )
             |> result.replace_error(Nil)
@@ -1490,7 +1539,11 @@ fn run(
                               )
                             False -> Nil
                           }
-                          streamed(broker, config)
+                          streamed(
+                            broker,
+                            duration.to_milliseconds(config.sse_keepalive),
+                            request_timeout_ms,
+                          )
                         }
                         False ->
                           buffered(
@@ -1509,7 +1562,8 @@ fn run(
 
 fn streamed(
   broker: Broker(context),
-  config: Config(context),
+  keepalive_ms: Int,
+  write_budget_ms: Int,
 ) -> http_mist.Reply {
   http_mist.Streamed(
     head: response.new(200)
@@ -1519,8 +1573,8 @@ fn streamed(
       |> response.set_body(Nil),
     next: fn(wait_ms) { next(broker, wait_ms) },
     close: fn() { client_gone(broker) },
-    keepalive_ms: duration.to_milliseconds(config.sse_keepalive),
-    write_budget: fn() { Ok(duration.to_milliseconds(config.request_timeout)) },
+    keepalive_ms: keepalive_ms,
+    write_budget: fn() { Ok(write_budget_ms) },
     written: fn(_) { Nil },
     attached: fn(_) { True },
   )

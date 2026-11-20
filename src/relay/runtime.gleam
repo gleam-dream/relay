@@ -69,6 +69,7 @@ import gleam/result
 import gleam/time/duration.{type Duration}
 import relay/internal/carrier
 import relay/internal/emit
+import relay/internal/held.{type Held}
 import relay/internal/protocol/v2026_07_28 as v2026
 import relay/internal/request_owner
 import relay/reducer.{type ExchangeId, type Invocation, type InvocationId}
@@ -308,11 +309,25 @@ type Cancelling {
   Cancelling(monitor: process.Monitor, kill: process.Timer)
 }
 
+// Where a runtime's server description comes from: kept on the runtime's
+// heap, so each invocation worker copies its one tool; held in shared
+// storage for the runtime's lifetime (stdio), so workers copy no tool but
+// stopping frees it with a node-wide check; or a holder's that outlives the
+// runtime (an HTTP endpoint's current snapshot). See ADR 0017.
+type Source(context) {
+  Keep(server: Server(context))
+  Own(server: Server(context))
+  Borrow(load: fn() -> Server(context))
+}
+
 type State(context) {
   State(
     config: Config,
     scope: Option(request_owner.Scope),
     reducer: reducer.State(context),
+    // The runtime's own held server, replaced on registry changes; `None`
+    // for a kept or borrowed one.
+    held: Option(Held(Server(context))),
     sink: fn(Output) -> Result(Nil, Nil),
     workers: Dict(Int, Worker),
     // Handlers in their cancellation grace. The runtime stops only once
@@ -339,29 +354,49 @@ fn monotonic_ms() -> Int
 @external(erlang, "relay_ffi", "rescue_run")
 fn rescue_run(fun: fn() -> a) -> Result(a, String)
 
-/// Starts a runtime linked to the caller.
+/// Starts a runtime linked to the caller. The runtime keeps `server` on its
+/// own heap; each invocation worker receives its invocation, which copies
+/// the one tool it runs, never the runtime state or the rest of the catalog.
 pub fn start(
   server: Server(context),
   config: Config,
   sink: fn(Output) -> Result(Nil, Nil),
 ) -> Result(Runtime(context), StartError) {
   use config <- result.try(validate(config))
-  builder(server, config, sink, None, None)
+  builder(Keep(server), config, sink, None, None)
+  |> actor.start
+  |> result.map(fn(started) { Runtime(started.data) })
+  |> result.map_error(ActorStartFailed)
+}
+
+/// Internal seam for long-lived runtimes such as stdio's: holds `server` in
+/// shared storage for the runtime's lifetime, so workers copy no tool, at
+/// the price of a node-wide check when the runtime stops.
+@internal
+pub fn start_holding(
+  server: Server(context),
+  config: Config,
+  sink: fn(Output) -> Result(Nil, Nil),
+) -> Result(Runtime(context), StartError) {
+  use config <- result.try(validate(config))
+  builder(Own(server), config, sink, None, None)
   |> actor.start
   |> result.map(fn(started) { Runtime(started.data) })
   |> result.map_error(ActorStartFailed)
 }
 
 /// Internal HTTP lifetime seam; ordinary runtimes keep their own limits.
+/// `load` reads the endpoint's held server inside the new runtime, so the
+/// catalog is never copied into it.
 @internal
 pub fn start_scoped(
-  server: Server(context),
+  load: fn() -> Server(context),
   config: Config,
   sink: fn(Output) -> Result(Nil, Nil),
   scope: request_owner.Scope,
 ) -> Result(#(Pid, Runtime(context)), StartError) {
   use config <- result.try(validate(config))
-  builder(server, config, sink, None, Some(scope))
+  builder(Borrow(load), config, sink, None, Some(scope))
   |> actor.start
   |> result.map(fn(started) { #(started.pid, Runtime(started.data)) })
   |> result.map_error(ActorStartFailed)
@@ -385,7 +420,7 @@ pub fn supervised(
     case validate(config) {
       Error(error) -> Error(actor.InitFailed(describe_start_error(error)))
       Ok(config) ->
-        builder(server, config, sink, Some(name), None)
+        builder(Keep(server), config, sink, Some(name), None)
         |> actor.start
         |> result.map(fn(started) {
           actor.Started(started.pid, Runtime(started.data))
@@ -400,7 +435,7 @@ pub fn named(name: process.Name(Message(context))) -> Runtime(context) {
 }
 
 fn builder(
-  server: Server(context),
+  source: Source(context),
   config: Config,
   sink: fn(Output) -> Result(Nil, Nil),
   name: Option(process.Name(Message(context))),
@@ -416,10 +451,19 @@ fn builder(
         |> process.select(for: self)
         |> process.select_monitors(WorkerDown)
         |> process.select_trapped_exits(OwnerExited)
+      let #(server, own) = case source {
+        Keep(server) -> #(server, None)
+        Own(server) -> {
+          let own = held.hold(server)
+          #(held.get(own), Some(own))
+        }
+        Borrow(load) -> #(load(), None)
+      }
       State(
         config: config,
         scope: scope,
         reducer: reducer.init(server),
+        held: own,
         sink: sink,
         workers: dict.new(),
         cancelling: dict.new(),
@@ -737,7 +781,35 @@ fn apply(
   input: reducer.Input(context),
 ) -> State(context) {
   let #(next, effects) = reducer.step(state.reducer, input)
-  list.fold(effects, State(..state, reducer: next), interpret)
+  let state = case input {
+    reducer.RegisterTool(_) | reducer.UnregisterTool(_) ->
+      rehold(State(..state, reducer: next))
+    _ -> State(..state, reducer: next)
+  }
+  list.fold(effects, state, interpret)
+}
+
+// Holds the changed catalog of a runtime that owns its server and frees the
+// previous one, so later workers keep sharing instead of copying new tools.
+fn rehold(state: State(context)) -> State(context) {
+  case state.held {
+    None -> state
+    Some(previous) -> {
+      let current = reducer.server(state.reducer)
+      case current == held.get(previous) {
+        True -> state
+        False -> {
+          let next = held.hold(current)
+          held.release(previous)
+          State(
+            ..state,
+            reducer: reducer.replace_server(state.reducer, held.get(next)),
+            held: Some(next),
+          )
+        }
+      }
+    }
+  }
 }
 
 fn interpret(
@@ -822,6 +894,10 @@ fn start_worker(
         Nil
       }
       let invocation_id = reducer.invocation_id(invocation)
+      // The worker's closure is copied into its process: it captures the
+      // invocation and these few values, never the runtime state.
+      let label = state.config.label
+      let scope = state.scope
       let run = fn() {
         emit.invocation_started(telemetry.InvocationStartedMeta(
           exchange_id: exchange,
@@ -829,9 +905,9 @@ fn start_worker(
           method: method,
           tool: tool,
           correlation: correlation,
-          listener: state.config.label,
+          listener: label,
         ))
-        let authorized = case state.scope {
+        let authorized = case scope {
           None -> True
           Some(scope) -> request_owner.authorized(scope)
         }

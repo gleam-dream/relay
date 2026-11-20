@@ -32,6 +32,9 @@ Add Relay and JSON Blueprint from Hex; add Sinal or HTTP Gun directly when your 
 gleam add relay json_blueprint@2
 ```
 
+Relay requires JSON Blueprint 2.1.1 or later: copying an earlier combinator
+codec to another process cost many times its size in the heap.
+
 Use Gleam `>= 1.18.0` with the Erlang target. Commit `gleam.toml` and
 `manifest.toml` so builds use the same resolved versions.
 
@@ -131,6 +134,32 @@ pub fn mount(service: server.Server(Tenant)) -> http.Handler(Tenant) {
 Requests that carry an `Origin` header must match an entry in `http.with_allowed_origins` by scheme, host and port. An entry without a port stands for the scheme's default, so a browser page served from `http://localhost:3000` needs `"http://localhost:3000"` listed explicitly. The default admits `http://localhost`, `http://127.0.0.1` and `http://[::1]` on port 80, plus, for a listener from `http.start` or `http.supervised`, its own origin on the bound port (the loopback names for a loopback or wildcard bind, and the bind host itself for a specific bind); a mounted handler knows no port, so list the host application's origins. A request carrying more than one `Origin` header is refused when the transport preserves repeated headers; mist 6.0.3 keeps only the last repeated header, so a listener started by Relay checks that last value (browsers never send more than one `Origin`). `Host` values are compared without their port.
 
 For bearer-protected endpoints, see the [protection recipe](examples/relay_usage/src/relay_usage/protect.gleam). Relay checks the verifier's attested resource and scopes and formats challenges and metadata; the verifier owns token authenticity, issuer, and expiry checks.
+
+## Tool codecs and process copies
+
+Write tool input and output codecs by the
+[JSON Blueprint codec practice](https://github.com/lostbean/json_blueprint/blob/main/docs/CODEC-PRACTICE.md).
+This section states only what Relay copies between processes.
+
+- An HTTP endpoint (`http.handler`, `http.start`, `http.supervised`) and a
+  stdio server (`stdio.serve`) hold the server, with every tool's codecs and
+  handler closures, once in `persistent_term`. Requests, request runtimes and
+  invocation workers read it there without copying it.
+- Other connection runtimes (`runtime.start`, `runtime.supervised`,
+  `client.in_process`, `testing.connect`) keep the server on their own heap.
+  Each call copies the one tool it runs into its worker, never the rest of
+  the catalog.
+- Per HTTP request Relay copies the request body, the endpoint's request
+  settings and the context your `new_with_context` or `new_protected` builder
+  returns. Per tool call it copies the call's arguments and that context into
+  a fresh worker. Keep catalogues, clients and codecs out of the context.
+- `register_tool` on an endpoint or stdio server holds a new snapshot and
+  frees the old one, which makes every process on the node check its heap.
+  Register tools rarely, never per request.
+- `client.call` encodes and decodes in the calling process; Relay sends no
+  `Definition` or codec to another process.
+
+`test/relay/copy_cost_test.gleam` bounds what one request and one call copy.
 
 ## Limits to plan for
 

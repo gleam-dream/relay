@@ -39,6 +39,15 @@
 //// cancellation signal, the invocation id, the JSON-RPC request id and the
 //// correlation.
 ////
+//// ## Codecs and process copies
+////
+//// An HTTP endpoint and a stdio server hold the server, with every tool's
+//// codecs and handler closures, once in shared storage, so a call copies no
+//// codec. Under `runtime.start` or `client.in_process` a call copies the one
+//// tool it runs. Every call copies its arguments and application context.
+//// Write codecs by the
+//// [JSON Blueprint codec practice](https://github.com/lostbean/json_blueprint/blob/main/docs/CODEC-PRACTICE.md).
+////
 //// ## Ids and retries
 ////
 //// MCP `2026-07-28` has no session and no idempotency key, so nothing in
