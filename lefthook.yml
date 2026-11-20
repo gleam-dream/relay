@@ -13,4 +13,6 @@ pre-commit:
       run: nix fmt -- {staged_files}
       stage_fixed: true
     design:
-      run: nix run .#design-gate-check -- docs/design
+      # Pass the root: git sets GIT_DIR in hooks, which misleads root
+      # discovery from a linked worktree.
+      run: nix run .#design-gate-check -- docs/design .
