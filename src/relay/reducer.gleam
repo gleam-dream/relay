@@ -260,6 +260,16 @@ pub fn server(state: State(context)) -> Server(context) {
   state.server
 }
 
+/// Replaces the server description with an equal one, such as the same
+/// catalog read back from shared storage.
+@internal
+pub fn replace_server(
+  state: State(context),
+  server: Server(context),
+) -> State(context) {
+  State(..state, server: server)
+}
+
 /// The number of open `subscriptions/listen` streams.
 pub fn open_streams(state: State(context)) -> Int {
   subs.count(state.subscriptions)

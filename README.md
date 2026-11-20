@@ -32,6 +32,9 @@ Add Relay and JSON Blueprint from Hex; add Sinal or HTTP Gun directly when your 
 gleam add relay json_blueprint@2
 ```
 
+Relay requires JSON Blueprint 2.1.1 or later: earlier combinator codecs grew
+many times larger each time they were copied to another process.
+
 Use Gleam `>= 1.18.0` with the Erlang target. Commit `gleam.toml` and
 `manifest.toml` so builds use the same resolved versions.
 
@@ -131,6 +134,38 @@ pub fn mount(service: server.Server(Tenant)) -> http.Handler(Tenant) {
 Requests that carry an `Origin` header must match an entry in `http.with_allowed_origins` by scheme, host and port. An entry without a port stands for the scheme's default, so a browser page served from `http://localhost:3000` needs `"http://localhost:3000"` listed explicitly. The default admits `http://localhost`, `http://127.0.0.1` and `http://[::1]` on port 80, plus, for a listener from `http.start` or `http.supervised`, its own origin on the bound port (the loopback names for a loopback or wildcard bind, and the bind host itself for a specific bind); a mounted handler knows no port, so list the host application's origins. A request carrying more than one `Origin` header is refused when the transport preserves repeated headers; mist 6.0.3 keeps only the last repeated header, so a listener started by Relay checks that last value (browsers never send more than one `Origin`). `Host` values are compared without their port.
 
 For bearer-protected endpoints, see the [protection recipe](examples/relay_usage/src/relay_usage/protect.gleam). Relay checks the verifier's attested resource and scopes and formats challenges and metadata; the verifier owns token authenticity, issuer, and expiry checks.
+
+## Tool codecs and process copies
+
+A tool's input and output codecs are closures, and the BEAM copies a closure's
+whole environment whenever it reaches another process. Write codecs as the
+[JSON Blueprint codec practice](https://github.com/lostbean/json_blueprint/blob/main/docs/CODEC-PRACTICE.md)
+describes: build each child codec inside its field (`of:` or a top-level
+function) rather than `let`-binding it above the fields that use it, use
+generated codecs for fixed shapes, and keep combinators for run-time enums,
+unions and custom codecs. Relay's part:
+
+- `http.handler`, `http.start`, `http.supervised`, `stdio.serve` and
+  `runtime.start` hold the server, with every tool's codecs and handler
+  closures, once in `persistent_term`. Requests, request runtimes and
+  invocation workers read it there without copying it, so the catalog's size
+  never multiplies per request or per call.
+- Per HTTP request Relay copies the request body, the endpoint's small
+  request settings and the context your `new_with_context` or
+  `new_protected` builder returns. Per tool call it copies the call's
+  arguments and that context into a fresh worker. Keep large values out of
+  the context: refer to catalogues, clients and codecs from module
+  functions, actors or your own held storage instead.
+- `http.register_tool` and `runtime.register_tool` hold a new snapshot,
+  which makes the node scan its processes. Use them for rare catalogue
+  changes, not per request.
+- `client.call` encodes and decodes in the calling process; a `Definition`
+  never crosses a process boundary inside Relay. Do not send definitions or
+  codecs to other processes per operation yourself.
+
+To guard a service, measure `erts_debug:flat_size(Term) * erlang:system_info(wordsize)`
+of the terms that actually cross: your context, a worker's closure, a
+message. Relay's own bounds live in `test/relay/copy_cost_test.gleam`.
 
 ## Limits to plan for
 

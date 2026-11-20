@@ -39,6 +39,18 @@
 //// cancellation signal, the invocation id, the JSON-RPC request id and the
 //// correlation.
 ////
+//// ## Codecs and process copies
+////
+//// Relay holds the server, with every tool's codecs and handler closures,
+//// once in shared storage; requests and invocation workers read it there,
+//// so a tool's codecs are not copied per request or per call. The call's
+//// arguments and application context are copied into each worker. Write
+//// codecs as the
+//// [JSON Blueprint codec practice](https://github.com/lostbean/json_blueprint/blob/main/docs/CODEC-PRACTICE.md)
+//// describes (JSON Blueprint 2.1.1 or later): build each child codec inside
+//// its field rather than `let`-binding it above the fields that use it,
+//// and prefer generated codecs for fixed shapes.
+////
 //// ## Ids and retries
 ////
 //// MCP `2026-07-28` has no session and no idempotency key, so nothing in
