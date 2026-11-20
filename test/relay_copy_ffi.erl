@@ -28,6 +28,11 @@ crossings(Run) ->
     trace:process(Session, all, true, [send, procs]),
     Result = try Run() after
         trace:process(Session, all, false, [send, procs]),
+        %% Trace messages arrive asynchronously: wait until every one
+        %% generated while tracing reached the tracer, so none is lost
+        %% after `done`.
+        Delivered = trace:delivered(Session, all),
+        receive {trace_delivered, all, Delivered} -> ok end,
         trace:session_destroy(Session)
     end,
     Ref = make_ref(),

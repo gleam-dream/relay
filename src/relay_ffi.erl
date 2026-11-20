@@ -530,8 +530,11 @@ signal_cancelled(Pid, InvocationId) ->
 %% value, so holders erase only on rare changes and at shutdown.
 hold(Value) ->
     Key = {relay_held, make_ref()},
-    persistent_term:put(Key, Value),
     Owner = self(),
+    %% The keeper exists before the value is published, so a holder that
+    %% dies at any point after the put still gets its value erased: a monitor
+    %% on a holder that already died reports DOWN at once. The keeper's
+    %% closure captures the key, never the value.
     Keeper = spawn(fun() ->
         Monitor = erlang:monitor(process, Owner),
         receive
@@ -540,6 +543,7 @@ hold(Value) ->
         end,
         persistent_term:erase(Key)
     end),
+    persistent_term:put(Key, Value),
     {Key, Keeper}.
 
 held_get({Key, _Keeper}) -> persistent_term:get(Key).

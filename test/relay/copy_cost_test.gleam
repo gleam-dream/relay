@@ -463,14 +463,18 @@ fn sample_order() -> Order {
 /// at most one stored catalog beyond the current one; stopping the endpoint
 /// returns the node's shared storage to where it was.
 pub fn endpoint_registry_churn_keeps_storage_bounded_test() {
-  let base = shared_bytes()
+  let base = settled_shared_bytes()
   let assert Ok(handler) = http.handler(http.new(probe_server()))
   let one = shared_bytes() - base
   assert one > 0
   churn(20, fn(index) {
     let name = "extra_" <> int.to_string(index)
     let assert Ok(Nil) = http.register_tool(handler, order_tool(name))
-    assert http.handle(handler, call(name)).status == 200
+    // The registered tool answers: a stale catalog would refuse the call
+    // with invalid params, still under HTTP 200.
+    let response = http.handle(handler, call(name))
+    assert response.status == 200
+    assert receipt_id(testing.body_text(response)) == Ok("o-1")
     assert http.unregister_tool(handler, name)
   })
   let listing =
@@ -485,18 +489,65 @@ pub fn endpoint_registry_churn_keeps_storage_bounded_test() {
 /// A holding runtime (stdio's) keeps storage bounded through registry churn
 /// and frees it when it stops.
 pub fn runtime_registry_churn_keeps_storage_bounded_test() {
-  let base = shared_bytes()
+  let base = settled_shared_bytes()
+  let outputs = process.new_subject()
   let assert Ok(rt) =
-    runtime.start_holding(probe_server(), runtime.config(), fn(_) { Ok(Nil) })
+    runtime.start_holding(probe_server(), runtime.config(), fn(output) {
+      process.send(outputs, output)
+      Ok(Nil)
+    })
   let one = shared_bytes() - base
   churn(20, fn(index) {
     let name = "extra_" <> int.to_string(index)
     runtime.register_tool(rt, order_tool(name))
     runtime.unregister_tool(rt, name)
   })
+  runtime.register_tool(rt, order_tool("extra_last"))
+  // Registry changes are casts; a listing answered after them proves the
+  // runtime applied every change before storage is measured.
+  let listing = runtime_listing(rt, outputs)
+  assert string.contains(listing, "\"extra_last\"")
+  assert !string.contains(listing, "\"extra_1\"")
   assert settles(fn() { shared_bytes() - base <= 2 * one }, 50)
   runtime.stop(rt)
   assert settles(fn() { shared_bytes() - base < one / 2 }, 50)
+}
+
+fn receipt_id(body: String) -> Result(String, json.DecodeError) {
+  json.parse(body, {
+    use id <- decode.subfield(
+      ["result", "structuredContent", "id"],
+      decode.string,
+    )
+    decode.success(id)
+  })
+}
+
+fn runtime_listing(
+  rt: runtime.Runtime(Nil),
+  outputs: process.Subject(runtime.Output),
+) -> String {
+  let assert Ok(Nil) =
+    runtime.send_frame(
+      rt,
+      reducer.new_exchange_id(),
+      Nil,
+      envelope("tools/list", []),
+      None,
+    )
+  let assert Ok(runtime.OutputWrite(_, bytes)) = process.receive(outputs, 2000)
+  bit_array_text(bytes)
+}
+
+// Shared storage is node-wide: wait until snapshots freed by earlier tests
+// have gone, so a baseline counts only what this test holds.
+fn settled_shared_bytes() -> Int {
+  let before = shared_bytes()
+  process.sleep(20)
+  case shared_bytes() == before {
+    True -> before
+    False -> settled_shared_bytes()
+  }
 }
 
 fn churn(times: Int, step: fn(Int) -> Nil) -> Nil {
