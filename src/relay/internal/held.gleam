@@ -1,8 +1,10 @@
 //// A value held once in node-wide shared storage. Processes that read it
 //// refer to the one stored copy: passing the handle, or the value read from
 //// it, to another process copies neither. The holder's exit or `release`
-//// frees it. Storing or freeing a value scans every process on the node, so
-//// a holder replaces its value only on rare changes.
+//// frees it. Storing copies the value once, at a cost that also grows with
+//// the number of stored terms; freeing makes every process on the node check
+//// its heap for the value, so holders free values only on rare changes and
+//// at shutdown. Shared reads hold on OTP 29, where the copy-cost tests run.
 
 /// The handle to a held value. It is small and cheap to copy.
 pub type Held(value)

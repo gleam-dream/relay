@@ -309,11 +309,13 @@ type Cancelling {
   Cancelling(monitor: process.Monitor, kill: process.Timer)
 }
 
-// Where a runtime's server description comes from: its own, held for the
-// runtime's lifetime, or a holder's that outlives the runtime (an HTTP
-// endpoint's current snapshot). Either way handlers and workers share one
-// stored copy instead of copying the catalog.
+// Where a runtime's server description comes from: kept on the runtime's
+// heap, so each invocation worker copies its one tool; held in shared
+// storage for the runtime's lifetime (stdio), so workers copy no tool but
+// stopping frees it with a node-wide check; or a holder's that outlives the
+// runtime (an HTTP endpoint's current snapshot). See ADR 0017.
 type Source(context) {
+  Keep(server: Server(context))
   Own(server: Server(context))
   Borrow(load: fn() -> Server(context))
 }
@@ -324,7 +326,7 @@ type State(context) {
     scope: Option(request_owner.Scope),
     reducer: reducer.State(context),
     // The runtime's own held server, replaced on registry changes; `None`
-    // for a borrowed one.
+    // for a kept or borrowed one.
     held: Option(Held(Server(context))),
     sink: fn(Output) -> Result(Nil, Nil),
     workers: Dict(Int, Worker),
@@ -352,8 +354,26 @@ fn monotonic_ms() -> Int
 @external(erlang, "relay_ffi", "rescue_run")
 fn rescue_run(fun: fn() -> a) -> Result(a, String)
 
-/// Starts a runtime linked to the caller.
+/// Starts a runtime linked to the caller. The runtime keeps `server` on its
+/// own heap; each invocation worker receives its invocation, which copies
+/// the one tool it runs, never the runtime state or the rest of the catalog.
 pub fn start(
+  server: Server(context),
+  config: Config,
+  sink: fn(Output) -> Result(Nil, Nil),
+) -> Result(Runtime(context), StartError) {
+  use config <- result.try(validate(config))
+  builder(Keep(server), config, sink, None, None)
+  |> actor.start
+  |> result.map(fn(started) { Runtime(started.data) })
+  |> result.map_error(ActorStartFailed)
+}
+
+/// Internal seam for long-lived runtimes such as stdio's: holds `server` in
+/// shared storage for the runtime's lifetime, so workers copy no tool, at
+/// the price of a node-wide check when the runtime stops.
+@internal
+pub fn start_holding(
   server: Server(context),
   config: Config,
   sink: fn(Output) -> Result(Nil, Nil),
@@ -400,7 +420,7 @@ pub fn supervised(
     case validate(config) {
       Error(error) -> Error(actor.InitFailed(describe_start_error(error)))
       Ok(config) ->
-        builder(Own(server), config, sink, Some(name), None)
+        builder(Keep(server), config, sink, Some(name), None)
         |> actor.start
         |> result.map(fn(started) {
           actor.Started(started.pid, Runtime(started.data))
@@ -432,6 +452,7 @@ fn builder(
         |> process.select_monitors(WorkerDown)
         |> process.select_trapped_exits(OwnerExited)
       let #(server, own) = case source {
+        Keep(server) -> #(server, None)
         Own(server) -> {
           let own = held.hold(server)
           #(held.get(own), Some(own))

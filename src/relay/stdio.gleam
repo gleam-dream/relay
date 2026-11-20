@@ -144,7 +144,8 @@ pub fn serve_with(
         }
     }
   }
-  case runtime.start(server, runtime_config, sink) {
+  // One runtime per OS process: hold the server so calls copy no tool.
+  case runtime.start_holding(server, runtime_config, sink) {
     Error(_) -> {
       stdio_frames.stop_writer(writer)
       close_stdin()

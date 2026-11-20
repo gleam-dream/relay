@@ -41,15 +41,12 @@
 ////
 //// ## Codecs and process copies
 ////
-//// Relay holds the server, with every tool's codecs and handler closures,
-//// once in shared storage; requests and invocation workers read it there,
-//// so a tool's codecs are not copied per request or per call. The call's
-//// arguments and application context are copied into each worker. Write
-//// codecs as the
-//// [JSON Blueprint codec practice](https://github.com/lostbean/json_blueprint/blob/main/docs/CODEC-PRACTICE.md)
-//// describes (JSON Blueprint 2.1.1 or later): build each child codec inside
-//// its field rather than `let`-binding it above the fields that use it,
-//// and prefer generated codecs for fixed shapes.
+//// An HTTP endpoint and a stdio server hold the server, with every tool's
+//// codecs and handler closures, once in shared storage, so a call copies no
+//// codec. Under `runtime.start` or `client.in_process` a call copies the one
+//// tool it runs. Every call copies its arguments and application context.
+//// Write codecs by the
+//// [JSON Blueprint codec practice](https://github.com/lostbean/json_blueprint/blob/main/docs/CODEC-PRACTICE.md).
 ////
 //// ## Ids and retries
 ////

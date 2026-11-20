@@ -2,7 +2,7 @@
 %% process, and every term that crosses a process boundary while a function
 %% runs (messages sent and closures handed to new processes).
 -module(relay_copy_ffi).
--export([flat_bytes/1, crossings/1, heap_bytes/0, held_count/1]).
+-export([flat_bytes/1, crossings/1, heap_bytes/0, shared_bytes/0]).
 
 flat_bytes(Term) ->
     erts_debug:flat_size(Term) * erlang:system_info(wordsize).
@@ -14,11 +14,9 @@ heap_bytes() ->
     {total_heap_size, Words} = process_info(self(), total_heap_size),
     Words * erlang:system_info(wordsize).
 
-%% How many values Relay holds in persistent_term that mention `Marker`,
-%% such as a tool name unique to one test.
-held_count(Marker) ->
-    length([K || {{relay_held, _} = K, V} <- persistent_term:get(),
-                 binary:match(term_to_binary(V), Marker) =/= nomatch]).
+%% Bytes the node keeps in persistent_term, Relay's shared storage.
+shared_bytes() ->
+    maps:get(memory, persistent_term:info()).
 
 %% Runs Run() with send and spawn tracing on every process, then returns
 %% #(Result, [#(Kind, Label, Bytes)]) for each message sent and each process

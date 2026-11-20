@@ -296,7 +296,8 @@ pub fn stdio(executable: String, arguments: List(String)) -> Config {
 
 /// A server in this VM, served through its own `relay/runtime` with this
 /// context: no socket and no child process, the same wire messages. Useful
-/// for tests (`relay/testing.connect`) and for composing servers.
+/// for tests (`relay/testing.connect`) and for composing servers. Each
+/// call copies the tool it runs into its worker, never the whole server.
 pub fn in_process(server: Server(context), context: context) -> Config {
   defaults(
     InProcessTarget(fn(max_frame_bytes) {

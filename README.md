@@ -32,8 +32,8 @@ Add Relay and JSON Blueprint from Hex; add Sinal or HTTP Gun directly when your 
 gleam add relay json_blueprint@2
 ```
 
-Relay requires JSON Blueprint 2.1.1 or later: earlier combinator codecs grew
-many times larger each time they were copied to another process.
+Relay requires JSON Blueprint 2.1.1 or later: copying an earlier combinator
+codec to another process cost many times its size in the heap.
 
 Use Gleam `>= 1.18.0` with the Erlang target. Commit `gleam.toml` and
 `manifest.toml` so builds use the same resolved versions.
@@ -137,35 +137,29 @@ For bearer-protected endpoints, see the [protection recipe](examples/relay_usage
 
 ## Tool codecs and process copies
 
-A tool's input and output codecs are closures, and the BEAM copies a closure's
-whole environment whenever it reaches another process. Write codecs as the
-[JSON Blueprint codec practice](https://github.com/lostbean/json_blueprint/blob/main/docs/CODEC-PRACTICE.md)
-describes: build each child codec inside its field (`of:` or a top-level
-function) rather than `let`-binding it above the fields that use it, use
-generated codecs for fixed shapes, and keep combinators for run-time enums,
-unions and custom codecs. Relay's part:
+Write tool input and output codecs by the
+[JSON Blueprint codec practice](https://github.com/lostbean/json_blueprint/blob/main/docs/CODEC-PRACTICE.md).
+This section states only what Relay copies between processes.
 
-- `http.handler`, `http.start`, `http.supervised`, `stdio.serve` and
-  `runtime.start` hold the server, with every tool's codecs and handler
-  closures, once in `persistent_term`. Requests, request runtimes and
-  invocation workers read it there without copying it, so the catalog's size
-  never multiplies per request or per call.
-- Per HTTP request Relay copies the request body, the endpoint's small
-  request settings and the context your `new_with_context` or
-  `new_protected` builder returns. Per tool call it copies the call's
-  arguments and that context into a fresh worker. Keep large values out of
-  the context: refer to catalogues, clients and codecs from module
-  functions, actors or your own held storage instead.
-- `http.register_tool` and `runtime.register_tool` hold a new snapshot,
-  which makes the node scan its processes. Use them for rare catalogue
-  changes, not per request.
-- `client.call` encodes and decodes in the calling process; a `Definition`
-  never crosses a process boundary inside Relay. Do not send definitions or
-  codecs to other processes per operation yourself.
+- An HTTP endpoint (`http.handler`, `http.start`, `http.supervised`) and a
+  stdio server (`stdio.serve`) hold the server, with every tool's codecs and
+  handler closures, once in `persistent_term`. Requests, request runtimes and
+  invocation workers read it there without copying it.
+- Other connection runtimes (`runtime.start`, `runtime.supervised`,
+  `client.in_process`, `testing.connect`) keep the server on their own heap.
+  Each call copies the one tool it runs into its worker, never the rest of
+  the catalog.
+- Per HTTP request Relay copies the request body, the endpoint's request
+  settings and the context your `new_with_context` or `new_protected` builder
+  returns. Per tool call it copies the call's arguments and that context into
+  a fresh worker. Keep catalogues, clients and codecs out of the context.
+- `register_tool` on an endpoint or stdio server holds a new snapshot and
+  frees the old one, which makes every process on the node check its heap.
+  Register tools rarely, never per request.
+- `client.call` encodes and decodes in the calling process; Relay sends no
+  `Definition` or codec to another process.
 
-To guard a service, measure `erts_debug:flat_size(Term) * erlang:system_info(wordsize)`
-of the terms that actually cross: your context, a worker's closure, a
-message. Relay's own bounds live in `test/relay/copy_cost_test.gleam`.
+`test/relay/copy_cost_test.gleam` bounds what one request and one call copy.
 
 ## Limits to plan for
 

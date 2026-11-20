@@ -525,8 +525,9 @@ signal_cancelled(Pid, InvocationId) ->
 %% A value held once in node-wide shared storage (persistent_term), so
 %% processes that read it share it instead of copying it: a held term is not
 %% copied by spawn or send. A keeper erases it on `release/1` or when the
-%% holding process exits. Each put or erase scans the node, so a holder
-%% changes its value only on rare operations such as registry changes.
+%% holding process exits. A put of a new key copies the value and the term
+%% table; an erase makes every process on the node check its heap for the
+%% value, so holders erase only on rare changes and at shutdown.
 hold(Value) ->
     Key = {relay_held, make_ref()},
     persistent_term:put(Key, Value),

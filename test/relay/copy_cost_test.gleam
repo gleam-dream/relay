@@ -1,15 +1,18 @@
 //// What crosses process boundaries per HTTP request and per tool call, for
 //// a server whose tools carry nested combinator codecs.
 
+import gleam/bit_array
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None}
+import gleam/string
 import json/blueprint/codec.{type Codec}
 import relay/client
 import relay/http
+import relay/reducer
 import relay/runtime
 import relay/server
 import relay/testing
@@ -138,8 +141,36 @@ const tool_count = 12
 @external(erlang, "relay_copy_ffi", "heap_bytes")
 fn heap_bytes() -> Int
 
-@external(erlang, "relay_copy_ffi", "held_count")
-fn held_count(marker: String) -> Int
+@external(erlang, "relay_copy_ffi", "shared_bytes")
+fn shared_bytes() -> Int
+
+@external(erlang, "relay_http_ffi", "request")
+fn local_request(
+  port: Int,
+  method: String,
+  headers: List(#(String, String)),
+  body: BitArray,
+) -> Result(#(Int, List(#(String, String)), BitArray), String)
+
+@external(erlang, "relay_http_ffi", "send_and_hold")
+fn send_and_hold(
+  port: Int,
+  method: String,
+  headers: List(#(String, String)),
+  body: BitArray,
+) -> Result(HeldConnection, String)
+
+@external(erlang, "relay_http_ffi", "read_until")
+fn read_until(
+  connection: HeldConnection,
+  needle: BitArray,
+  timeout_ms: Int,
+) -> Result(BitArray, String)
+
+@external(erlang, "relay_http_ffi", "abort_connection")
+fn abort_connection(connection: HeldConnection) -> BitArray
+
+type HeldConnection
 
 type Probe {
   Probe(heap: Int)
@@ -234,6 +265,40 @@ fn largest(seen: List(#(String, String, Int))) -> #(String, Int) {
   })
 }
 
+// A tool that answers after its response is due, so a streaming client
+// receives it as server-sent events.
+fn slow_tool() -> tool.Tool(Nil) {
+  tool.define("slow", order_codec(), receipt_codec())
+  |> tool.handle(fn(order: Order) {
+    process.sleep(150)
+    Ok(Receipt(order.id, Money(0, Brl), order.lines))
+  })
+}
+
+fn envelope(method: String, params: List(#(String, json.Json))) -> BitArray {
+  let metadata =
+    json.object([
+      #("io.modelcontextprotocol/protocolVersion", json.string("2026-07-28")),
+      #("io.modelcontextprotocol/clientCapabilities", json.object([])),
+    ])
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("id", json.int(7)),
+    #("method", json.string(method)),
+    #("params", json.object([#("_meta", metadata), ..params])),
+  ])
+  |> json.to_string
+  |> bit_array.from_string
+}
+
+fn stream_headers(method: String) -> List(#(String, String)) {
+  [
+    #("Accept", "application/json, text/event-stream"),
+    #("MCP-Protocol-Version", "2026-07-28"),
+    #("Mcp-Method", method),
+  ]
+}
+
 // One registered tool's own size: a worker may refer to the tool it runs.
 fn one_tool_bytes() -> Int {
   flat_bytes(order_tool("order_0"))
@@ -264,6 +329,68 @@ pub fn http_request_crossings_exclude_the_catalog_test() {
   http.stop(handler)
 }
 
+/// The streaming paths bound the same way: a tools/call answered as
+/// server-sent events, and a `subscriptions/listen` stream up to its
+/// acknowledgement, over a real listener.
+pub fn http_stream_crossings_exclude_the_catalog_test() {
+  let srv = probe_server()
+  let assert Ok(srv) = server.register_tool(srv, slow_tool())
+  let bound = one_tool_bytes() + slack
+  let assert Ok(listener) = http.start(http.new(srv))
+  let port = http.port(listener)
+
+  let #(reply, seen) =
+    crossings(fn() {
+      local_request(
+        port,
+        "POST",
+        [#("Mcp-Name", "slow"), ..stream_headers("tools/call")],
+        envelope("tools/call", [
+          #("name", json.string("slow")),
+          #("arguments", order_arguments()),
+        ]),
+      )
+    })
+  let assert Ok(#(200, headers, body)) = reply
+  assert list.key_find(headers, "content-type") == Ok("text/event-stream")
+  assert string.contains(bit_array_text(body), "\"result\"")
+  let #(label, bytes) = largest(seen)
+  assert #(label, bytes <= bound) == #(label, True)
+
+  let #(acknowledged, seen) =
+    crossings(fn() {
+      let assert Ok(connection) =
+        send_and_hold(
+          port,
+          "POST",
+          stream_headers("subscriptions/listen"),
+          envelope("subscriptions/listen", [
+            #(
+              "notifications",
+              json.object([#("toolsListChanged", json.bool(True))]),
+            ),
+          ]),
+        )
+      let acknowledged =
+        read_until(
+          connection,
+          <<"notifications/subscriptions/acknowledged">>,
+          2000,
+        )
+      let _ = abort_connection(connection)
+      acknowledged
+    })
+  let assert Ok(_) = acknowledged
+  let #(label, bytes) = largest(seen)
+  assert #(label, bytes <= bound) == #(label, True)
+  http.stop(listener)
+}
+
+fn bit_array_text(bytes: BitArray) -> String {
+  let assert Ok(text) = bit_array.to_string(bytes)
+  text
+}
+
 /// An HTTP invocation worker holds only its own call's data, not a copy of
 /// the catalog or of the tool it runs.
 pub fn http_invocation_worker_holds_no_copied_catalog_test() {
@@ -275,70 +402,122 @@ pub fn http_invocation_worker_holds_no_copied_catalog_test() {
   http.stop(handler)
 }
 
-/// A connection runtime (stdio, in-process client) starts each invocation
-/// worker with its invocation alone: no runtime state, no catalog copy.
-pub fn runtime_invocation_crossings_exclude_the_catalog_test() {
+/// An in-process connection's runtime keeps its server on its heap: each
+/// invocation worker copies its invocation and the one tool it runs, never
+/// the runtime state or the rest of the catalog.
+pub fn in_process_invocation_copies_one_tool_test() {
   let peer = testing.connect(probe_server(), Nil)
   let bound = one_tool_bytes() + slack
-  let order =
-    Order(
-      "o-1",
-      "Ada",
-      Address("Rua A, 1", "Recife", "BR"),
-      [Line("sku-1", 2, Money(150, Brl))],
-      None,
-    )
   let #(result, seen) =
-    crossings(fn() { client.call(peer, probe_definition(), order) })
+    crossings(fn() { client.call(peer, probe_definition(), sample_order()) })
   let assert Ok(client.Succeeded(Probe(heap), _)) = result
-  assert heap <= slack
+  assert heap <= bound
   let #(label, bytes) = largest(seen)
   assert #(label, bytes <= bound) == #(label, True)
+  client.close(peer)
 }
 
-/// Registry changes hold one new snapshot and release the old ones; stopping
-/// the endpoint releases the last.
-pub fn registry_changes_release_old_snapshots_test() {
-  let marker = "snapshot_marker_tool"
-  let assert Ok(handler) =
-    http.handler(http.new(server.new([order_tool(marker)])))
-  assert held_count(marker) == 1
-  let assert Ok(Nil) = http.register_tool(handler, order_tool("extra_1"))
-  let assert Ok(Nil) = http.register_tool(handler, order_tool("extra_2"))
-  assert http.unregister_tool(handler, "extra_1")
-  assert released(marker, 1, 50)
-  let response = http.handle(handler, call("extra_2"))
-  assert response.status == 200
+/// A holding runtime (stdio's) starts each invocation worker with its
+/// invocation alone, and the worker copies no tool.
+pub fn holding_runtime_invocation_copies_no_tool_test() {
+  let self = process.new_subject()
+  let assert Ok(rt) =
+    runtime.start_holding(probe_server(), runtime.config(), fn(output) {
+      process.send(self, output)
+      Ok(Nil)
+    })
+  let bound = one_tool_bytes() + slack
+  let #(response, seen) =
+    crossings(fn() {
+      let assert Ok(Nil) =
+        runtime.send_frame(
+          rt,
+          reducer.new_exchange_id(),
+          Nil,
+          envelope("tools/call", [
+            #("name", json.string("probe")),
+            #("arguments", order_arguments()),
+          ]),
+          None,
+        )
+      let assert Ok(runtime.OutputWrite(_, bytes)) = process.receive(self, 2000)
+      bytes
+    })
+  assert worker_heap(bit_array_text(response)) <= slack
+  let #(label, bytes) = largest(seen)
+  assert #(label, bytes <= bound) == #(label, True)
+  runtime.stop(rt)
+}
+
+fn sample_order() -> Order {
+  Order(
+    "o-1",
+    "Ada",
+    Address("Rua A, 1", "Recife", "BR"),
+    [Line("sku-1", 2, Money(150, Brl))],
+    None,
+  )
+}
+
+/// Registry churn on a live endpoint serves the current catalog and keeps
+/// at most one stored catalog beyond the current one; stopping the endpoint
+/// returns the node's shared storage to where it was.
+pub fn endpoint_registry_churn_keeps_storage_bounded_test() {
+  let base = shared_bytes()
+  let assert Ok(handler) = http.handler(http.new(probe_server()))
+  let one = shared_bytes() - base
+  assert one > 0
+  churn(20, fn(index) {
+    let name = "extra_" <> int.to_string(index)
+    let assert Ok(Nil) = http.register_tool(handler, order_tool(name))
+    assert http.handle(handler, call(name)).status == 200
+    assert http.unregister_tool(handler, name)
+  })
+  let listing =
+    testing.body_text(http.handle(handler, testing.request("tools/list", [])))
+  assert string.contains(listing, "\"order_0\"")
+  assert !string.contains(listing, "extra_")
+  assert settles(fn() { shared_bytes() - base <= 2 * one }, 50)
   http.stop(handler)
-  assert released(marker, 0, 50)
+  assert settles(fn() { shared_bytes() - base < one / 2 }, 50)
 }
 
-fn released(marker: String, count: Int, attempts: Int) -> Bool {
-  case held_count(marker) == count, attempts {
-    True, _ -> True
-    False, 0 -> False
-    False, _ -> {
-      process.sleep(10)
-      released(marker, count, attempts - 1)
+/// A holding runtime (stdio's) keeps storage bounded through registry churn
+/// and frees it when it stops.
+pub fn runtime_registry_churn_keeps_storage_bounded_test() {
+  let base = shared_bytes()
+  let assert Ok(rt) =
+    runtime.start_holding(probe_server(), runtime.config(), fn(_) { Ok(Nil) })
+  let one = shared_bytes() - base
+  churn(20, fn(index) {
+    let name = "extra_" <> int.to_string(index)
+    runtime.register_tool(rt, order_tool(name))
+    runtime.unregister_tool(rt, name)
+  })
+  assert settles(fn() { shared_bytes() - base <= 2 * one }, 50)
+  runtime.stop(rt)
+  assert settles(fn() { shared_bytes() - base < one / 2 }, 50)
+}
+
+fn churn(times: Int, step: fn(Int) -> Nil) -> Nil {
+  case times {
+    0 -> Nil
+    _ -> {
+      step(times)
+      churn(times - 1, step)
     }
   }
 }
 
-/// A connection runtime holds its own catalog for its lifetime, holds it
-/// again after a registry change, and frees it when it stops.
-pub fn runtime_registry_changes_release_old_snapshots_test() {
-  let marker = "runtime_marker_tool"
-  let assert Ok(rt) =
-    runtime.start(server.new([order_tool(marker)]), runtime.config(), fn(_) {
-      Ok(Nil)
-    })
-  assert released(marker, 1, 50)
-  runtime.register_tool(rt, order_tool("extra_1"))
-  runtime.unregister_tool(rt, "extra_1")
-  runtime.register_tool(rt, order_tool(marker))
-  assert released(marker, 1, 50)
-  runtime.stop(rt)
-  assert released(marker, 0, 50)
+fn settles(holds: fn() -> Bool, attempts: Int) -> Bool {
+  case holds(), attempts {
+    True, _ -> True
+    False, 0 -> False
+    False, _ -> {
+      process.sleep(10)
+      settles(holds, attempts - 1)
+    }
+  }
 }
 
 /// The handler mist copies into every connection holds only the endpoint's
