@@ -32,7 +32,7 @@ Add Relay and JSON Blueprint from Hex; add Sinal or HTTP Gun directly when your 
 gleam add relay json_blueprint@2
 ```
 
-Relay requires JSON Blueprint 2.1.1 or later: copying an earlier combinator
+Relay requires JSON Blueprint 2.2.0 or later: copying an earlier combinator
 codec to another process cost many times its size in the heap.
 
 Use Gleam `>= 1.18.0` with the Erlang target. Commit `gleam.toml` and
