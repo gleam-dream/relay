@@ -1,0 +1,486 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# Review policy for relay, derived by the coderabbit-config skill.
+# Each instruction names the skill it comes from; `policy` is the review policy
+# of coderabbit-config itself, and `repository` marks a rule beyond the catalog.
+#
+# Catalogs read:
+#   practice catalog (not public)  879841a61c3f83cd809edca9229c4a6bb7f909f8
+#   gleam-agent-tools  6a9ea2f647e787a32d3c7fa88d9c58c5b81ae9d7
+#
+# Governing skills: coderabbit-config (policy), gleam, gleam-lib, gleam-ffi,
+# relay, http-gun, wisp (its Mist rules), gleam-otp, sinal, json-blueprint
+# (no rule taken, see below), testing, python, design, tracker, gate, git.
+#
+# Governing dependency versions: relay 0.2.2 (this package, gleam.toml).
+# Locked in manifest.toml: json_blueprint 2.1.1, http_gun 0.2.0, mist 6.0.3,
+# glisten 9.0.1, gleam_http 4.4.0, gleam_otp 1.3.0, gleam_erlang 1.3.0,
+# sinal 0.1.0, telemetry 1.4.2, gleam_json 3.1.0, gleam_stdlib 1.0.5,
+# gleeunit 1.11.0.
+#
+# json_blueprint 2.1.1 is below the json-blueprint skill's install line
+# (>= 2.2.0) and below the pairing the relay skill names, so no json-blueprint
+# rule and no codec copy-size rule is taken; re-derive once the lock reaches
+# 2.2.0. The http-gun skill's install line names 0.1.0; the rules taken here
+# were checked against the http_gun 0.2.0 public API, which still has every
+# function they cite.
+language: en-US
+tone_instructions: >-
+  Literal and concise. Report only defects you can evidence from the diff, its
+  callers, the design, or a cited rule. One finding per cause. An empty review
+  is valid.
+early_access: false
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  high_level_summary_instructions: |
+    Lead with the problem the change solves, then the response in one short
+    paragraph, then the public API or MCP wire effect, if any. Do not narrate
+    the diff file by file.
+  review_status: true
+  commit_status: true
+  fail_commit_status: true
+  collapse_walkthrough: true
+  changed_files_summary: false
+  sequence_diagrams: false
+  estimate_code_review_effort: false
+  assess_linked_issues: true
+  related_issues: true
+  related_prs: false
+  suggested_labels: false
+  suggested_reviewers: false
+  auto_assign_reviewers: false
+  poem: false
+  in_progress_fortune: false
+  enable_prompt_for_ai_agents: true
+
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: true
+    base_branches:
+      - main
+
+  # Rendered, locked and frozen fixture material. The TLS fixtures are
+  # throwaway test certificates and keys, not secrets.
+  path_filters:
+    - "!flake.lock"
+    - "!scripts/conformance/pnpm-lock.yaml"
+    - "!docs/design/design-layer.pdf"
+    - "!test/fixtures/tls/**"
+
+  path_instructions:
+    - path: "{src,dev,examples}/**"
+      instructions: |
+        Review policy (policy).
+        - Design first. docs/COVERAGE.md maps each part to its owning section
+          of docs/design/design.typ (one MCP context) and to docs/adr. Flag
+          code that contradicts that section's interface, invariants or side
+          effects, and a change to designed behavior with no change to its
+          design. A fix that restores designed behavior needs none. When code
+          and design disagree, the design changes first.
+        - Core abstractions. Flag a second representation of a concept the
+          design names (Definition, Bound tool, Server description, Exchange,
+          Invocation, Reducer, Runtime, Endpoint, Request owner, Protection,
+          Verifier, Submission evidence, Continuation, Subscription), a name
+          that differs from docs/design/CONTEXT.typ, and a public module that
+          reaches into `relay/internal` past the interface that owns it.
+        - Lean. Flag code no test, caller or unit needs: an unset option, an
+          unvaried parameter, a wrapper that adds no rule, an unreachable
+          branch. Say what to delete.
+        - Migration, never a legacy path. The frozen MCP `2026-07-28`
+          revision and its retained protocol strategy (ADR-0001) are designed
+          contracts, not legacy paths. Outside them, flag a compatibility
+          shim, a fallback to an old format, a dual read or write, a deprecated
+          alias, and a flag that keeps old behavior. A change to a public
+          module ships as a breaking release with a migration note.
+        - Composable. In a public module, flag hidden call ordering, global
+          state, a mandatory framework where functions compose, a concept the
+          common caller must learn and does not need, and a module with two
+          responsibilities.
+        - Test first. Flag a behavior change with no test that exercises it,
+          and a test bound to internals.
+        - Typed before foreign. Flag Erlang where Gleam does the job, an
+          unchecked cast, an untyped value that reaches domain logic
+          undecoded, and a crash on a routine failure.
+        - Silence. Report nothing that `nix fmt`, the compiler with warnings
+          as errors, the tests or scripts/test.sh decide, and no layout or
+          naming preference without a written rule.
+
+    - path: "{src,test,dev,examples}/**/*.gleam"
+      instructions: |
+        Gleam (gleam).
+        - Flag a module function, private included, without annotated
+          arguments and return type, and an imported function or constant used
+          unqualified.
+        - Flag a name against the conventions: `Json` not `JSON`,
+          conversions named `x_to_y` or `to_y` inside module `x`, `try_` only
+          for an error-propagating counterpart.
+        - Flag `Option` carrying a failure, and a change that merges omitted,
+          explicit false, empty and failed where they mean different things.
+        - Flag an error a caller must parse as a string to choose recovery.
+        - Flag independent optional fields or booleans standing for exclusive
+          states; they are variants.
+        - Flag a predicate check followed by `let assert` on the same shape,
+          and a catch-all branch that silently accepts a new variant.
+        - Flag `panic` or `let assert` handling a routine peer, transport or
+          decode failure in `src/`.
+        - Flag a refactor that changes observable errors, ordering or effects.
+        - Flag a compatibility branch with no comment saying why it exists.
+        - Flag `src/` importing a `test/` or `dev/` module or `gleeunit`.
+        - Flag a new process, module or generic machinery added only for
+          organization, and a local type replacing a compatible ecosystem type.
+
+    - path: "src/**/*.gleam"
+      instructions: |
+        Published library surface (gleam-lib). Exported constructors, fields,
+        variants, module paths and behavior of `relay/*` outside
+        `relay/internal` are the compatibility surface; `internal_modules` in
+        gleam.toml marks instability, not access control.
+        - Flag a removed or changed export, variant, field or behavior in a
+          public module that the pull request does not call breaking.
+        - Flag a public signature that exposes an implementation-state type
+          parameter.
+        - Flag an argument that does not affect behavior, a bound tool or
+          operation that makes callers repeat its name or codecs at each use,
+          a setter per field where a record update works, and two public paths
+          for one common task.
+        - Flag configuration validated after a listener, endpoint or client
+          is allocated.
+        - Flag a builder or extension protocol with no distinct use case, and
+          a dynamic dispatcher over heterogeneous tools where typed
+          definitions can be bound.
+        - Flag a deliberate crash on a failure the caller could act on; return
+          a structured error instead.
+        - Flag the library taking over policy that belongs to the application:
+          business permissions, durable execution, retries, effect identity.
+
+    - path: "{src,test}/**/*.{gleam,erl}"
+      instructions: |
+        Foreign boundaries (gleam-ffi). Apply to `*.erl` files and to a Gleam
+        module that declares `@external`.
+        - Flag validation, branching or state transitions in Erlang; it
+          performs the native call and the representation conversion only.
+        - Flag an external that declares a native value to be a checked domain
+          value, `Dynamic` or a type variable that accepts every handle, and a
+          generic return that hides an unchecked cast.
+        - Flag Erlang that builds a Gleam `Result` or variant with a shape the
+          compiler does not generate for it.
+        - Flag an expected native failure not mapped to the declared failure
+          value, and code that assumes Gleam catches an Erlang exception.
+        - Flag a change to `relay_ffi.erl` that reads another private field of
+          mist's `Connection` record, or drops the safe fallback on another
+          record shape (gleam.toml comment).
+        - Flag a timeout or cancellation read as proof that a remote effect
+          did not happen.
+        - Flag a foreign function with no remaining caller.
+
+    - path: "src/**/*.gleam"
+      instructions: |
+        Relay runtime contracts (relay; rules for 0.2.2).
+        - Flag the server description, its codecs or handlers copied per
+          request or call where HTTP endpoints and stdio servers read the
+          snapshot held once in `persistent_term` (ADR-0017), and a new value
+          added to the per-request or per-call copy.
+        - Flag `register_tool` or `unregister_tool` placed on a per-request
+          path; freeing a snapshot scans the node.
+        - Flag the buffered `http.handle` path promising progress, peer
+          disconnect cancellation or `subscriptions/listen` (it answers 406).
+        - Flag Relay retrying a call, and transport success reported as
+          business success despite `ToolFailed`.
+        - Flag a client error that loses its `client.kind` or
+          `client.evidence`, or that reports `NotSent` where the request may
+          have reached the peer.
+        - Flag continuation state, correlation or a client key used as tenant
+          or principal authorization, and a verifier that decides business
+          permissions.
+        - Flag bearer authorization added to stdio, which trusts its parent.
+        - Flag request id, invocation id, correlation and effect identity
+          merged into one value.
+        - Flag a discovered behavior hint used to deem a retry safe, and a
+          discovered schema outside the supported profile accepted by
+          weakening its contract instead of refused.
+        - Flag a claim of an MCP revision, OAuth flow, extension or JSON
+          Schema feature beyond `2026-07-28` and the finite profile.
+        - Flag cancellation presented as stopping detached children or remote
+          effects.
+
+    - path: "{examples,dev}/**/*.gleam"
+      instructions: |
+        Relay consumers (relay; rules for 0.2.2). Apply to a module that
+        imports `relay`.
+        - Flag a tool declared twice for server and client; build one
+          `tool.Definition` and reuse it for decoding and typed calling.
+        - Flag `tool.define` for a definition built at run time; use
+          `tool.try_define`.
+        - Flag a call result that does not distinguish `Succeeded`,
+          `ToolFailed`, input-required results and client errors.
+        - Flag a client, endpoint or listener the module creates and does not
+          close, also when later setup fails.
+        - Flag a catalogue, client or codec carried in the application
+          context; Relay copies the context per request and call.
+        - Flag `http.handle` used where progress, subscriptions or disconnect
+          handling are needed; use `http.mist_handler`, a listener or the
+          supervised streaming endpoint.
+        - Flag a retry that does not inspect `client.kind` and
+          `client.evidence`, a retry after `MaybeSent` without a stable
+          idempotency key scoped to the authenticated principal, and a new key
+          minted for a retried mutation.
+        - Flag bearer admission required but `http.new_protected` not used,
+          and verifier success treated as business permission.
+
+    - path: "{src,test,examples}/**/*.gleam"
+      instructions: |
+        Outgoing HTTP (http-gun; rules checked against http_gun 0.2.0). Apply
+        to a module that imports `http_gun`.
+        - Flag a response body decoded before `buffered.response.status` is
+          inspected; an `Ok` transport result can hold a 404 or 503.
+        - Flag a truncated collection decoded as a complete document without
+          checking `buffered.truncated`.
+        - Flag a shared client started by a short-lived request process; use
+          `http_gun.supervised` and `http_gun.named`.
+        - Flag a body opened with `open` and not closed on every path, and a
+          body read from a process other than the one that opened it.
+        - Flag `body.next_within` returning `None` treated as end of stream.
+        - Flag a retry that does not use `error.is_retryable` with the
+          request's actual idempotency, and a timeout or cancellation treated
+          as proof that the peer did nothing.
+        - Flag a destination view that widens its client's authority, and
+          loopback reached without `destination.allow_loopback`.
+
+    - path: "{src,test}/**/*.gleam"
+      instructions: |
+        Mist endpoint (wisp; rules for mist 6.0.3, glisten 9.0.1). Apply to a
+        module that imports `mist`.
+        - Flag a handler or `after_start` callback passed to `mist.start` that
+          captures a catalogue, codec set, route table or other large value;
+          each connection process holds a copy. Reach it through a module
+          constant, `persistent_term` written once at start, or a named
+          process asked for one entry.
+        - Flag a route table, codec or catalogue built inside the handler on
+          every request.
+        - Flag a request body read twice, or read by two layers.
+        - Flag a stream or chunked response with no stated owner, disconnect
+          handling, send limit or cleanup.
+        - Flag malformed input or a domain failure that leaves the ordinary
+          response path, and a crash response that returns private
+          diagnostics to the peer.
+
+    - path: "{src,dev,examples}/**/*.gleam"
+      instructions: |
+        Processes (gleam-otp; rules for gleam_otp 1.3.0, gleam_erlang 1.3.0).
+        Apply to a module that imports `gleam/otp` or `gleam/erlang/process`.
+        - Flag `process.call` whose timeout or callee exit is handled as a
+          returned error or as proof the request had no effect, and a call
+          timeout that triggers an unconditional retry of a tool call.
+        - Flag network or handler work inside the process that must stay
+          responsive to cancellation or disconnect.
+        - Flag a subject received from outside its owning process.
+        - Flag accepted requests, active tool workers or waiting messages
+          with no bound.
+        - Flag a process name or atom created from request input; allocate a
+          bounded set at startup.
+        - Flag a supervisor strategy that does not match the children's
+          dependency, and a dependant that keeps an unusable handle after a
+          restart.
+        - Flag a spawn closure, message or start argument that captures the
+          server, a catalogue or a codec set; capture small references.
+        - Flag an actor introduced only to organize functions.
+
+    - path: "{src,test,examples}/**/*.gleam"
+      instructions: |
+        Telemetry (sinal; rules for sinal 0.1.0, telemetry 1.4.2). Apply to a
+        module that imports `sinal`.
+        - Flag an event name, field key or route prefix built from request
+          input; put request ids and other unbounded values in metadata
+          values.
+        - Flag a custom getter or encoder that can fail or raise in the
+          emitting process.
+        - Flag an enum field codec whose list misses a constructor.
+        - Flag a handler that does I/O on a request path, and an attachment a
+          test or request scope does not detach.
+        - Flag telemetry used to decide whether a tool call or business effect
+          happened, and forwarding treated as lossless.
+
+    - path: "{test,examples/relay_usage/test}/**"
+      instructions: |
+        Tests (testing).
+        - Flag a test that confirms success through internals, private state
+          or a side channel where the public API can show it.
+        - Flag a mock of an internal collaborator, and an assertion on call
+          counts or call order.
+        - Flag a scenario outcome that no design rule states.
+        - Flag tests left in place for an interface the diff replaced.
+        - Flag a refusal or illegal input the change introduces with no test
+          through the public boundary.
+        - Flag a new transport or client path with no test of timeout,
+          disconnect, duplicate delivery or reordering where the design states
+          its outcome.
+
+    - path: "{scripts,test/fixtures/stdio}/**/*.py"
+      instructions: |
+        Python checks and peers (python).
+        - Flag `Any`, and an external value (file, JSON, process output) used
+          without parsing.
+        - Flag an abstract base class hierarchy; use `Protocol`.
+        - Flag mutable dataclasses inside the program, and exclusive states as
+          flags instead of tagged frozen dataclasses matched with
+          `assert_never`.
+        - Flag a parser model passed past the boundary.
+
+    - path: "docs/{design,adr}/**"
+      instructions: |
+        Design layer (design; policy).
+        - Fresh reader. The reviewer never saw the change being made. Flag a
+          changed unit that does not tell a reader with no memory what the
+          code does not say, and a unit that copies the code.
+        - Flag content the code states: payloads, fields, limits, timeouts,
+          function or file lists, queries. Name the rule it serves instead; a
+          file or symbol is allowed only where a reader needs it to find where
+          a rule is enforced.
+        - Flag session narration, progress notes, status or delivery history.
+        - Flag a unit missing one of overview, interface, invariants, side
+          effects and verification; an empty part says "none".
+        - Flag a concept defined in a second home, a glossary term with two
+          meanings, and a retired term reused.
+        - Flag an edit to an accepted ADR's text instead of a superseding ADR,
+          and a changed date on a pending entry.
+
+    - path: "issues/**/*.md"
+      instructions: |
+        Local tracker (tracker; AGENTS.md).
+        - Each issue file carries one `Status:` and one `Category:` header
+          with a value AGENTS.md lists.
+        - Flag an issue titled with a solution instead of the observable
+          problem, line numbers or solution code in an issue, and a horizontal
+          task such as "build the data layer".
+        - Flag an AI-written comment that does not start with
+          `AI-assisted contribution.`
+
+    - path: "{scripts/**,flake.nix,lefthook.yml,.github/**}"
+      instructions: |
+        Gate (gate).
+        - Flag a check that passes or skips when its tool is missing; it
+          fails or reports unmeasured.
+        - Flag a tool not supplied through the Nix flake, and a command that
+          differs between local runs and CI.
+        - Flag a new check that encodes a layout, naming or README
+          convention, and a check that scripts what a tool already performs.
+        - Flag a replaced check that drops security or data-integrity
+          coverage, such as the schema check, the negative compiler fixtures
+          or the conformance server suite.
+        - Flag a gate that keeps a formatting check but loses compile, Erlang
+          warnings-as-errors or behavior tests for the root or
+          examples/relay_usage.
+
+  pre_merge_checks:
+    title:
+      mode: "off"
+    description:
+      mode: warning
+    issue_assessment:
+      mode: "off"
+    docstrings:
+      mode: "off"
+    custom_checks:
+      - name: No weakened test or gate
+        mode: error
+        instructions: |
+          Source: policy, gate. Fail if the diff skips, deletes, disables or
+          loosens a test, a negative or positive compiler fixture, a protocol
+          corpus case, a conformance suite case or a step of scripts/test.sh
+          or CI (including removing a package from a test run or adding
+          `continue-on-error`), and the pull request description does not name
+          the behavior that no longer exists or the stronger check that
+          replaces it. Pass otherwise.
+      - name: Behavior change carries its design
+        mode: warning
+        instructions: |
+          Source: policy, design. Warn if the diff changes public behavior, an
+          invariant or MCP wire behavior in src/ with no change under
+          docs/design or docs/adr, and the pull request description does not
+          say the change restores designed behavior or preserves behavior.
+          Pass for tests, tooling and documentation-only changes.
+      - name: Breaking change is declared
+        mode: warning
+        instructions: |
+          Source: policy, gleam-lib. Warn if the diff removes or changes an
+          exported function, type, constructor, field or module path in a
+          `relay/*` module outside `relay/internal`, and the pull request
+          description does not call the change breaking and give its
+          migration. Pass otherwise.
+      - name: Problem-first description
+        mode: warning
+        instructions: |
+          Source: git. Warn unless the pull request description gives the
+          problem, why it matters, one concrete example, the solution in one
+          paragraph, its trade-offs, and what was verified, with no file
+          tour, and its claims match the diff.
+      - name: No attribution text
+        mode: warning
+        instructions: |
+          Source: git. Warn if the pull request title or description contains
+          a co-author credit, `Co-Authored-By`, a "Generated with" or
+          "Generated by" line, or a line starting with the robot emoji.
+
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+    simplify:
+      enabled: false
+
+  tools:
+    gitleaks:
+      enabled: true
+    trufflehog:
+      enabled: true
+    actionlint:
+      enabled: true
+    zizmor:
+      enabled: true
+    shellcheck:
+      enabled: true
+    ruff:
+      enabled: true
+    # The repository runs no JavaScript, prose or YAML linter and no second
+    # Python linter; their findings would be preferences without a written
+    # rule (policy, Silence).
+    biome:
+      enabled: false
+    eslint:
+      enabled: false
+    oxc:
+      enabled: false
+    pylint:
+      enabled: false
+    flake8:
+      enabled: false
+    markdownlint:
+      enabled: false
+    languagetool:
+      enabled: false
+    yamllint:
+      enabled: false
+    github-checks:
+      enabled: true
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    # AGENTS.md and CLAUDE.md are read by default.
+    filePatterns:
+      - files: "docs/COVERAGE.md,docs/design/*.typ,docs/adr/*.md"
+        applyTo: "src/**,test/**,dev/**,examples/**,fixtures/**"
+      - files: "docs/ORACLE.md"
+        applyTo: "scripts/**,test/**,dev/**"
+  learnings:
+    scope: local
+  pull_requests:
+    scope: local
