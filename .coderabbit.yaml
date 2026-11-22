@@ -272,6 +272,9 @@ reviews:
         - Flag TLS verification weakened to reach a server that accepts only
           TLS 1.2 CBC suites; use `config.with_cipher_suites(settings,
           config.OtpDefaultsAndTls12Cbc)`.
+        - Flag a call to an `http_gun` function that a release admitted by
+          the `http_gun` range in gleam.toml does not provide; a suggestion
+          that needs such a function raises the range's lower bound with it.
 
     - path: "{src,test}/**/*.gleam"
       instructions: |
