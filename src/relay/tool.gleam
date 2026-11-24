@@ -46,7 +46,7 @@
 //// codec. Under `runtime.start` or `client.in_process` a call copies the one
 //// tool it runs. Every call copies its arguments and application context.
 //// Write codecs by the
-//// [JSON Blueprint codec practice](https://github.com/lostbean/json_blueprint/blob/main/docs/CODEC-PRACTICE.md).
+//// [JSON Blueprint codec practice](https://github.com/gleam-dream/json_blueprint/blob/main/docs/CODEC-PRACTICE.md).
 ////
 //// ## Ids and retries
 ////
