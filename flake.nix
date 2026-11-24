@@ -68,7 +68,6 @@
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             git
-            gh
             lefthook
             gleam
             nodejs_22

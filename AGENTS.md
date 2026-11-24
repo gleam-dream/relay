@@ -40,7 +40,7 @@ sibling source graph into a new output directory per run.
 
 ## Releasing
 
-- `scripts/release <version>` opens the version-bump pull request from a clean, current `main`. It never tags and never publishes.
+- `nix run github:gleam-dream/.github#release -- <version>` opens the version-bump pull request from a clean, current `main`. It never tags and never publishes. Nix supplies every tool it calls.
 - After the merge, tag the merge commit `v<version>` and push the tag. The `Release` workflow uploads the package to Hex, where it stays staged.
 - Staged publishing is on for relay on hex.pm, so a release becomes public only when a Hex maintainer approves it there with a second factor. If that setting is ever turned off, a pushed tag publishes at once; never push a release tag while it is off. An agent stops after pushing the tag and reports whether the release waits for approval or is public.
 - Push a release tag only on an explicit request that names the version. The steps and the way to undo a release are in the [shared workflow's README](https://github.com/gleam-dream/.github#publishing-a-package-to-hex).
