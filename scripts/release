@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Opens the version-bump pull request for a release of relay.
+# It never tags and never publishes: see AGENTS.md, "Releasing".
+set -euo pipefail
+
+die() {
+  echo "release: $*" >&2
+  exit 1
+}
+
+version="${1:-}"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "usage: scripts/release <major.minor.patch>"
+
+cd "$(git rev-parse --show-toplevel)"
+package="$(sed -nE 's/^name *= *"([^"]+)".*/\1/p' gleam.toml | head -n 1)"
+current="$(sed -nE 's/^version *= *"([^"]+)".*/\1/p' gleam.toml | head -n 1)"
+
+[[ "$(git branch --show-current)" == main ]] || die "run it on main"
+[[ -z "$(git status --porcelain)" ]] || die "the working tree has changes"
+git fetch --quiet origin main --tags
+[[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || die "main differs from origin/main"
+[[ "$version" != "$current" ]] || die "gleam.toml already declares $version"
+[[ -z "$(git tag --list "v$version")" ]] || die "tag v$version exists"
+
+branch="release/v$version"
+git switch --quiet --create "$branch"
+
+# The package version, and its copy in every manifest that locks the package
+# by path.
+RELEASE_VERSION="$version" perl -pi -e '$done ||= s/^version *= *"[^"]+"/version = "$ENV{RELEASE_VERSION}"/' gleam.toml
+changed=(gleam.toml)
+while IFS= read -r manifest; do
+  if grep -qE "name = \"$package\", version = \"$current\".*source = \"local\"" "$manifest"; then
+    RELEASE_PACKAGE="$package" RELEASE_VERSION="$version" perl -pi -e \
+      's/(name = "\Q$ENV{RELEASE_PACKAGE}\E", version = ")[^"]+(".*source = "local")/$1$ENV{RELEASE_VERSION}$2/' "$manifest"
+    changed+=("$manifest")
+  fi
+done < <(git ls-files 'manifest.toml' '*/manifest.toml')
+
+title="build: release $package $version"
+git add -- "${changed[@]}"
+git commit --quiet --message "$title"
+git push --quiet --set-upstream origin "$branch"
+
+{
+  echo "Sets the $package version to $version in gleam.toml and in the manifests that depend on it by path."
+  echo
+  echo "Changes since v$current:"
+  echo
+  git log --format='- %s' "v$current..origin/main"
+  echo
+  echo "Consumers that must change, and from which version: (fill in, or write none)"
+} | gh pr create --title "$title" --body-file - --base main --head "$branch"
+
+echo "release: after the merge, tag the merge commit v$version and push the tag."
