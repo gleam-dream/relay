@@ -138,7 +138,7 @@ For bearer-protected endpoints, see the [protection recipe](examples/relay_usage
 ## Tool codecs and process copies
 
 Write tool input and output codecs by the
-[JSON Blueprint codec practice](https://github.com/lostbean/json_blueprint/blob/main/docs/CODEC-PRACTICE.md).
+[JSON Blueprint codec practice](https://github.com/gleam-dream/json_blueprint/blob/main/docs/CODEC-PRACTICE.md).
 This section states only what Relay copies between processes.
 
 - An HTTP endpoint (`http.handler`, `http.start`, `http.supervised`) and a
