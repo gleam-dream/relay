@@ -41,9 +41,9 @@ import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
-import gleam/uri
 import relay/authorization.{type Attestation, type Verifier}
 import relay/client
+import relay/internal/header_value
 import relay/server.{type Server}
 import sinal/correlation
 
@@ -109,7 +109,8 @@ pub fn request(
     |> request.set_header("mcp-protocol-version", "2026-07-28")
     |> request.set_header("mcp-method", method)
   case routing_name(method, params) {
-    Some(name) -> request.set_header(base, "mcp-name", uri.percent_encode(name))
+    Some(name) ->
+      request.set_header(base, "mcp-name", header_value.encode(name))
     None -> base
   }
 }
