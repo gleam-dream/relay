@@ -1,4 +1,5 @@
 import gleam/dict
+import gleam/erlang/atom
 import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/json
@@ -212,6 +213,11 @@ fn local_server(observed: Subject(String)) -> server.Server(context) {
 
 fn start_http(service: server.Server(Nil)) -> #(http.Handler(Nil), String) {
   let assert Ok(handler) = http.start(http.new(service))
+  #(handler, url_of(handler))
+}
+
+fn start_http_with(config: http.Config(Nil)) -> #(http.Handler(Nil), String) {
+  let assert Ok(handler) = http.start(config)
   #(handler, url_of(handler))
 }
 
@@ -1562,6 +1568,48 @@ fn churn(handler: http.Handler(Nil), remaining: Int) -> Nil {
         )
       let assert True = http.unregister_tool(handler, name)
       churn(handler, remaining - 1)
+    }
+  }
+}
+
+// gleeunit stops a plain test after 5 s; this generator form allows 60 s.
+pub fn http_subscription_outlives_the_peer_graceful_close_window_test_() {
+  #(atom.create("timeout"), 60, fn() {
+    let #(handler, url) =
+      start_http_with(
+        http.new(server.new([]))
+        |> http.with_sse_keepalive(duration.seconds(1)),
+      )
+    let peer = connect_url(url)
+    let assert Ok(subscription) =
+      client.listen(peer, [subscriptions.ToolsListChanged])
+    // Twenty idle seconds: the stream carries only keepalive comments.
+    hold_idle(subscription, 20)
+    let late =
+      tool.define("late", named_input(), codec.string())
+      |> tool.handle(fn(_) { Ok("late") })
+    let assert Ok(Nil) = http.register_tool(handler, late)
+    let assert Ok(Some(subscriptions.ToolsListChanged)) =
+      client.next_notification(subscription, duration.seconds(2))
+    client.close_subscription(subscription)
+    client.close(peer)
+    http.stop(handler)
+  })
+}
+
+fn hold_idle(subscription: client.Subscription, seconds: Int) -> Nil {
+  let elapsed = process.new_subject()
+  process.send_after(elapsed, seconds * 1000, Nil)
+  wait_idle(subscription, elapsed)
+}
+
+fn wait_idle(subscription: client.Subscription, elapsed: Subject(Nil)) -> Nil {
+  case process.receive(elapsed, 0) {
+    Ok(Nil) -> Nil
+    Error(Nil) -> {
+      let assert Ok(None) =
+        client.next_notification(subscription, duration.seconds(1))
+      wait_idle(subscription, elapsed)
     }
   }
 }
