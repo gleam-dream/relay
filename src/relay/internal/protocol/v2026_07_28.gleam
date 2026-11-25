@@ -135,12 +135,46 @@ pub fn admit_message(raw_json: String) -> Admission {
 
 /// Reads the HTTP routing fields without executing or admitting the request.
 pub fn http_route(bytes: BitArray) -> Result(HttpRoute, Nil) {
+  use dynamic <- result.try(parse_envelope(bytes))
+  route_of(dynamic, fn() { extracted_arguments(bytes) })
+}
+
+/// Reads the HTTP routing fields and admits the request from one parse of
+/// the body. The route's arguments are the admitted ones, so the body is not
+/// decoded again for them.
+pub fn http_inspect(bytes: BitArray) -> Result(#(HttpRoute, Admission), Nil) {
+  use dynamic <- result.try(parse_envelope(bytes))
+  let admission = admit_dynamic(dynamic, bytes)
+  use route <- result.map(
+    route_of(dynamic, fn() {
+      case admission {
+        AdmittedRequest(ToolsCall(_, _, _, arguments, _, _)) -> Some(arguments)
+        // A refused call keeps the header check it had: its arguments are
+        // read on their own.
+        _ -> extracted_arguments(bytes)
+      }
+    }),
+  )
+  #(route, admission)
+}
+
+fn parse_envelope(bytes: BitArray) -> Result(Dynamic, Nil) {
   use raw <- result.try(
     bit_array.to_string(bytes) |> result.map_error(fn(_) { Nil }),
   )
-  use dynamic <- result.try(
-    json.parse(raw, decode.dynamic) |> result.map_error(fn(_) { Nil }),
-  )
+  json.parse(raw, decode.dynamic) |> result.map_error(fn(_) { Nil })
+}
+
+fn extracted_arguments(bytes: BitArray) -> Option(Value) {
+  ffi_extract_arguments_as_blueprint_value(bytes)
+  |> result.map(Some)
+  |> result.unwrap(None)
+}
+
+fn route_of(
+  dynamic: Dynamic,
+  tool_arguments: fn() -> Option(Value),
+) -> Result(HttpRoute, Nil) {
   use fields <- result.try(
     decode.run(dynamic, decode.dict(decode.string, decode.dynamic))
     |> result.map_error(fn(_) { Nil }),
@@ -208,18 +242,15 @@ pub fn http_route(bytes: BitArray) -> Result(HttpRoute, Nil) {
       }
   }
   let arguments = case method {
-    "tools/call" ->
-      ffi_extract_arguments_as_blueprint_value(bytes)
-      |> result.map(Some)
-      |> result.unwrap(None)
+    "tools/call" -> tool_arguments()
     _ -> None
   }
   Ok(HttpRoute(method, name, arguments, protocol_version, has_id))
 }
 
 /// Returns an HTTP status and JSON-RPC error for messages rejected at admission.
-pub fn http_admission_failure(bytes: BitArray) -> Option(HttpFailure) {
-  case admit_bytes(bytes) {
+pub fn http_admission_failure(admission: Admission) -> Option(HttpFailure) {
+  case admission {
     AdmittedRejected(id, error) -> {
       let status_code = case error.code == jsonrpc.method_not_found_code {
         True -> 404
@@ -274,60 +305,39 @@ fn request_id(request: Request) -> RequestId {
 
 /// True for a JSON-RPC response or error object, false for a notification.
 pub fn is_response_frame(bytes: BitArray) -> Bool {
-  case bit_array.to_string(bytes) {
-    Error(_) -> False
-    Ok(raw) ->
-      case json.parse(raw, decode.dynamic) {
-        Error(_) -> False
-        Ok(dynamic) ->
-          case decode.run(dynamic, decode.dict(decode.string, decode.dynamic)) {
-            Error(_) -> False
-            Ok(fields) -> {
-              let has_id_or_error =
-                dict.has_key(fields, "id") || dict.has_key(fields, "error")
-              !dict.has_key(fields, "method") && has_id_or_error
-            }
-          }
-      }
-  }
+  result.is_ok(response_status(bytes))
 }
 
 /// Returns the Streamable HTTP status required for protocol-level errors.
 pub fn http_response_status(bytes: BitArray) -> Option(Int) {
-  case bit_array.to_string(bytes) {
-    Error(_) -> None
-    Ok(raw) ->
-      case json.parse(raw, decode.dynamic) {
-        Error(_) -> None
-        Ok(dynamic) ->
-          case decode.run(dynamic, decode.dict(decode.string, decode.dynamic)) {
-            Error(_) -> None
-            Ok(fields) ->
-              case dict.get(fields, "error") {
-                Error(_) -> None
-                Ok(error) ->
-                  case
-                    decode.run(
-                      error,
-                      decode.dict(decode.string, decode.dynamic),
-                    )
-                  {
-                    Error(_) -> None
-                    Ok(error) ->
-                      case dict.get(error, "code") {
-                        Error(_) -> None
-                        Ok(code) ->
-                          case decode.run(code, decode.int) {
-                            Error(_) -> None
-                            Ok(-32_601) -> Some(404)
-                            Ok(-32_021) | Ok(-32_022) -> Some(400)
-                            Ok(_) -> None
-                          }
-                      }
-                  }
-              }
-          }
-      }
+  case parse_envelope(bytes) {
+    Ok(dynamic) -> error_status(dynamic)
+    Error(Nil) -> None
+  }
+}
+
+/// Classifies an outgoing frame from one parse: `Error` for a notification
+/// or an unreadable frame, `Ok` for a response or error object, with the
+/// Streamable HTTP status its error code requires, if any.
+pub fn response_status(bytes: BitArray) -> Result(Option(Int), Nil) {
+  use dynamic <- result.try(parse_envelope(bytes))
+  use fields <- result.try(
+    decode.run(dynamic, decode.dict(decode.string, decode.dynamic))
+    |> result.replace_error(Nil),
+  )
+  let has_id_or_error =
+    dict.has_key(fields, "id") || dict.has_key(fields, "error")
+  case !dict.has_key(fields, "method") && has_id_or_error {
+    True -> Ok(error_status(dynamic))
+    False -> Error(Nil)
+  }
+}
+
+fn error_status(message: Dynamic) -> Option(Int) {
+  case decode.run(message, decode.at(["error", "code"], decode.int)) {
+    Ok(-32_601) -> Some(404)
+    Ok(-32_021) | Ok(-32_022) -> Some(400)
+    _ -> None
   }
 }
 

@@ -287,7 +287,7 @@
     #md-table(3, (
       [*Limit or policy*], [*Default / refusal*], [*Application point*],
       [Bind and protection], [127.0.0.1, ephemeral; unprotected nonloopback start fails], [Validated before listener startup; allow_unauthenticated is explicit caller policy.],
-      [Body and JSON depth], [1 MiB → 413; depth 64 → 400], [Mist bounded reader before slot; endpoint body check before context; depth before reducer parse. Mounted body allocation belongs to host.],
+      [Body and JSON depth], [1 MiB → 413; depth 64 → 400], [Mist bounded reader before slot; endpoint body check before context; depth before reducer parse. The endpoint takes routing fields and admission from one parse of the body, and the reducer parses it once more. Mounted body allocation belongs to host.],
       [Request slots and listen streams], [1,024 and 64 → 503], [Leased admitted requests/streams; does not count all incomplete network body readers.],
       [Response budget], [1 MiB response or cumulative stream event bytes], [Broker enforces event output budget and acknowledged delivery; existing allocations are not erased by refusal.],
       [Admitted request deadline], [30 s], [One absolute deadline starts at slot admission and covers callbacks, finite execution and response waits.],
@@ -577,7 +577,7 @@
     ))
     #points(
       [CI invokes Nix/treefmt and the pinned design-layer checker directly. The local scripts/test.sh compiles Gleam and authored Erlang with warnings as errors and runs application tests, compiler fixtures, schema comparisons and the server suite. Local source-policy checkers, profile registries and provenance receipts remain removed. See #adr(15).],
-      [Generated dependencies, TLS fixtures, the pnpm lockfile and deliberate negative compiler fixtures are excluded from authored formatting. No benchmark harness or latency claim exists.],
+      [Generated dependencies, TLS fixtures, the pnpm lockfile and deliberate negative compiler fixtures are excluded from authored formatting. One benchmark compares the HTTP tools/call decode cost of two builds on one machine; no latency claim exists.],
       [The server check runs the pinned conformance package against all server scenarios of spec 2026-07-28 and retains structured results and the local server log on success or failure. The upstream CLI reports failed assertions with a nonzero exit status. Scenario inventory and warning policy are not separately enforced; emitted assertions establish only their tested scope.],
       [Each #term("term-sibling-dependency") of Relay (Sinal, HTTP Gun and JSON Blueprint) uses a Hex version requirement. Each manifest records the resolved versions and checksums; dependency updates are explicit. CI fetches the dependencies like any other and persists no credentials; fork pull requests run the same jobs. A change that spans Relay and a sibling is verified by a whole-graph local-source capture rather than a path override of Relay alone. See #adr(16).],
     )

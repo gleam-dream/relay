@@ -1370,7 +1370,8 @@ fn dispatch(
 ) -> http_mist.Reply {
   let config = held.get(lease.config)
   let body = request.body
-  case v2026.http_route(body) {
+  // One parse of the body gives the routing fields and the admission.
+  case v2026.http_inspect(body) {
     Error(Nil) ->
       reject(
         config,
@@ -1379,7 +1380,7 @@ fn dispatch(
         correlation,
         "Invalid MCP JSON-RPC envelope",
       )
-    Ok(route) ->
+    Ok(#(route, admission)) ->
       case
         valid_route_headers(request, route)
         && valid_parameter_headers(request, config.server, route)
@@ -1397,7 +1398,7 @@ fn dispatch(
           ))
         }
         True ->
-          case v2026.http_admission_failure(body) {
+          case v2026.http_admission_failure(admission) {
             Some(v2026.HttpFailure(status, failure)) ->
               http_mist.Buffered(json_response(status, failure))
             None ->
@@ -1587,9 +1588,9 @@ fn buffered(
 ) -> http_mist.Reply {
   let deadline = monotonic_ms() + timeout_ms
   case collect(broker, deadline, []) {
-    Collected(frames) -> {
+    Collected(frames, status) -> {
       finish(broker, rt)
-      http_mist.Buffered(respond_with_frames(frames))
+      http_mist.Buffered(respond(frames, status))
     }
     TooLate -> {
       finish(broker, rt)
@@ -1602,7 +1603,9 @@ fn buffered(
 }
 
 type Collection {
-  Collected(List(BitArray))
+  /// The frames, and the HTTP status of the last one when it was already
+  /// classified as the response.
+  Collected(frames: List(BitArray), status: Option(Int))
   TooLate
 }
 
@@ -1622,13 +1625,13 @@ fn collect(
         http_mist.Ended ->
           case frames {
             [] -> TooLate
-            _ -> Collected(list.reverse(frames))
+            _ -> Collected(list.reverse(frames), final_status(frames))
           }
         http_mist.Data(bytes) -> {
           let frames = [bytes, ..frames]
-          case v2026.is_response_frame(bytes) {
-            True -> Collected(list.reverse(frames))
-            False -> collect(broker, deadline, frames)
+          case v2026.response_status(bytes) {
+            Ok(status) -> Collected(list.reverse(frames), status)
+            Error(Nil) -> collect(broker, deadline, frames)
           }
         }
       }
@@ -2090,12 +2093,22 @@ fn decode_parameter_header(raw: String) -> Result(String, Nil) {
 // --- responses ---------------------------------------------------------------
 
 fn respond_with_frames(frames: List(BitArray)) -> Response(BytesTree) {
+  respond(frames, final_status(list.reverse(frames)))
+}
+
+// The HTTP status of the newest frame, given newest first.
+fn final_status(newest_first: List(BitArray)) -> Option(Int) {
+  case newest_first {
+    [bytes, ..] -> v2026.http_response_status(bytes)
+    [] -> None
+  }
+}
+
+// Answers with the last frame under an HTTP status worked out earlier.
+fn respond(frames: List(BitArray), status: Option(Int)) -> Response(BytesTree) {
   case list.last(frames) {
     Error(Nil) -> plain(500, "Relay produced no response")
-    Ok(bytes) -> {
-      let status = option.unwrap(v2026.http_response_status(bytes), 200)
-      json_response(status, bytes)
-    }
+    Ok(bytes) -> json_response(option.unwrap(status, 200), bytes)
   }
 }
 
