@@ -20,11 +20,12 @@ import mist
 pub type Reply {
   Buffered(Response(BytesTree))
   /// A server-sent event stream: `head` carries the status and headers;
-  /// `next(wait_ms)` returns the next event, or `Idle` when nothing arrived
-  /// within the wait; `close` tells the endpoint the client went away.
+  /// `next(wait_ms, closed)` returns the next event, `Idle` when nothing
+  /// arrived within the wait, or `Gone` when `closed` fired first; `close`
+  /// tells the endpoint the client went away.
   Streamed(
     head: Response(Nil),
-    next: fn(Int) -> Event,
+    next: fn(Int, process.Selector(Nil)) -> Event,
     close: fn() -> Nil,
     keepalive_ms: Int,
     write_budget: fn() -> Result(Int, Nil),
@@ -38,6 +39,8 @@ pub type Event {
   Data(BitArray)
   Idle
   Ended
+  /// The client closed the connection while the stream waited.
+  Gone
 }
 
 /// The callbacks of one endpoint.
@@ -98,6 +101,7 @@ fn handle(
                 write_budget,
                 written,
                 attached,
+                closed,
               )
             }
           }
@@ -160,13 +164,18 @@ type Pull {
 fn stream(
   request: Request(mist.Connection),
   head: Response(Nil),
-  next: fn(Int) -> Event,
+  next: fn(Int, process.Selector(Nil)) -> Event,
   close: fn() -> Nil,
   keepalive_ms: Int,
   write_budget: fn() -> Result(Int, Nil),
   written: fn(Event) -> Nil,
   attached: fn(process.Pid) -> Bool,
+  closed: process.Selector(Nil),
 ) -> Response(mist.ResponseData) {
+  // `closed` selects the closure message armed on the socket before the
+  // reply was computed. The chunk process becomes the socket's controlling
+  // process, so the message arrives here and ends a silent stream at once
+  // instead of at its next keepalive write.
   // The chunk process owns the socket and closes it when the stream ends,
   // so the response must tell the client not to reuse the connection.
   mist.chunked(
@@ -181,14 +190,12 @@ fn stream(
       subject
     },
     loop: fn(subject, _pull, connection) {
-      let pulled = next(keepalive_ms)
-      let bytes = case pulled {
-        Data(bytes) -> Some(event(bytes))
-        Idle -> Some(<<": keepalive\n\n">>)
-        Ended -> None
-      }
-      case bytes {
-        None -> {
+      case next(keepalive_ms, closed) {
+        Gone -> {
+          close()
+          mist.chunk_stop()
+        }
+        Ended -> {
           case write_budget() {
             Error(Nil) -> mist.chunk_stop_abnormal("Relay request ended")
             Ok(timeout) -> {
@@ -197,31 +204,71 @@ fn stream(
             }
           }
         }
-        Some(bytes) -> {
-          case write_budget() {
-            Error(Nil) -> {
-              close()
-              mist.chunk_stop_abnormal("Relay request ended")
-            }
-            Ok(timeout) -> {
-              let _ = set_send_timeout(connection, timeout)
-              case mist.send_chunk(connection, bytes) {
-                Ok(Nil) -> {
-                  written(pulled)
-                  process.send(subject, Pull)
-                  mist.chunk_continue(subject)
-                }
-                Error(_) -> {
-                  close()
-                  mist.chunk_stop()
-                }
-              }
-            }
-          }
-        }
+        Data(bytes) ->
+          write(
+            Data(bytes),
+            event(bytes),
+            subject,
+            connection,
+            close,
+            write_budget,
+            written,
+            closed,
+          )
+        Idle ->
+          write(
+            Idle,
+            <<": keepalive\n\n">>,
+            subject,
+            connection,
+            close,
+            write_budget,
+            written,
+            closed,
+          )
       }
     },
   )
+}
+
+fn write(
+  pulled: Event,
+  bytes: BitArray,
+  subject: process.Subject(Pull),
+  connection: mist.Connection,
+  close: fn() -> Nil,
+  write_budget: fn() -> Result(Int, Nil),
+  written: fn(Event) -> Nil,
+  closed: process.Selector(Nil),
+) -> mist.ChunkNext(process.Subject(Pull)) {
+  case write_budget() {
+    Error(Nil) -> {
+      close()
+      mist.chunk_stop_abnormal("Relay request ended")
+    }
+    Ok(timeout) -> {
+      let _ = set_send_timeout(connection, timeout)
+      case mist.send_chunk(connection, bytes) {
+        Ok(Nil) -> {
+          written(pulled)
+          process.send(subject, Pull)
+          // A closure that arrived during the write is taken here, behind
+          // `Pull`, so the actor never sees it unselected.
+          case process.selector_receive(closed, 0) {
+            Ok(Nil) -> {
+              close()
+              mist.chunk_stop()
+            }
+            Error(Nil) -> mist.chunk_continue(subject)
+          }
+        }
+        Error(_) -> {
+          close()
+          mist.chunk_stop()
+        }
+      }
+    }
+  }
 }
 
 fn event(bytes: BitArray) -> BitArray {

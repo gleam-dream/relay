@@ -1571,7 +1571,7 @@ fn streamed(
       |> response.set_header("cache-control", "no-store")
       |> response.set_header("mcp-protocol-version", "2026-07-28")
       |> response.set_body(Nil),
-    next: fn(wait_ms) { next(broker, wait_ms) },
+    next: fn(wait_ms, closed) { next(broker, wait_ms, closed) },
     close: fn() { client_gone(broker) },
     keepalive_ms: keepalive_ms,
     write_budget: fn() { Ok(write_budget_ms) },
@@ -1617,8 +1617,10 @@ fn collect(
   case remaining <= 0 {
     True -> TooLate
     False ->
-      case next(broker, int.min(remaining, poll_ms)) {
+      case next(broker, int.min(remaining, poll_ms), process.new_selector()) {
         http_mist.Idle -> collect(broker, deadline, frames)
+        // Nothing selects a closure here: the request owner watches it.
+        http_mist.Gone -> TooLate
         http_mist.Ended ->
           case frames {
             [] -> TooLate
@@ -1725,7 +1727,13 @@ fn deliver(
   }
 }
 
-fn next(broker: Broker(context), wait_ms: Int) -> http_mist.Event {
+// Waits for the broker's next event, or for `closed`, which a streaming
+// reader passes to learn that its client left while the stream was silent.
+fn next(
+  broker: Broker(context),
+  wait_ms: Int,
+  closed: process.Selector(Nil),
+) -> http_mist.Event {
   case process.subject_owner(broker) {
     Error(Nil) -> http_mist.Ended
     Ok(owner) -> {
@@ -1736,6 +1744,9 @@ fn next(broker: Broker(context), wait_ms: Int) -> http_mist.Event {
         process.new_selector()
         |> process.select(reply)
         |> process.select_specific_monitor(monitor, fn(_) { http_mist.Ended })
+        |> process.merge_selector(
+          process.map_selector(closed, fn(_) { http_mist.Gone }),
+        )
         |> process.selector_receive(wait_ms + hub_timeout)
       let _ = process.demonitor_process(monitor)
       result.unwrap(answer, http_mist.Ended)

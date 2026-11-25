@@ -298,7 +298,7 @@
       [handle consumes Request(BitArray) and returns buffered Response(BytesTree). It drops progress, cannot observe peer disconnect, and rejects subscriptions/listen with 406. mist_handler, start, and supervised retain streaming, keepalive and disconnect cancellation.],
       [Correlation, context, and verifier closures execute in the managed request worker, including buffered mounting. A callback-created Subject belongs to that worker and only its owner can receive from it; successful context construction does not terminate the worker. Long-lived clients, pools, and actors remain application-owned borrowed resources. Arbitrary detached or exit-trapping children and remote effects do not become Relay-owned resources.],
       [Modern MCP accepts POST only; protected-resource metadata has a separate GET path. No modern GET notification endpoint, DELETE session termination, or protocol session is added by this metadata route.],
-      [Optional FFI helpers inspect Mist's Connection record to set a send timeout and observe buffered connection closure. They fall back on unfamiliar shapes; Mist upgrades require the real disconnect tests and record-contract check. See #adr(3).],
+      [Optional FFI helpers inspect Mist's Connection record to set a send timeout and observe connection closure, for a buffered reply and for an event stream that is waiting to write. They fall back on unfamiliar shapes; Mist upgrades require the real disconnect tests and record-contract check. See #adr(3).],
     )
     #behavior(title: "Buffered mounting refuses listen streams", area: "HTTP mounting", level: "interface")[
       #given[An application mounted the framework-neutral buffered handler.]
@@ -409,6 +409,7 @@
       [#term("term-header-acquisition") runs header callbacks in a temporary request-owned process. They return header data, not process-affine resources. Application resources captured by the callback remain borrowed; arbitrary detached children and remote effects are not adopted. See #adr(11).],
       [Subscription opening uses the same budget for headers, HTTP opening and the acknowledgement. Successful acknowledgement removes the relative opening limit. The explicit absolute deadline and cancellation continue to bound the established subscription. Closing or failing the stream releases its request owner.],
       [An injected HTTP Gun client's existing absolute deadline remains intact unless the caller explicitly installs a Relay deadline view. A relative Relay timeout never replaces that HTTP deadline. Per-page request budgets and separate continuation requests retain their existing boundaries.],
+      [Every ordinary request lists both application/json and text/event-stream in Accept and reads either response form. From an event stream the client skips notifications, returns the first JSON-RPC response and closes the stream, so a stream the server leaves open does not hold the call. Bytes read from the stream count against the response limit. Request-scoped progress is not yet surfaced to the caller.],
     )
     #behavior(title: "Blocked client headers cannot outlive their request", area: "HTTP client lifetime", level: "interface")[
       #given[A dynamic header callback has entered and has not returned.]
