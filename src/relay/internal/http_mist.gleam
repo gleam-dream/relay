@@ -31,23 +31,7 @@ pub type Reply {
     write_budget: fn() -> Result(Int, Nil),
     written: fn(Event) -> Nil,
     attached: fn(process.Pid) -> Bool,
-    lifetime: Lifetime,
   )
-}
-
-/// How a streamed response ends. The writer owns the socket and closes it
-/// when the stream ends, so no client may reuse the connection afterwards.
-pub type Lifetime {
-  /// A response that completes: the writer sends the final chunk and then
-  /// closes the connection, and the head says `connection: close`.
-  Finite
-  /// A subscription, open until its owner ends it. The head does not say
-  /// `connection: close`: a client that reads it may end the open response
-  /// on its own graceful-close timer (gun's `closing_timeout` ends it after
-  /// 15 s). When the server ends the stream, the writer closes the socket
-  /// before the final chunk, so the response never completes and no client
-  /// reuses the connection.
-  Open
 }
 
 pub type Event {
@@ -98,7 +82,6 @@ fn handle(
           write_budget,
           written,
           attached,
-          lifetime,
         ) -> {
           case write_budget() {
             Error(Nil) -> {
@@ -119,7 +102,6 @@ fn handle(
                 written,
                 attached,
                 closed,
-                lifetime,
               )
             }
           }
@@ -189,19 +171,16 @@ fn stream(
   written: fn(Event) -> Nil,
   attached: fn(process.Pid) -> Bool,
   closed: process.Selector(Nil),
-  lifetime: Lifetime,
 ) -> Response(mist.ResponseData) {
   // `closed` selects the closure message armed on the socket before the
   // reply was computed. The chunk process becomes the socket's controlling
   // process, so the message arrives here and ends a silent stream at once
   // instead of at its next keepalive write.
-  let head = case lifetime {
-    Finite -> response.set_header(head, "connection", "close")
-    Open -> head
-  }
+  // The chunk process owns the socket and closes it when the stream ends,
+  // so the response must tell the client not to reuse the connection.
   mist.chunked(
     request: request,
-    response: head,
+    response: response.set_header(head, "connection", "close"),
     init: fn(subject) {
       // Mist starts this process through its factory. Refuse initialization
       // unless the request owner has registered its lifetime before first pull.
@@ -217,14 +196,9 @@ fn stream(
           mist.chunk_stop()
         }
         Ended ->
-          case lifetime, write_budget() {
-            Open, _ -> {
-              close_connection(connection)
-              mist.chunk_stop()
-            }
-            Finite, Error(Nil) ->
-              mist.chunk_stop_abnormal("Relay request ended")
-            Finite, Ok(timeout) -> {
+          case write_budget() {
+            Error(Nil) -> mist.chunk_stop_abnormal("Relay request ended")
+            Ok(timeout) -> {
               let _ = set_send_timeout(connection, timeout)
               mist.chunk_stop()
             }
@@ -355,11 +329,9 @@ pub fn stop(listener: process.Pid) -> Nil {
 @external(erlang, "relay_ffi", "stop_supervisor")
 fn stop_supervisor(pid: process.Pid) -> Nil
 
-// mist offers no public way to set socket options, arm a closure message or
-// close the socket; these read its connection record and fail safely when the
-// record shape changes.
-@external(erlang, "relay_ffi", "close_connection")
-fn close_connection(connection: mist.Connection) -> Nil
+// mist offers no public way to set socket options or to arm a closure
+// message; both read its connection record and fail safely when the record
+// shape changes.
 
 @external(erlang, "relay_ffi", "watch_client_close")
 fn watch_client_close(connection: mist.Connection) -> Result(Nil, Nil)

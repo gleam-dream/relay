@@ -1572,10 +1572,10 @@ fn churn(handler: http.Handler(Nil), remaining: Int) -> Nil {
   }
 }
 
-// A subscription never completes: when the endpoint ends it, here because
-// its events outgrow the response limit, the response stops without its
-// final chunk, so no client reuses the connection.
-pub fn http_subscription_ended_by_the_endpoint_never_completes_test() {
+// When the endpoint ends a subscription, here because its events outgrow
+// the response limit, the response completes with its final chunk; its head
+// said `connection: close`, so no client reuses the connection.
+pub fn http_subscription_ended_by_the_endpoint_completes_its_response_test() {
   let #(handler, url) =
     start_http_with(
       http.new(server.new([]))
@@ -1592,7 +1592,7 @@ pub fn http_subscription_ended_by_the_endpoint_never_completes_test() {
       )
   })
   let assert Error(ended) = await_end(subscription, 3)
-  let assert client.ConnectionClosed(client.MaybeSent) = client.reason(ended)
+  let assert client.ConnectionClosed(client.Completed) = client.reason(ended)
   client.close(peer)
   http.stop(handler)
 }

@@ -565,7 +565,6 @@ fn wrap_stream(
     budget,
     written,
     _attached,
-    lifetime,
   ) = reply
   let assert Ok(per_write) = budget()
   http_mist.Streamed(
@@ -586,7 +585,6 @@ fn wrap_stream(
       }
     },
     fn(pid) { attach_stream(scope, pid) },
-    lifetime,
   )
 }
 

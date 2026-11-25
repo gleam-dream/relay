@@ -30,7 +30,6 @@
     git_head/1,
     watch_client_close/1,
     set_send_timeout/2,
-    close_connection/1,
     decode_base64_strict/1,
     start_stdio_client_port/4,
     send_stdio_client_command/2,
@@ -71,18 +70,6 @@ watch_client_close({connection, _Body, Socket, Transport, _Factory}) ->
     end;
 watch_client_close(_) ->
     {error, nil}.
-
-%% Closes a mist connection's socket. A subscription stream that the server
-%% ends closes its socket before mist's final chunk, so the response never
-%% completes and no client reuses the connection.
-close_connection({connection, _Body, Socket, Transport, _Factory}) ->
-    _ = case Transport of
-        tcp -> gen_tcp:close(Socket);
-        ssl -> ssl:close(Socket)
-    end,
-    nil;
-close_connection(_) ->
-    nil.
 
 decode_base64_strict(Encoded) when is_binary(Encoded) ->
     try
