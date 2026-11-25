@@ -1008,21 +1008,42 @@ fn http_peer(
           |> http_gun.with_body_limit(budget.max_bytes, http_gun.Fail)
           |> http_gun.with_additional_cancellation(http_owner.token(owner))
         let outcome =
-          http_gun.send(client, build(out, "application/json", budget, headers))
+          http_gun.with_response(
+            client,
+            build(out, "application/json, text/event-stream", budget, headers),
+            gun_failure(_, budget.max_bytes, budget.correlation),
+            fn(response) {
+              let answer = case
+                response.status,
+                is_event_stream(response.headers)
+              {
+                200, True ->
+                  stream_response(
+                    response.body,
+                    <<>>,
+                    0,
+                    budget.max_bytes,
+                    budget.correlation,
+                  )
+                _, _ ->
+                  body.collect(response.body, budget.max_bytes)
+                  |> result.map(fn(collected) { collected.bytes })
+                  |> result.map_error(gun_failure(
+                    _,
+                    budget.max_bytes,
+                    budget.correlation,
+                  ))
+              }
+              use bytes <- result.map(answer)
+              Incoming(
+                response.status,
+                bytes,
+                www_authenticate(response.headers),
+              )
+            },
+          )
         let stopped = http_owner.finish(owner)
-        case outcome {
-          Ok(buffered) ->
-            Ok(Incoming(
-              buffered.response.status,
-              buffered.response.body,
-              www_authenticate(buffered.response.headers),
-            ))
-          Error(failure) ->
-            Error(owned_failure(
-              gun_failure(failure, budget.max_bytes, budget.correlation),
-              stopped,
-            ))
-        }
+        result.map_error(outcome, owned_failure(_, stopped))
       },
       listen: fn(out, budget) {
         use #(headers, owner) <- result.try(acquire(budget))
@@ -1171,6 +1192,114 @@ fn gun_failure(
     gun_error.Unavailable | gun_error.Misuse | gun_error.Playback ->
       Failed(ConnectionClosed(evidence), call)
   }
+}
+
+fn is_event_stream(headers: List(#(String, String))) -> Bool {
+  case list.key_find(headers, "content-type") {
+    Ok(value) ->
+      string.starts_with(
+        string.lowercase(string.trim(value)),
+        "text/event-stream",
+      )
+    Error(Nil) -> False
+  }
+}
+
+// Reads a request-scoped event stream up to the JSON-RPC response and
+// returns that frame. Notifications that precede it, such as
+// `notifications/progress`, are skipped. The caller closes the stream, so a
+// server that keeps it open after the response does not hold the call.
+// `read` counts the bytes taken from the stream against `limit`.
+fn stream_response(
+  stream: body.Body,
+  pending: BitArray,
+  read: Int,
+  limit: Int,
+  call: Correlation,
+) -> Result(BitArray, Error) {
+  case split_event(pending) {
+    Some(#(event, rest)) ->
+      case event_data(event) {
+        Some(data) ->
+          case is_notification(data) {
+            True -> stream_response(stream, rest, read, limit, call)
+            False -> Ok(data)
+          }
+        None -> stream_response(stream, rest, read, limit, call)
+      }
+    None -> {
+      use #(pending, read) <- result.try(read_to_blank_line(
+        stream,
+        pending,
+        AtText,
+        read,
+        limit,
+        call,
+      ))
+      stream_response(stream, pending, read, limit, call)
+    }
+  }
+}
+
+// Where a scan for the blank line that ends an event stands.
+type LineEnd {
+  AtText
+  AfterNewline
+  AfterNewlineReturn
+}
+
+// Appends chunks to `pending` until one completes a blank line, scanning
+// each chunk once, so a large event costs time linear in its size.
+fn read_to_blank_line(
+  stream: body.Body,
+  pending: BitArray,
+  at: LineEnd,
+  read: Int,
+  limit: Int,
+  call: Correlation,
+) -> Result(#(BitArray, Int), Error) {
+  case read > limit {
+    True -> Error(Failed(ResponseTooLarge(limit), call))
+    False ->
+      case body.next(stream) {
+        Ok(body.Chunk(chunk)) -> {
+          let pending = bit_array.append(pending, chunk)
+          let read = read + bit_array.byte_size(chunk)
+          case blank_line(chunk, at) {
+            Ok(Nil) -> Ok(#(pending, read))
+            Error(at) ->
+              read_to_blank_line(stream, pending, at, read, limit, call)
+          }
+        }
+        Ok(body.End(_)) -> Error(Failed(ConnectionClosed(MaybeSent), call))
+        Error(failure) -> Error(gun_failure(failure, limit, call))
+      }
+  }
+}
+
+// `Ok` when `chunk` completes a blank line (`\n\n` or `\n\r\n`), else where
+// the scan stands at its end.
+fn blank_line(chunk: BitArray, at: LineEnd) -> Result(Nil, LineEnd) {
+  case chunk, at {
+    <<>>, _ -> Error(at)
+    <<"\n", _:bits>>, AfterNewline | <<"\n", _:bits>>, AfterNewlineReturn ->
+      Ok(Nil)
+    <<"\n", rest:bits>>, AtText -> blank_line(rest, AfterNewline)
+    <<"\r", rest:bits>>, AfterNewline -> blank_line(rest, AfterNewlineReturn)
+    <<_, rest:bits>>, _ -> blank_line(rest, AtText)
+    _, _ -> Error(at)
+  }
+}
+
+// A frame with a `method` is a notification on a response stream; the
+// response itself has none.
+fn is_notification(frame: BitArray) -> Bool {
+  bit_array.to_string(frame)
+  |> result.try(fn(text) {
+    json.parse(text, decode.at(["method"], decode.string))
+    |> result.replace_error(Nil)
+  })
+  |> result.is_ok
 }
 
 // Server-sent events: blank-line separated, `data:` lines joined, comments
