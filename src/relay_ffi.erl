@@ -232,16 +232,20 @@ rescue_run(Fun) ->
     end.
 
 set_stdio_binary() ->
-    io:setopts(standard_io, [{binary, true}, {encoding, utf8}]),
+    %% Latin-1 makes the I/O server pass every input byte through as one
+    %% character, valid UTF-8 or not; Relay writes its output to the raw
+    %% device, which this encoding does not touch.
+    io:setopts(standard_io, [{binary, true}, {encoding, latin1}]),
     io:setopts(standard_error, [{binary, true}, {encoding, utf8}]),
     enable_raw_stdin(),
     {ok, nil}.
 
 close_stdin() ->
     case erase(relay_stdio_input) of
-        undefined -> ok;
-        Device -> file:close(Device)
+        {port, Port} -> try erlang:port_close(Port) catch error:_ -> ok end;
+        _ -> ok
     end,
+    erase(relay_stdio_pending),
     nil.
 
 enable_raw_stdin() ->
@@ -261,36 +265,80 @@ enable_raw_stdin() ->
         _:_ -> ok
     end.
 
+%% Returns the next bytes of standard input, at most ChunkSize of them, as
+%% soon as any are available. A raw file read of standard input waits for
+%% its whole count, so a request shorter than one chunk would not be seen
+%% until more input or end of file arrived. Input is therefore taken from
+%% whichever reader the VM offers, and handed out in chunks from the calling
+%% process's dictionary:
+%%
+%% - Normally the `user` I/O server owns descriptor 0. It is asked for one
+%%   line at a time and reads the pipe only while a request is pending, so
+%%   an unread pipe holds the parent. It returns a line whole, however long,
+%%   so the frame limit applies after the line is in memory.
+%% - Under `-noinput` no I/O server reads standard input. A port in stream
+%%   mode on descriptor 0, owned by the calling process, delivers input as
+%%   the parent writes it; a failing port takes its linked owner down.
 read_stdin(ChunkSize) when ChunkSize =< 0 ->
     {read_failed, <<"stdin chunk limit must be positive">>};
 read_stdin(ChunkSize) ->
-    case ensure_stdin_input() of
-        {ok, Device} ->
-            read_stdin_result(ChunkSize, file:read(Device, ChunkSize));
-        {error, Reason} ->
-            {read_failed, unicode:characters_to_binary(io_lib:format("~p", [Reason]))}
+    case get(relay_stdio_pending) of
+        <<Chunk:ChunkSize/binary, Rest/binary>> ->
+            put(relay_stdio_pending, Rest),
+            {read_chunk, Chunk};
+        <<_, _/binary>> = Chunk ->
+            erase(relay_stdio_pending),
+            {read_chunk, Chunk};
+        _ ->
+            case more_stdin(ensure_stdin_input()) of
+                {ok, Data} ->
+                    put(relay_stdio_pending, Data),
+                    read_stdin(ChunkSize);
+                Outcome ->
+                    Outcome
+            end
     end.
+
+more_stdin(io_server) ->
+    case io:get_line(standard_io, '') of
+        eof -> read_eof;
+        {error, Reason} -> {read_failed, printable(Reason)};
+        %% `set_stdio_binary` made each input byte one Latin-1 character,
+        %% which a binary result carries as UTF-8; this restores the bytes.
+        Line when is_binary(Line) ->
+            case unicode:characters_to_binary(Line, utf8, latin1) of
+                Bytes when is_binary(Bytes) -> {ok, Bytes};
+                _ -> {read_failed, <<"stdin returned an invalid line">>}
+            end;
+        Line when is_list(Line) ->
+            try {ok, list_to_binary(Line)}
+            catch error:badarg -> {read_failed, <<"stdin returned an invalid line">>}
+            end
+    end;
+more_stdin({port, Port}) ->
+    receive
+        {Port, {data, Data}} -> {ok, Data};
+        {Port, eof} -> read_eof
+    end;
+more_stdin({error, Reason}) ->
+    {read_failed, printable(Reason)}.
 
 ensure_stdin_input() ->
     case get(relay_stdio_input) of
         undefined ->
-            case file:open("/dev/stdin", [read, binary, raw]) of
-                {ok, Device} ->
-                    put(relay_stdio_input, Device),
-                    {ok, Device};
-                {error, Reason} -> {error, Reason}
-            end;
-        Device -> {ok, Device}
+            Input = case init:get_argument(noinput) of
+                error -> io_server;
+                {ok, _} ->
+                    try erlang:open_port({fd, 0, 1}, [in, binary, stream, eof]) of
+                        Port -> {port, Port}
+                    catch
+                        error:Reason -> {error, Reason}
+                    end
+            end,
+            put(relay_stdio_input, Input),
+            Input;
+        Input -> Input
     end.
-
-read_stdin_result(ChunkSize, {ok, Data}) when is_binary(Data), byte_size(Data) =< ChunkSize ->
-    {read_chunk, Data};
-read_stdin_result(_ChunkSize, eof) ->
-    read_eof;
-read_stdin_result(_ChunkSize, {error, Reason}) ->
-    {read_failed, unicode:characters_to_binary(io_lib:format("~p", [Reason]))};
-read_stdin_result(_ChunkSize, _) ->
-    {read_failed, <<"stdin returned an invalid chunk">>}.
 
 mailbox_size(Pid) when is_pid(Pid) ->
     case erlang:process_info(Pid, message_queue_len) of

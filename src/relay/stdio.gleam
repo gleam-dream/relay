@@ -47,7 +47,8 @@ pub fn config() -> Config {
   Config(chunk_size: 4096, runtime: runtime.config())
 }
 
-/// The largest chunk read from standard input at once.
+/// The largest piece of standard input framed at once. Input is taken as
+/// soon as it arrives, so a request shorter than one chunk is not held back.
 pub fn with_chunk_size(config: Config, bytes: Int) -> Config {
   Config(..config, chunk_size: bytes)
 }

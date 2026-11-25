@@ -90,6 +90,73 @@ fn at(message: Dynamic, path: List(String), decoder: decode.Decoder(a)) -> a {
   found
 }
 
+// --- default settings over a real pipe ---------------------------------------
+
+// The server with default settings. `flag` selects who reads standard
+// input in the child: the `user` I/O server (`-noshell`) or nobody
+// (`-noinput`), where Relay reads the descriptor itself.
+fn default_runner(flag: String) -> String {
+  "erl -pa build/dev/erlang/*/ebin "
+  <> flag
+  <> " -run relay_stdio_default_runner main"
+}
+
+fn size_request(id: String, bytes: Int) -> BitArray {
+  request_line(id, "tools/call", [
+    #("name", json.string("size")),
+    #(
+      "arguments",
+      json.object([#("text", json.string(string.repeat("x", bytes)))]),
+    ),
+  ])
+}
+
+pub fn default_settings_answer_a_small_request_while_stdin_stays_open_test() {
+  answers_while_stdin_stays_open("-noshell")
+}
+
+pub fn default_settings_answer_a_small_request_without_an_io_server_test() {
+  answers_while_stdin_stays_open("-noinput")
+}
+
+fn answers_while_stdin_stays_open(flag: String) -> Nil {
+  let child = spawn_child(default_runner(flag))
+  // Far less than one read chunk, and the pipe stays open afterwards.
+  send_to_child(child, size_request("small", 5))
+  let small = read_one(child)
+  assert at(small, ["id"], decode.string) == "small"
+  assert at(small, ["result", "structuredContent"], decode.int) == 5
+
+  // A request of many chunks, then another small one on the same pipe.
+  send_to_child(child, size_request("large", 300_000))
+  let large = read_one(child)
+  assert at(large, ["result", "structuredContent"], decode.int) == 300_000
+  send_to_child(child, size_request("again", 7))
+  assert at(read_one(child), ["result", "structuredContent"], decode.int) == 7
+  close_child(child)
+}
+
+pub fn default_settings_stop_cleanly_when_stdin_closes_test() {
+  stops_cleanly_when_stdin_closes("-noshell")
+  stops_cleanly_when_stdin_closes("-noinput")
+}
+
+fn stops_cleanly_when_stdin_closes(flag: String) -> Nil {
+  // `printf` writes one request and exits, which closes the server's input.
+  let request =
+    "{\"jsonrpc\":\"2.0\",\"id\":\"eof\",\"method\":\"server/discover\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{}}}}"
+  let child =
+    spawn_child(
+      "sh -c 'printf \"%s\\n\" \"$0\" | "
+      <> default_runner(flag)
+      <> "' '"
+      <> request
+      <> "'",
+    )
+  assert at(read_one(child), ["id"], decode.string) == "eof"
+  expect_exit(child, 0)
+}
+
 // --- configuration -----------------------------------------------------------
 
 pub fn stdio_rejects_invalid_settings_before_io_test() {
