@@ -1572,6 +1572,54 @@ fn churn(handler: http.Handler(Nil), remaining: Int) -> Nil {
   }
 }
 
+// A subscription never completes: when the endpoint ends it, here because
+// its events outgrow the response limit, the response stops without its
+// final chunk, so no client reuses the connection.
+pub fn http_subscription_ended_by_the_endpoint_never_completes_test() {
+  let #(handler, url) =
+    start_http_with(
+      http.new(server.new([]))
+      |> http.with_max_response_bytes(400),
+    )
+  let peer = connect_url(url)
+  let assert Ok(subscription) =
+    client.listen(peer, [subscriptions.ToolsListChanged])
+  list.each(["one", "two", "three", "four"], fn(name) {
+    let assert Ok(Nil) =
+      http.register_tool(
+        handler,
+        tool.define(name, named_input(), codec.string()) |> tool.handle(Ok),
+      )
+  })
+  let assert Error(ended) = await_end(subscription, 3)
+  let assert client.ConnectionClosed(client.MaybeSent) = client.reason(ended)
+  client.close(peer)
+  http.stop(handler)
+}
+
+fn await_end(
+  subscription: client.Subscription,
+  seconds: Int,
+) -> Result(Nil, client.Error) {
+  let elapsed = process.new_subject()
+  process.send_after(elapsed, seconds * 1000, Nil)
+  end_before(subscription, elapsed)
+}
+
+fn end_before(
+  subscription: client.Subscription,
+  elapsed: Subject(Nil),
+) -> Result(Nil, client.Error) {
+  case process.receive(elapsed, 0) {
+    Ok(Nil) -> Ok(Nil)
+    Error(Nil) ->
+      case client.next_notification(subscription, duration.seconds(1)) {
+        Ok(_) -> end_before(subscription, elapsed)
+        Error(error) -> Error(error)
+      }
+  }
+}
+
 // gleeunit stops a plain test after 5 s; this generator form allows 60 s.
 pub fn http_subscription_outlives_the_peer_graceful_close_window_test_() {
   #(atom.create("timeout"), 60, fn() {

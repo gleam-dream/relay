@@ -1531,16 +1531,21 @@ fn run(
                     _ ->
                       case stream {
                         True -> {
-                          case route.method == "subscriptions/listen" {
-                            True ->
+                          let lifetime = case
+                            route.method == "subscriptions/listen"
+                          {
+                            True -> {
                               process.send(
                                 handler.subject,
                                 AddStream(lease.slot, rt, lease.generation),
                               )
-                            False -> Nil
+                              http_mist.Open
+                            }
+                            False -> http_mist.Finite
                           }
                           streamed(
                             broker,
+                            lifetime,
                             duration.to_milliseconds(config.sse_keepalive),
                             request_timeout_ms,
                           )
@@ -1562,6 +1567,7 @@ fn run(
 
 fn streamed(
   broker: Broker(context),
+  lifetime: http_mist.Lifetime,
   keepalive_ms: Int,
   write_budget_ms: Int,
 ) -> http_mist.Reply {
@@ -1577,6 +1583,7 @@ fn streamed(
     write_budget: fn() { Ok(write_budget_ms) },
     written: fn(_) { Nil },
     attached: fn(_) { True },
+    lifetime: lifetime,
   )
 }
 
