@@ -167,11 +167,15 @@ fn stream(
   written: fn(Event) -> Nil,
   attached: fn(process.Pid) -> Bool,
 ) -> Response(mist.ResponseData) {
-  // The chunk process owns the socket and closes it when the stream ends,
-  // so the response must tell the client not to reuse the connection.
+  // The chunk process owns the socket and closes it when the stream ends.
+  // The head must not carry `connection: close`: a client that reads it
+  // starts a graceful close and may end the still-open response on its own
+  // timer (gun's `closing_timeout` ends it after 15 s). Only the stream's
+  // owner ends the stream. A client that reuses the connection after the
+  // final chunk finds it closed, as after any server-side idle close.
   mist.chunked(
     request: request,
-    response: response.set_header(head, "connection", "close"),
+    response: head,
     init: fn(subject) {
       // Mist starts this process through its factory. Refuse initialization
       // unless the request owner has registered its lifetime before first pull.

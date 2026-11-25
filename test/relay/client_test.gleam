@@ -1589,8 +1589,8 @@ pub fn http_subscription_outlives_the_peer_graceful_close_window_test_() {
       tool.define("late", named_input(), codec.string())
       |> tool.handle(fn(_) { Ok("late") })
     let assert Ok(Nil) = http.register_tool(handler, late)
-    let assert Ok(Some(subscriptions.ToolsListChanged)) =
-      client.next_notification(subscription, duration.seconds(2))
+    let assert Ok(subscriptions.ToolsListChanged) =
+      await_notification(subscription, 3)
     client.close_subscription(subscription)
     client.close(peer)
     http.stop(handler)
@@ -1611,6 +1611,31 @@ fn wait_idle(subscription: client.Subscription, elapsed: Subject(Nil)) -> Nil {
         client.next_notification(subscription, duration.seconds(1))
       wait_idle(subscription, elapsed)
     }
+  }
+}
+
+// A keepalive comment ends a `next_notification` wait early with `Ok(None)`.
+fn await_notification(
+  subscription: client.Subscription,
+  seconds: Int,
+) -> Result(subscriptions.Notification, Nil) {
+  let elapsed = process.new_subject()
+  process.send_after(elapsed, seconds * 1000, Nil)
+  next_before(subscription, elapsed)
+}
+
+fn next_before(
+  subscription: client.Subscription,
+  elapsed: Subject(Nil),
+) -> Result(subscriptions.Notification, Nil) {
+  case process.receive(elapsed, 0) {
+    Ok(Nil) -> Error(Nil)
+    Error(Nil) ->
+      case client.next_notification(subscription, duration.seconds(1)) {
+        Ok(Some(notification)) -> Ok(notification)
+        Ok(None) -> next_before(subscription, elapsed)
+        Error(_) -> Error(Nil)
+      }
   }
 }
 

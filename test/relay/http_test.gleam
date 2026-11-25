@@ -734,7 +734,9 @@ pub fn progress_streams_events_before_the_result_test() {
   |> should.equal(Ok("text/event-stream"))
   list.key_find(response_headers, "transfer-encoding")
   |> should.equal(Ok("chunked"))
-  list.key_find(response_headers, "connection") |> should.equal(Ok("close"))
+  // A `connection: close` head would let a client end the open stream on
+  // its own graceful-close timer.
+  list.key_find(response_headers, "connection") |> should.equal(Error(Nil))
   let body = text(body)
   let events =
     string.split(body, "\n\n")
