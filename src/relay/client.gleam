@@ -101,6 +101,7 @@ import relay/internal/carrier
 import relay/internal/client_http_owner as http_owner
 import relay/internal/core
 import relay/internal/emit
+import relay/internal/header_value
 import relay/internal/protocol/v2026_07_28 as v2026
 import relay/internal/subscriptions_state as subs
 import relay/internal/transport/stdio_client
@@ -973,7 +974,7 @@ fn http_peer(
       |> request.set_header("mcp-method", out.method)
     let base = case out.name {
       Some(name) ->
-        request.set_header(base, "mcp-name", uri.percent_encode(name))
+        request.set_header(base, "mcp-name", header_value.encode(name))
       None -> base
     }
     let base = case carried(budget) {

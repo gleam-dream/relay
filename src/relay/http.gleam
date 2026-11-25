@@ -93,7 +93,6 @@ import gleam/result
 import gleam/set
 import gleam/string
 import gleam/time/duration.{type Duration}
-import gleam/uri
 import json/blueprint/value
 import mist
 import relay/authorization.{
@@ -101,6 +100,7 @@ import relay/authorization.{
 }
 import relay/internal/carrier
 import relay/internal/emit
+import relay/internal/header_value
 import relay/internal/held.{type Held}
 import relay/internal/http_mist
 import relay/internal/jsonrpc
@@ -1983,26 +1983,20 @@ fn valid_route_headers(
     Some(_), Error(Nil) -> False
     None, _ -> True
   }
-  case header("mcp-method") {
+  // `Mcp-Method` is compared as sent. `Mcp-Name` may also arrive in the
+  // Base64 form, which is decoded first. Neither is percent-decoded: a header
+  // that differs from the body after that is a mismatch.
+  let method_matches = case header("mcp-method") {
+    Ok(method) -> string.trim(method) == route.method
     Error(Nil) -> False
-    Ok(method) ->
-      case uri.percent_decode(string.trim(method)) {
-        Error(Nil) -> False
-        Ok(method) -> {
-          let name_matches = case route.name, header("mcp-name") {
-            Some(name), Ok(sent) ->
-              case uri.percent_decode(string.trim(sent)) {
-                Ok(sent) -> sent == name
-                Error(Nil) -> False
-              }
-            Some(_), Error(Nil) -> False
-            None, Error(Nil) -> True
-            None, Ok(_) -> False
-          }
-          method == route.method && name_matches && version_matches
-        }
-      }
   }
+  let name_matches = case route.name, header("mcp-name") {
+    Some(name), Ok(sent) -> header_value.decode(string.trim(sent)) == Ok(name)
+    Some(_), Error(Nil) -> False
+    None, Error(Nil) -> True
+    None, Ok(_) -> False
+  }
+  method_matches && name_matches && version_matches
 }
 
 // A property whose schema declares `x-mcp-header` must arrive both in the
@@ -2061,29 +2055,13 @@ fn parameter_header_matches(
           case argument, header {
             Error(Nil), Error(Nil) -> True
             Ok(value.String(expected)), Ok(raw) ->
-              decode_parameter_header(string.trim(raw)) == Ok(expected)
+              header_value.decode(string.trim(raw)) == Ok(expected)
             _, _ -> False
           }
         }
         _ -> True
       }
     _ -> True
-  }
-}
-
-@external(erlang, "relay_ffi", "decode_base64_strict")
-fn decode_base64_strict(encoded: String) -> Result(String, Nil)
-
-fn decode_parameter_header(raw: String) -> Result(String, Nil) {
-  let prefix = "=?base64?"
-  let suffix = "?="
-  case string.starts_with(raw, prefix) && string.ends_with(raw, suffix) {
-    True ->
-      raw
-      |> string.drop_start(string.length(prefix))
-      |> string.drop_end(string.length(suffix))
-      |> decode_base64_strict
-    False -> Ok(raw)
   }
 }
 
