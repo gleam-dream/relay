@@ -1620,6 +1620,37 @@ fn end_before(
   }
 }
 
+// A streamed call's head says `connection: close`. Gun once ended such a
+// response on its own 15 s graceful-close timer; only the call's deadline
+// may end it now. gleeunit stops a plain test after 5 s; this allows 60 s.
+pub fn http_streamed_call_outlives_the_peer_graceful_close_window_test_() {
+  #(atom.create("timeout"), 60, fn() {
+    let long =
+      tool.define("long", named_input(), codec.string())
+      |> tool.handle(fn(name) {
+        process.sleep(17_000)
+        Ok("done " <> name)
+      })
+    let #(handler, url) =
+      start_http_with(
+        http.new(server.new([long]))
+        |> http.with_request_timeout(duration.seconds(40))
+        |> http.with_sse_keepalive(duration.seconds(1)),
+      )
+    let assert Ok(config) = client.http(url)
+    let assert Ok(peer) =
+      config |> client.with_timeout(duration.seconds(40)) |> client.connect
+    let assert Ok(client.Succeeded("done Ada", _)) =
+      client.call(
+        peer,
+        tool.define("long", named_input(), codec.string()),
+        "Ada",
+      )
+    client.close(peer)
+    http.stop(handler)
+  })
+}
+
 // gleeunit stops a plain test after 5 s; this generator form allows 60 s.
 pub fn http_subscription_outlives_the_peer_graceful_close_window_test_() {
   #(atom.create("timeout"), 60, fn() {
