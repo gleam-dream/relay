@@ -494,7 +494,9 @@ const call_timeout = 5000
 /// correlation the transport built for it. With `None`, the runtime uses
 /// the correlation the frame carries in `_meta`, or a fresh one. Returns
 /// once the runtime has admitted or refused the frame; responses arrive
-/// through the sink.
+/// through the sink. The wait lasts as long as the runtime is busy, which is
+/// how a slow sink holds the transport's reader; a runtime that has exited
+/// answers `RuntimeStopped`.
 pub fn send_frame(
   runtime: Runtime(context),
   exchange: ExchangeId,
@@ -503,9 +505,29 @@ pub fn send_frame(
   correlation: Option(Correlation),
 ) -> Result(Nil, FrameError) {
   let Runtime(subject) = runtime
-  process.call(subject, waiting: call_timeout, sending: fn(reply) {
-    ReceiveFrame(exchange, context, bytes, correlation, reply)
-  })
+  // The wait has no timeout: a runtime that is busy, for example writing to
+  // a slow sink, holds the transport's reader, which is the back-pressure
+  // on the peer. A runtime that is gone answers `RuntimeStopped`.
+  case process.subject_owner(subject) {
+    Error(Nil) -> Error(RuntimeStopped)
+    Ok(owner) -> {
+      let monitor = process.monitor(owner)
+      let reply = process.new_subject()
+      process.send(
+        subject,
+        ReceiveFrame(exchange, context, bytes, correlation, reply),
+      )
+      let admitted =
+        process.new_selector()
+        |> process.select(reply)
+        |> process.select_specific_monitor(monitor, fn(_) {
+          Error(RuntimeStopped)
+        })
+        |> process.selector_receive_forever
+      process.demonitor_process(monitor)
+      admitted
+    }
+  }
 }
 
 /// Reports that the peer closed one exchange; its invocation is cancelled

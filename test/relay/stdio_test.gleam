@@ -1,6 +1,7 @@
 import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
+import gleam/erlang/process
 import gleam/json
 import gleam/list
 import gleam/string
@@ -88,6 +89,82 @@ fn read_one(child: Dynamic) -> Dynamic {
 fn at(message: Dynamic, path: List(String), decoder: decode.Decoder(a)) -> a {
   let assert Ok(found) = decode.run(message, decode.at(path, decoder))
   found
+}
+
+// --- output pressure -----------------------------------------------------------
+
+const pressure_runner =
+  "erl -pa build/dev/erlang/*/ebin -noshell -run relay_stdio_pressure_runner main"
+
+// Reads from the child until its output contains `wanted` and returns all of
+// it, or what arrived when the child went quiet for `quiet_ms`.
+fn read_until(
+  child: Dynamic,
+  wanted: String,
+  quiet_ms: Int,
+  seen: String,
+) -> String {
+  case string.contains(seen, wanted) {
+    True -> seen
+    False ->
+      case receive_from_child(child, quiet_ms) {
+        Ok(chunk) -> {
+          let assert Ok(text) = bit_array.to_string(chunk)
+          read_until(child, wanted, quiet_ms, seen <> text)
+        }
+        Error(_) -> seen
+      }
+  }
+}
+
+pub fn stalled_stdout_stops_the_server_with_a_typed_error_test() {
+  // The server's standard output is a pipe that `sleep` never reads. Its
+  // standard error and exit status come back on descriptor 3.
+  let child =
+    spawn_child(
+      "sh -c '{ { "
+      <> pressure_runner
+      <> " 2>&3; echo \"exit=$?\" >&3; } | sleep 20; } 3>&1'",
+    )
+  send_to_child(
+    child,
+    request_line("big", "tools/call", [
+      #("name", json.string("big")),
+      #("arguments", json.object([#("bytes", json.int(2_000_000))])),
+    ]),
+  )
+  let report = read_until(child, "exit=", 9000, "")
+  close_child(child)
+  assert string.contains(
+    report,
+    "stopped: standard output failed while writing a reply",
+  )
+  assert string.contains(report, "exit=1")
+}
+
+pub fn request_beyond_the_exchange_limit_gets_an_error_response_test() {
+  let child = spawn_child(pressure_runner)
+  send_to_child(
+    child,
+    request_line("first", "tools/call", [
+      #("name", json.string("slow")),
+      #("arguments", json.object([#("ms", json.int(500))])),
+    ]),
+  )
+  send_to_child(
+    child,
+    request_line("second", "tools/call", [
+      #("name", json.string("slow")),
+      #("arguments", json.object([#("ms", json.int(0))])),
+    ]),
+  )
+  let assert [refused, answered] = read_lines(child, 2)
+  close_child(child)
+  assert at(refused, ["id"], decode.string) == "second"
+  assert at(refused, ["error", "code"], decode.int) == -32_000
+  assert at(answered, ["id"], decode.string) == "first"
+  assert at(answered, ["result", "structuredContent"], decode.string)
+    == "slow response"
 }
 
 // --- configuration -----------------------------------------------------------
@@ -197,9 +274,24 @@ pub fn framer_incomplete_eof_test() {
 pub fn writer_failure_is_returned_to_the_caller_test() {
   let assert Ok(writer) =
     stdio_frames.start_writer(fn(_bytes) { Error("closed pipe") })
-  let assert Error("closed pipe") =
-    stdio_frames.write_bytes(writer, <<"response\n">>)
-  stdio_frames.stop_writer(writer)
+  let assert Error(stdio_frames.SinkFailed("closed pipe")) =
+    stdio_frames.write_bytes(writer, <<"response\n">>, 1000)
+  stdio_frames.stop_writer(writer, 1000)
+}
+
+pub fn stalled_writer_times_out_and_then_fails_at_once_test() {
+  let release = process.new_subject()
+  let assert Ok(writer) =
+    stdio_frames.start_writer(fn(_bytes) {
+      // A sink that never returns, like a write to a full pipe.
+      process.receive_forever(release)
+    })
+  let assert Error(stdio_frames.WriteTimedOut) =
+    stdio_frames.write_bytes(writer, <<"first\n">>, 50)
+  // The stuck writer is gone: a later write does not wait for its timeout.
+  let assert Error(stdio_frames.WriterStopped) =
+    stdio_frames.write_bytes(writer, <<"second\n">>, 60_000)
+  stdio_frames.stop_writer(writer, 60_000)
 }
 
 // --- a spawned child over OS pipes -------------------------------------------

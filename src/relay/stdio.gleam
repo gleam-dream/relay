@@ -22,12 +22,25 @@
 //// | --- | --- | --- |
 //// | read chunk | 4 KiB | `with_chunk_size` |
 //// | frame, depth, handler limits | `relay/runtime.config()` | `with_runtime` |
+//// | one write to standard output | 5 s, then `StdoutBroken` | `with_write_timeout` |
+////
+//// ## Output pressure
+////
+//// Responses are written one at a time. A parent that reads slowly holds
+//// the write, and the write holds the runtime that produced the response.
+//// A write that does not finish within the write timeout ends `serve` with
+//// `StdoutBroken`; handlers still running are cancelled first. A request
+//// that arrives while the runtime's exchange limit is reached is answered
+//// with JSON-RPC error `-32000`.
 
 import gleam/bit_array
 import gleam/erlang/process.{type Pid, type Subject}
-import gleam/option.{None}
+import gleam/int
+import gleam/option.{None, Some}
 import gleam/result
+import gleam/time/duration.{type Duration}
 import relay/internal/emit
+import relay/internal/protocol/v2026_07_28 as v2026
 import relay/internal/stdio_frames.{
   type Framer, type ReadOutcome, type Writer, Frame, FrameOversized,
   InvalidTrailingBytes,
@@ -39,17 +52,27 @@ import relay/telemetry
 
 /// Stdio settings. Build with `config()` and the `with_*` setters.
 pub opaque type Config {
-  Config(chunk_size: Int, runtime: runtime.Config)
+  Config(chunk_size: Int, runtime: runtime.Config, write_timeout_ms: Int)
 }
 
 /// A 4 KiB read chunk and the default runtime limits.
 pub fn config() -> Config {
-  Config(chunk_size: 4096, runtime: runtime.config())
+  Config(chunk_size: 4096, runtime: runtime.config(), write_timeout_ms: 5000)
 }
 
 /// The largest chunk read from standard input at once.
 pub fn with_chunk_size(config: Config, bytes: Int) -> Config {
   Config(..config, chunk_size: bytes)
+}
+
+/// How long one write to standard output may take before the output counts
+/// as broken and `serve` stops with `StdoutBroken`. Default 5 s; a shorter
+/// value than 1 ms is treated as 1 ms.
+pub fn with_write_timeout(config: Config, timeout: Duration) -> Config {
+  Config(
+    ..config,
+    write_timeout_ms: int.max(1, duration.to_milliseconds(timeout)),
+  )
 }
 
 /// The runtime limits: frame size, nesting depth, handler timeout and the
@@ -64,7 +87,8 @@ pub type StdioError {
   InvalidRuntimeConfig(field: runtime.ConfigField)
   /// Standard input could not be switched to binary mode or read.
   ReadFailed
-  /// Standard output was closed or failed while writing a reply.
+  /// Standard output was closed, failed, or did not accept a reply within
+  /// the write timeout.
   StdoutBroken
   StartupFailed
   /// Standard input ended in the middle of a frame.
@@ -135,7 +159,7 @@ pub fn serve_with(
     case output {
       runtime.OutputClose(_) -> Ok(Nil)
       runtime.OutputWrite(_, bytes) ->
-        case stdio_frames.write_bytes(writer, bytes) {
+        case stdio_frames.write_bytes(writer, bytes, config.write_timeout_ms) {
           Ok(Nil) -> Ok(Nil)
           Error(_) -> {
             process.send(write_errors, StdoutBroken)
@@ -147,7 +171,7 @@ pub fn serve_with(
   // One runtime per OS process: hold the server so calls copy no tool.
   case runtime.start_holding(server, runtime_config, sink) {
     Error(_) -> {
-      stdio_frames.stop_writer(writer)
+      stdio_frames.stop_writer(writer, config.write_timeout_ms)
       close_stdin()
       Error(StartupFailed)
     }
@@ -155,11 +179,20 @@ pub fn serve_with(
       let framer =
         stdio_frames.new_framer(runtime.max_frame_bytes(runtime_config))
       let reader = start_reader(config.chunk_size)
-      let outcome = read_loop(rt, context, reader, writer, framer, write_errors)
+      let outcome =
+        read_loop(
+          rt,
+          context,
+          reader,
+          writer,
+          config.write_timeout_ms,
+          framer,
+          write_errors,
+        )
       process.kill(reader.0)
       runtime.close(rt)
       runtime.stop(rt)
-      stdio_frames.stop_writer(writer)
+      stdio_frames.stop_writer(writer, config.write_timeout_ms)
       close_stdin()
       use _ <- result.try(outcome)
       case process.receive(write_errors, 0) {
@@ -196,6 +229,7 @@ fn read_loop(
   context: context,
   reader: #(Pid, Subject(ReadOutcome)),
   writer: Writer,
+  write_timeout_ms: Int,
   framer: Framer,
   write_errors: Subject(StdioError),
 ) -> Result(Nil, StdioError) {
@@ -205,13 +239,13 @@ fn read_loop(
     |> process.select_map(reader.1, Stdin)
     |> process.select_map(write_errors, WriteFailed)
     |> process.select_specific_monitor(monitor, fn(_) { ReaderDown })
-  loop(rt, context, writer, framer, selector)
+  loop(rt, context, #(writer, write_timeout_ms), framer, selector)
 }
 
 fn loop(
   rt: Runtime(context),
   context: context,
-  writer: Writer,
+  writer: #(Writer, Int),
   framer: Framer,
   selector: process.Selector(Signal),
 ) -> Result(Nil, StdioError) {
@@ -244,7 +278,7 @@ const too_deep =
 fn submit(
   rt: Runtime(context),
   context: context,
-  writer: Writer,
+  writer: #(Writer, Int),
   frames: List(stdio_frames.FramerResult),
 ) -> Result(Nil, StdioError) {
   case frames {
@@ -264,7 +298,12 @@ fn submit(
             Ok(Nil) -> Ok(Nil)
             Error(runtime.FrameTooLarge(..)) -> write(writer, too_large)
             Error(runtime.FrameTooDeep(..)) -> write(writer, too_deep)
-            Error(_) -> Ok(Nil)
+            // The request is refused, not dropped: its caller gets an
+            // answer instead of waiting for its own timeout.
+            Error(runtime.TooManyLiveExchanges(..)) ->
+              refuse(writer, bytes, "Too many requests in progress")
+            Error(runtime.RuntimeStopped) ->
+              refuse(writer, bytes, "The server is stopping")
           }
         FrameOversized(..) -> {
           emit.frame_rejected(0, telemetry.FrameTooLarge, None)
@@ -278,7 +317,26 @@ fn submit(
   }
 }
 
-fn write(writer: Writer, line: String) -> Result(Nil, StdioError) {
-  stdio_frames.write_bytes(writer, bit_array.from_string(line))
+fn write(writer: #(Writer, Int), line: String) -> Result(Nil, StdioError) {
+  write_frame(writer, bit_array.from_string(line))
+}
+
+fn write_frame(
+  writer: #(Writer, Int),
+  bytes: BitArray,
+) -> Result(Nil, StdioError) {
+  stdio_frames.write_bytes(writer.0, bytes, writer.1)
   |> result.replace_error(StdoutBroken)
+}
+
+// Answers a request the runtime did not admit. A notification gets nothing.
+fn refuse(
+  writer: #(Writer, Int),
+  frame: BitArray,
+  message: String,
+) -> Result(Nil, StdioError) {
+  case v2026.encode_refusal(frame, message) {
+    Some(response) -> write_frame(writer, response)
+    None -> Ok(Nil)
+  }
 }

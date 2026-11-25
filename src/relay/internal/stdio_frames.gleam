@@ -1,10 +1,11 @@
 //// Newline framing and a serialized writer for stdio transports.
 
 import gleam/bit_array
-import gleam/erlang/process.{type Subject}
+import gleam/erlang/process.{type Pid, type Subject}
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
+import gleam/result
 
 pub type ReadOutcome {
   ReadChunk(BitArray)
@@ -156,17 +157,43 @@ fn strip_trailing_cr(line: BitArray) -> BitArray {
 type WriterMessage {
   WriteBytes(bytes: BitArray, reply: Subject(Result(Nil, String)))
   CloseWriter(reply: Subject(Nil))
+  OwnerDown
 }
 
 pub opaque type Writer {
-  Writer(subject: Subject(WriterMessage))
+  Writer(subject: Subject(WriterMessage), pid: Pid)
 }
 
+/// Why a write did not complete.
+pub type WriteError {
+  /// The sink reported this failure.
+  SinkFailed(reason: String)
+  /// The sink did not finish within the write timeout. The writer has been
+  /// stopped, so every later write fails with `WriterStopped` at once.
+  WriteTimedOut
+  /// The writer is not running.
+  WriterStopped
+}
+
+/// Starts a process that runs `sink` for one write at a time. The writer is
+/// not linked to its caller: it stops when the calling process exits, and a
+/// write that times out stops it.
 pub fn start_writer(
   sink: fn(BitArray) -> Result(Nil, String),
 ) -> Result(Writer, actor.StartError) {
+  let owner = process.self()
   let builder =
-    actor.new(Nil)
+    actor.new_with_initialiser(5000, fn(subject) {
+      let monitor = process.monitor(owner)
+      actor.initialised(Nil)
+      |> actor.selecting(
+        process.new_selector()
+        |> process.select(subject)
+        |> process.select_specific_monitor(monitor, fn(_) { OwnerDown }),
+      )
+      |> actor.returning(subject)
+      |> Ok
+    })
     |> actor.on_message(fn(_state, msg) {
       case msg {
         WriteBytes(bytes, reply) -> {
@@ -178,23 +205,64 @@ pub fn start_writer(
           process.send(reply, Nil)
           actor.stop()
         }
+        OwnerDown -> actor.stop()
       }
     })
 
   case actor.start(builder) {
-    Ok(started) -> Ok(Writer(started.data))
+    Ok(started) -> {
+      // Stopping the writer after a stalled write must not take its owner
+      // with it; the writer watches the owner through its monitor instead.
+      process.unlink(started.pid)
+      Ok(Writer(started.data, started.pid))
+    }
     Error(err) -> Error(err)
   }
 }
 
-pub fn write_bytes(writer: Writer, bytes: BitArray) -> Result(Nil, String) {
-  let Writer(subj) = writer
-  process.call(subj, waiting: 5000, sending: fn(reply) {
-    WriteBytes(bytes, reply)
-  })
+/// Writes `bytes` and waits at most `timeout_ms` for the sink to finish.
+/// The wait is the back-pressure a slow reader puts on the producer. When it
+/// runs out the output is treated as broken: the writer is stopped, because
+/// a sink that is stuck in a write cannot serve the writes behind it.
+pub fn write_bytes(
+  writer: Writer,
+  bytes: BitArray,
+  timeout_ms: Int,
+) -> Result(Nil, WriteError) {
+  let Writer(subject, pid) = writer
+  let monitor = process.monitor(pid)
+  let reply = process.new_subject()
+  process.send(subject, WriteBytes(bytes, reply))
+  let outcome =
+    process.new_selector()
+    |> process.select_map(reply, result.map_error(_, SinkFailed))
+    |> process.select_specific_monitor(monitor, fn(_) { Error(WriterStopped) })
+    |> process.selector_receive(timeout_ms)
+  process.demonitor_process(monitor)
+  case outcome {
+    Ok(written) -> written
+    Error(Nil) -> {
+      process.kill(pid)
+      Error(WriteTimedOut)
+    }
+  }
 }
 
-pub fn stop_writer(writer: Writer) -> Nil {
-  let Writer(subj) = writer
-  process.call(subj, waiting: 5000, sending: CloseWriter)
+/// Stops the writer after the writes already sent to it, waiting at most
+/// `timeout_ms` before stopping it regardless.
+pub fn stop_writer(writer: Writer, timeout_ms: Int) -> Nil {
+  let Writer(subject, pid) = writer
+  let monitor = process.monitor(pid)
+  let reply = process.new_subject()
+  process.send(subject, CloseWriter(reply))
+  let stopped =
+    process.new_selector()
+    |> process.select(reply)
+    |> process.select_specific_monitor(monitor, fn(_) { Nil })
+    |> process.selector_receive(timeout_ms)
+  process.demonitor_process(monitor)
+  case stopped {
+    Ok(Nil) -> Nil
+    Error(Nil) -> process.kill(pid)
+  }
 }
