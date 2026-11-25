@@ -8,9 +8,10 @@
     unique_integer/0,
     rescue_run/1,
     monotonic_time_ms/0,
-    set_stdio_binary/0,
-    close_stdin/0,
-    read_stdin/1,
+    reserve_stdio/0,
+    read_stdin/0,
+    lead_output_to_stderr/0,
+    restore_group_leader/1,
     stop_supervisor/1,
     write_stdout/1,
     write_stderr/1,
@@ -231,66 +232,84 @@ rescue_run(Fun) ->
             {error, <<"handler crashed (redacted)">>}
     end.
 
-set_stdio_binary() ->
-    io:setopts(standard_io, [{binary, true}, {encoding, utf8}]),
-    io:setopts(standard_error, [{binary, true}, {encoding, utf8}]),
-    enable_raw_stdin(),
-    {ok, nil}.
+%% Prepares the VM for serving MCP over its standard streams. Standard input
+%% is Relay's only when the VM never reads it itself, which `-noinput`
+%% guarantees; otherwise the VM's terminal reader already owns descriptor 0.
+%% Every logger handler that writes to standard output is moved to standard
+%% error, so that log events (crash reports and emulator warnings included)
+%% cannot interleave with protocol frames.
+reserve_stdio() ->
+    case init:get_argument(noinput) of
+        error -> {error, nil};
+        {ok, _} ->
+            lists:foreach(fun route_handler_to_stderr/1, logger:get_handler_config()),
+            {ok, nil}
+    end.
 
-close_stdin() ->
-    case erase(relay_stdio_input) of
+%% `logger_std_h` cannot change its `type` in place, so the handler is
+%% removed and added again with the same level, filters, formatter and
+%% overload settings.
+route_handler_to_stderr(#{id := Id, module := logger_std_h,
+                          config := #{type := standard_io} = Config} = Handler) ->
+    Overload = maps:with([sync_mode_qlen, drop_mode_qlen, flush_qlen,
+                          burst_limit_enable, burst_limit_max_count,
+                          burst_limit_window_time, overload_kill_enable,
+                          overload_kill_qlen, overload_kill_mem_size,
+                          overload_kill_restart_after], Config),
+    Kept = maps:with([level, filter_default, filters, formatter], Handler),
+    _ = logger:remove_handler(Id),
+    _ = logger:add_handler(Id, logger_std_h,
+                           Kept#{config => Overload#{type => standard_error}}),
+    ok;
+route_handler_to_stderr(_) ->
+    ok.
+
+%% Makes standard error the group leader of the calling process and returns
+%% the previous one. Processes it spawns from now on inherit the new group
+%% leader, so `io` output from the runtime and its handlers goes to standard
+%% error instead of standard output.
+lead_output_to_stderr() ->
+    Previous = group_leader(),
+    case whereis(standard_error) of
         undefined -> ok;
-        Device -> file:close(Device)
+        StandardError -> group_leader(StandardError, self())
     end,
+    Previous.
+
+restore_group_leader(Previous) ->
+    group_leader(Previous, self()),
     nil.
 
-enable_raw_stdin() ->
-    try
-        case whereis(user) of
-            undefined -> ok;
-            User ->
-                case sys:get_status(User) of
-                    {status, _, _, [_, _, _, _, [_, _, {data, [{_, {_, State}}]}]]} ->
-                        Drv = element(3, State),
-                        User ! {Drv, terminal_mode, raw},
-                        ok;
-                    _ -> ok
-                end
-        end
-    catch
-        _:_ -> ok
-    end.
-
-read_stdin(ChunkSize) when ChunkSize =< 0 ->
-    {read_failed, <<"stdin chunk limit must be positive">>};
-read_stdin(ChunkSize) ->
-    case ensure_stdin_input() of
-        {ok, Device} ->
-            read_stdin_result(ChunkSize, file:read(Device, ChunkSize));
+%% Returns the next bytes of standard input as soon as any arrive. A raw file
+%% read of a pipe waits for its whole count, so input comes from a port in
+%% stream mode on descriptor 0, owned by the calling process. The port
+%% delivers each read as it completes, so the framer bounds a frame while it
+%% grows. A port cannot be paused: input the server has not framed yet waits
+%% in the owner's mailbox.
+read_stdin() ->
+    case ensure_stdin_port() of
+        {ok, Port} ->
+            receive
+                {Port, {data, Data}} -> {read_chunk, Data};
+                {Port, eof} -> read_eof
+            end;
         {error, Reason} ->
-            {read_failed, unicode:characters_to_binary(io_lib:format("~p", [Reason]))}
+            {read_failed, printable(Reason)}
     end.
 
-ensure_stdin_input() ->
+ensure_stdin_port() ->
     case get(relay_stdio_input) of
         undefined ->
-            case file:open("/dev/stdin", [read, binary, raw]) of
-                {ok, Device} ->
-                    put(relay_stdio_input, Device),
-                    {ok, Device};
-                {error, Reason} -> {error, Reason}
+            try erlang:open_port({fd, 0, 1}, [in, binary, stream, eof]) of
+                Port ->
+                    put(relay_stdio_input, Port),
+                    {ok, Port}
+            catch
+                error:Reason -> {error, Reason}
             end;
-        Device -> {ok, Device}
+        Port ->
+            {ok, Port}
     end.
-
-read_stdin_result(ChunkSize, {ok, Data}) when is_binary(Data), byte_size(Data) =< ChunkSize ->
-    {read_chunk, Data};
-read_stdin_result(_ChunkSize, eof) ->
-    read_eof;
-read_stdin_result(_ChunkSize, {error, Reason}) ->
-    {read_failed, unicode:characters_to_binary(io_lib:format("~p", [Reason]))};
-read_stdin_result(_ChunkSize, _) ->
-    {read_failed, <<"stdin returned an invalid chunk">>}.
 
 mailbox_size(Pid) when is_pid(Pid) ->
     case erlang:process_info(Pid, message_queue_len) of

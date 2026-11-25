@@ -11,7 +11,7 @@ import relay/server
 import relay/stdio
 
 const runner =
-  "erl -pa build/dev/erlang/*/ebin -noshell -run relay_stdio_runner main"
+  "erl -pa build/dev/erlang/*/ebin -noinput -run relay_stdio_runner main"
 
 @external(erlang, "relay_ffi", "spawn_stdio_child")
 fn spawn_child(cmd: String) -> Dynamic
@@ -90,12 +90,128 @@ fn at(message: Dynamic, path: List(String), decoder: decode.Decoder(a)) -> a {
   found
 }
 
+// --- default settings over a real pipe ---------------------------------------
+
+// The server with default settings.
+const default_runner =
+  "erl -pa build/dev/erlang/*/ebin -noinput -run relay_stdio_default_runner main"
+
+fn size_request(id: String, bytes: Int) -> BitArray {
+  request_line(id, "tools/call", [
+    #("name", json.string("size")),
+    #(
+      "arguments",
+      json.object([#("text", json.string(string.repeat("x", bytes)))]),
+    ),
+  ])
+}
+
+pub fn default_settings_answer_a_small_request_while_stdin_stays_open_test() {
+  let child = spawn_child(default_runner)
+  // Far less than one read chunk, and the pipe stays open afterwards.
+  send_to_child(child, size_request("small", 5))
+  let small = read_one(child)
+  assert at(small, ["id"], decode.string) == "small"
+  assert at(small, ["result", "structuredContent"], decode.int) == 5
+
+  // A request of many chunks, then another small one on the same pipe.
+  send_to_child(child, size_request("large", 300_000))
+  let large = read_one(child)
+  assert at(large, ["result", "structuredContent"], decode.int) == 300_000
+  send_to_child(child, size_request("again", 7))
+  assert at(read_one(child), ["result", "structuredContent"], decode.int) == 7
+  close_child(child)
+}
+
+pub fn default_settings_stop_cleanly_when_stdin_closes_test() {
+  // `printf` writes one request and exits, which closes the server's input.
+  let request =
+    "{\"jsonrpc\":\"2.0\",\"id\":\"eof\",\"method\":\"server/discover\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{}}}}"
+  let child =
+    spawn_child(
+      "sh -c 'printf \"%s\\n\" \"$0\" | "
+      <> default_runner
+      <> "' '"
+      <> request
+      <> "'",
+    )
+  assert at(read_one(child), ["id"], decode.string) == "eof"
+  expect_exit(child, 0)
+}
+
+// --- standard output carries only frames -------------------------------------
+
+pub fn log_and_print_output_while_serving_stays_off_stdout_test() {
+  let child = spawn_child(runner)
+  send_to_child(
+    child,
+    request_line("noisy", "tools/call", [
+      #("name", json.string("noisy")),
+      #("arguments", json.object([])),
+    ]),
+  )
+  // A second request gives asynchronous log output time to be written.
+  send_to_child(child, request_line("after-noise", "server/discover", []))
+  let lines = read_raw_lines(child, 2, "")
+  // Every line on standard output is a JSON-RPC message.
+  let messages =
+    list.map(lines, fn(line) {
+      let assert Ok(message) = json.parse(line, decode.dynamic) as line
+      message
+    })
+  let ids =
+    list.map(messages, at(_, ["id"], decode.string))
+    |> list.sort(string.compare)
+  assert ids == ["after-noise", "noisy"]
+  close_child(child)
+}
+
+// Reads from the child until `count` complete lines arrived, unparsed.
+fn read_raw_lines(child: Dynamic, count: Int, buffer: String) -> List(String) {
+  let lines =
+    string.split(buffer, "\n")
+    |> list.reverse
+    |> list.drop(1)
+    |> list.reverse
+  case list.length(lines) >= count {
+    True -> list.take(lines, count)
+    False -> {
+      let assert Ok(chunk) = receive_from_child(child, 5000)
+      let assert Ok(text) = bit_array.to_string(chunk)
+      read_raw_lines(child, count, buffer <> text)
+    }
+  }
+}
+
+// --- frame bound ---------------------------------------------------------------
+
+pub fn oversized_frame_is_refused_before_its_newline_arrives_test() {
+  let child = spawn_child(runner)
+  // More than the runner's 1,024-byte frame limit, and no newline yet: the
+  // refusal must not wait for the whole line.
+  send_to_child(child, bit_array.from_string(string.repeat("x", 2000)))
+  let refusal = read_one(child)
+  assert at(refusal, ["error", "code"], decode.int) == -32_600
+  assert at(refusal, ["error", "message"], decode.string) == "Frame too large"
+  // The rest of the oversized line is dropped as it arrives.
+  send_to_child(child, bit_array.from_string(string.repeat("y", 5000) <> "\n"))
+  send_to_child(child, request_line("after-oversized", "server/discover", []))
+  assert at(read_one(child), ["id"], decode.string) == "after-oversized"
+  close_child(child)
+}
+
 // --- configuration -----------------------------------------------------------
+
+pub fn stdio_refuses_to_serve_while_the_vm_reads_stdin_test() {
+  // The test VM runs without `-noinput`, so its terminal reader owns
+  // standard input and `serve` must return before reading anything.
+  let assert Error(stdio.StdinOwnedByVm) = stdio.serve(server.new([]), Nil)
+  assert stdio.describe_error(stdio.StdinOwnedByVm)
+    == "the VM reads standard input itself; start it with -noinput"
+}
 
 pub fn stdio_rejects_invalid_settings_before_io_test() {
   let service = server.new([])
-  let assert Error(stdio.InvalidChunkSize(0)) =
-    stdio.serve_with(service, Nil, stdio.config() |> stdio.with_chunk_size(0))
 
   let bad_runtime =
     runtime.config()
@@ -115,7 +231,6 @@ pub fn stdio_rejects_invalid_settings_before_io_test() {
       stdio.config() |> stdio.with_runtime(bad_frames),
     )
 
-  let assert True = stdio.describe_error(stdio.InvalidChunkSize(0)) != ""
   let assert "standard input ended in the middle of a frame" =
     stdio.describe_error(stdio.InvalidTrailingData(<<"x">>))
 }

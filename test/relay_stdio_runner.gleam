@@ -1,7 +1,7 @@
 //// The stdio child program the stdio tests launch with
-//// `erl -pa build/dev/erlang/*/ebin -noshell -run relay_stdio_runner main`
+//// `erl -pa build/dev/erlang/*/ebin -noinput -run relay_stdio_runner main`
 //// (see `test/fixtures/stdio/relay-stdio`). It serves a small server over
-//// `relay/stdio.serve_with` with 1-byte reads, a 1,024-byte frame limit and
+//// `relay/stdio.serve_with` with a 1,024-byte frame limit and
 //// a nesting depth of 16, and exits 0 on a clean EOF, 3 on trailing bytes,
 //// and 1 on any other error.
 
@@ -19,6 +19,9 @@ fn halt(status: Int) -> Nil
 
 @external(erlang, "persistent_term", "put")
 fn put_marker(key: String, value: Bool) -> Dynamic
+
+@external(erlang, "relay_stdio_noise_ffi", "make_noise")
+fn make_noise() -> Nil
 
 @external(erlang, "persistent_term", "get")
 fn get_marker(key: String, default: Bool) -> Bool
@@ -66,13 +69,19 @@ fn tools() -> List(tool.Tool(String)) {
   let was_cancelled =
     tool.define("was_cancelled", codec.success(Nil), codec.bool())
     |> tool.handle(fn(_) { Ok(get_marker(cancelled_marker, False)) })
-  [greet, fail, slow, wait, was_cancelled]
+  // Logs, prints and lets a process crash while the server is serving.
+  let noisy =
+    tool.define("noisy", codec.success(Nil), codec.bool())
+    |> tool.handle(fn(_) {
+      make_noise()
+      Ok(True)
+    })
+  [greet, fail, slow, wait, was_cancelled, noisy]
 }
 
 pub fn main() -> Nil {
   let config =
     stdio.config()
-    |> stdio.with_chunk_size(1)
     |> stdio.with_runtime(
       runtime.config()
       |> runtime.with_max_frame_bytes(1024)
