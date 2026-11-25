@@ -1,13 +1,23 @@
 //// Serves an MCP server over standard input and output.
 ////
 //// `serve(server, context)` reads newline-delimited JSON-RPC frames from
-//// standard input until it closes, writes replies to standard output, and
-//// keeps standard output free of anything else. It blocks the calling
-//// process, which is usually `main`. `serve_with` takes a `Config` for the
-//// read chunk size and the runtime limits (`relay/runtime.config`). The
-//// stdio transport enforces no authorization: run it only under a trusted
-//// parent process. A client launches such a server with
-//// `relay/client.stdio`.
+//// standard input until it closes and writes replies to standard output. It
+//// blocks the calling process, which is usually `main`. `serve_with` takes a
+//// `Config` for the runtime limits (`relay/runtime.config`). The stdio
+//// transport enforces no authorization: run it only under a trusted parent
+//// process. A client launches such a server with `relay/client.stdio`.
+////
+//// Start the VM with `-noinput` (for example `ERL_FLAGS=-noinput`). Without
+//// it the VM's own terminal reader owns standard input, and `serve` returns
+//// `StdinOwnedByVm` before reading anything.
+////
+//// Standard output carries only protocol frames. `serve` moves every logger
+//// handler that writes to standard output to standard error, for the rest of
+//// the VM's life, and makes standard error the group leader of the runtime
+//// and its handlers, so their `io` output goes there too. Processes started
+//// before `serve` keep their group leader and must not print to standard
+//// output; neither may `erlang:display`, which writes to the descriptor
+//// directly.
 ////
 //// ```gleam
 //// import relay/server
@@ -20,7 +30,6 @@
 ////
 //// | Setting | Default | Setter |
 //// | --- | --- | --- |
-//// | read chunk | 4 KiB | `with_chunk_size` |
 //// | frame, depth, handler limits | `relay/runtime.config()` | `with_runtime` |
 //// | one write to standard output | 5 s, then `StdoutBroken` | `with_write_timeout` |
 ////
@@ -50,19 +59,14 @@ import relay/runtime.{type Runtime}
 import relay/server.{type Server}
 import relay/telemetry
 
-/// Stdio settings. Build with `config()` and the `with_*` setters.
+/// Stdio settings. Build with `config()` and `with_runtime`.
 pub opaque type Config {
-  Config(chunk_size: Int, runtime: runtime.Config, write_timeout_ms: Int)
+  Config(runtime: runtime.Config, write_timeout_ms: Int)
 }
 
-/// A 4 KiB read chunk and the default runtime limits.
+/// The default runtime limits.
 pub fn config() -> Config {
-  Config(chunk_size: 4096, runtime: runtime.config(), write_timeout_ms: 5000)
-}
-
-/// The largest chunk read from standard input at once.
-pub fn with_chunk_size(config: Config, bytes: Int) -> Config {
-  Config(..config, chunk_size: bytes)
+  Config(runtime: runtime.config(), write_timeout_ms: 5000)
 }
 
 /// How long one write to standard output may take before the output counts
@@ -83,9 +87,11 @@ pub fn with_runtime(config: Config, runtime: runtime.Config) -> Config {
 
 /// Why `serve` stopped with an error.
 pub type StdioError {
-  InvalidChunkSize(size: Int)
   InvalidRuntimeConfig(field: runtime.ConfigField)
-  /// Standard input could not be switched to binary mode or read.
+  /// The VM reads standard input itself because it was started without
+  /// `-noinput`.
+  StdinOwnedByVm
+  /// Standard input could not be read.
   ReadFailed
   /// Standard output was closed, failed, or did not accept a reply within
   /// the write timeout.
@@ -98,8 +104,9 @@ pub type StdioError {
 /// A one-line description of a stdio error.
 pub fn describe_error(error: StdioError) -> String {
   case error {
-    InvalidChunkSize(_) -> "the stdio read chunk size must be positive"
     InvalidRuntimeConfig(_) -> "a stdio runtime setting is out of range"
+    StdinOwnedByVm ->
+      "the VM reads standard input itself; start it with -noinput"
     ReadFailed -> "standard input could not be read"
     StdoutBroken -> "standard output failed while writing a reply"
     StartupFailed -> "the stdio server failed to start"
@@ -107,14 +114,17 @@ pub fn describe_error(error: StdioError) -> String {
   }
 }
 
-@external(erlang, "relay_ffi", "set_stdio_binary")
-fn set_stdio_binary() -> Result(Nil, String)
-
-@external(erlang, "relay_ffi", "close_stdin")
-fn close_stdin() -> Nil
+@external(erlang, "relay_ffi", "reserve_stdio")
+fn reserve_stdio() -> Result(Nil, Nil)
 
 @external(erlang, "relay_ffi", "read_stdin")
-fn read_stdin(chunk_size: Int) -> ReadOutcome
+fn read_stdin() -> ReadOutcome
+
+@external(erlang, "relay_ffi", "lead_output_to_stderr")
+fn lead_output_to_stderr() -> Pid
+
+@external(erlang, "relay_ffi", "restore_group_leader")
+fn restore_group_leader(previous: Pid) -> Nil
 
 @external(erlang, "relay_ffi", "write_stdout")
 fn write_stdout(bytes: BitArray) -> Result(Nil, String)
@@ -133,10 +143,6 @@ pub fn serve_with(
   context: context,
   config: Config,
 ) -> Result(Nil, StdioError) {
-  use _ <- result.try(case config.chunk_size > 0 {
-    True -> Ok(Nil)
-    False -> Error(InvalidChunkSize(config.chunk_size))
-  })
   use runtime_config <- result.try(
     runtime.validate(config.runtime)
     |> result.map_error(fn(error) {
@@ -146,14 +152,23 @@ pub fn serve_with(
       }
     }),
   )
-  use _ <- result.try(set_stdio_binary() |> result.replace_error(ReadFailed))
-  use writer <- result.try(case stdio_frames.start_writer(write_stdout) {
-    Ok(writer) -> Ok(writer)
-    Error(_) -> {
-      close_stdin()
-      Error(StartupFailed)
-    }
-  })
+  use _ <- result.try(reserve_stdio() |> result.replace_error(StdinOwnedByVm))
+  let previous_leader = lead_output_to_stderr()
+  let outcome = serve_reserved(server, context, config, runtime_config)
+  restore_group_leader(previous_leader)
+  outcome
+}
+
+fn serve_reserved(
+  server: Server(context),
+  context: context,
+  config: Config,
+  runtime_config: runtime.Config,
+) -> Result(Nil, StdioError) {
+  use writer <- result.try(
+    stdio_frames.start_writer(write_stdout)
+    |> result.replace_error(StartupFailed),
+  )
   let write_errors = process.new_subject()
   let sink = fn(output) {
     case output {
@@ -172,13 +187,12 @@ pub fn serve_with(
   case runtime.start_holding(server, runtime_config, sink) {
     Error(_) -> {
       stdio_frames.stop_writer(writer, config.write_timeout_ms)
-      close_stdin()
       Error(StartupFailed)
     }
     Ok(rt) -> {
       let framer =
         stdio_frames.new_framer(runtime.max_frame_bytes(runtime_config))
-      let reader = start_reader(config.chunk_size)
+      let reader = start_reader()
       let outcome =
         read_loop(
           rt,
@@ -193,7 +207,6 @@ pub fn serve_with(
       runtime.close(rt)
       runtime.stop(rt)
       stdio_frames.stop_writer(writer, config.write_timeout_ms)
-      close_stdin()
       use _ <- result.try(outcome)
       case process.receive(write_errors, 0) {
         Ok(error) -> Error(error)
@@ -209,17 +222,18 @@ type Signal {
   ReaderDown
 }
 
-fn start_reader(chunk_size: Int) -> #(Pid, Subject(ReadOutcome)) {
+// The reader owns the standard input port; the port closes when it exits.
+fn start_reader() -> #(Pid, Subject(ReadOutcome)) {
   let subject = process.new_subject()
-  let pid = process.spawn_unlinked(fn() { read_forever(subject, chunk_size) })
+  let pid = process.spawn_unlinked(fn() { read_forever(subject) })
   #(pid, subject)
 }
 
-fn read_forever(subject: Subject(ReadOutcome), chunk_size: Int) -> Nil {
-  let outcome = read_stdin(chunk_size)
+fn read_forever(subject: Subject(ReadOutcome)) -> Nil {
+  let outcome = read_stdin()
   process.send(subject, outcome)
   case outcome {
-    stdio_frames.ReadChunk(_) -> read_forever(subject, chunk_size)
+    stdio_frames.ReadChunk(_) -> read_forever(subject)
     stdio_frames.ReadEof | stdio_frames.ReadFailed(_) -> Nil
   }
 }

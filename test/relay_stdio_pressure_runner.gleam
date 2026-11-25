@@ -1,5 +1,5 @@
 //// A stdio child for the output-pressure tests, launched with
-//// `erl -pa build/dev/erlang/*/ebin -noshell -run relay_stdio_pressure_runner main`.
+//// `erl -pa build/dev/erlang/*/ebin -noinput -run relay_stdio_pressure_runner main`.
 //// It admits one exchange at a time. When `serve_with` stops with an error
 //// it prints the error's description on standard error and exits 1.
 
@@ -41,7 +41,6 @@ pub fn main() -> Nil {
   let config =
     stdio.config()
     // One-byte reads: a larger read waits until that many bytes arrived.
-    |> stdio.with_chunk_size(1)
     |> stdio.with_write_timeout(duration.milliseconds(300))
     |> stdio.with_runtime(
       runtime.config() |> runtime.with_max_live_exchanges(1),
