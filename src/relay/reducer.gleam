@@ -45,6 +45,7 @@ import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import json/blueprint/codec
 import json/blueprint/value.{type Value}
 import relay/content.{type ResourceContents}
 import relay/internal/carrier
@@ -1045,10 +1046,23 @@ pub fn perform(
           )
         core.AwaitingInput(requests) ->
           input_required(invocation, requests, request_state)
-        core.InvalidArguments(_) ->
+        // MCP reports input validation as a tool execution error, so the
+        // model can correct the call. The text names the path and the
+        // expectation, never the value that was sent.
+        core.InvalidArguments(error) ->
           Outcome(
-            jsonrpc.error_to_json(Some(id), jsonrpc.invalid_params()),
-            telemetry.Failed,
+            v2026.encode_call_response(
+              id,
+              None,
+              [
+                content.text(
+                  "Invalid arguments: " <> codec.describe_decode_error(error),
+                ),
+              ],
+              True,
+              invocation.identity,
+            ),
+            telemetry.ToolFailed,
           )
         core.InvalidOutput ->
           Outcome(

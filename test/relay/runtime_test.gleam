@@ -1058,8 +1058,9 @@ pub fn invocation_completed_status_test() {
   run("ok", "greet", named) |> should.equal(telemetry.Succeeded)
   run("tool-failed", "fail", named) |> should.equal(telemetry.ToolFailed)
   run("input", "ask", named) |> should.equal(telemetry.InputRequested)
+  // Invalid arguments are a tool error, not a protocol error.
   run("bad-args", "greet", json.object([#("name", json.int(5))]))
-  |> should.equal(telemetry.Failed)
+  |> should.equal(telemetry.ToolFailed)
 
   runtime.stop(rt)
   let assert Ok(Nil) = sinal.detach(attachment)

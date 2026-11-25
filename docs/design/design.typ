@@ -199,6 +199,13 @@
       #then[Error data.uri retains the requested URI.]
       #then[Private reader failure details remain hidden.]
     ]
+    #behavior(title: "Invalid tool arguments are a tool error with detail", area: "Tool calls", level: "interface")[
+      #given[A call names a callable tool and its arguments do not decode with the tool's input codec.]
+      #when[The server answers that call.]
+      #then[The caller receives a result with isError true, not a JSON-RPC error.]
+      #then[Its text names the path and the expectation that failed.]
+      #then[The text does not repeat the value the caller sent, and the handler does not run.]
+    ]
     #behavior(title: "Re-evaluate visibility on named calls", area: "Tool access", level: "interface")[
       #given[A tool was listed for an earlier application context but is now hidden or not callable.]
       #when[The client names that tool in a new call.]
