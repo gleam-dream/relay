@@ -1,5 +1,5 @@
 -module(relay_http_lifecycle_ffi).
--export([intentional_stop/1, unexpected_listener_exit/1]).
+-export([intentional_stop/1, unexpected_listener_exit/1, stop_with_slow_listener/2]).
 -include_lib("eunit/include/eunit.hrl").
 
 %% Keep tracing and monitor messages in an isolated test coordinator.
@@ -69,4 +69,25 @@ stop_in_order(Owner, Hub, Listener) ->
 await_down(Ref, Pid) ->
     receive {'DOWN', Ref, process, Pid, Reason} -> Reason
     after 3000 -> error({down_timeout, Pid})
+    end.
+
+%% Suspends the process that owns the listen socket on `Port`, calls `Stop`,
+%% and resumes the owner 200 ms later from another process. A `Stop` that
+%% returns before the socket closes sees the kernel still accept a
+%% connection; one that waits cannot return before the resume.
+stop_with_slow_listener(Port, Stop) ->
+    [Owner] = [O || P <- erlang:ports(),
+                    erlang:port_info(P, name) =:= {name, "tcp_inet"},
+                    inet:sockname(P) =:= {ok, {{127, 0, 0, 1}, Port}},
+                    {connected, O} <- [erlang:port_info(P, connected)]],
+    erlang:suspend_process(Owner),
+    spawn(fun() ->
+        timer:sleep(200),
+        try erlang:resume_process(Owner) catch _:_ -> ok end
+    end),
+    Stop(),
+    case gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000) of
+        {ok, Socket} -> gen_tcp:close(Socket), accepted;
+        {error, econnrefused} -> refused;
+        {error, Reason} -> Reason
     end.

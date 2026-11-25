@@ -319,7 +319,8 @@ pub fn start(
   }
 }
 
-/// Stops a listener started by `start`.
+/// Stops a listener started by `start` and returns once its listening
+/// socket is closed and its connection handlers have exited.
 pub fn stop(listener: process.Pid) -> Nil {
   // This shutdown is requested by the owner, not a listener failure.
   process.unlink(listener)

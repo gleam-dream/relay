@@ -599,7 +599,7 @@ pub opaque type Message(context) {
   Unregister(name: String, reply: Subject(Bool))
   GetPort(reply: Subject(Option(Int)))
   GetBodyLimit(reply: Subject(Int))
-  StopEndpoint(reply: Subject(Nil))
+  StopEndpoint
 }
 
 // What an admitted request receives: a handle to the endpoint's held
@@ -774,14 +774,24 @@ pub fn port(handler: Handler(context)) -> Int {
 }
 
 /// Stops the endpoint: closes its streams, stops its listener and its
-/// actor without terminating its linked caller. Initiates request cleanup,
-/// which may continue after this call returns. Waits at most 5 s.
-/// Unexpected listener failure still reaches the caller through the link.
+/// actor without terminating its linked caller. Returns once the endpoint
+/// actor has exited; for a listener, its listening socket is closed by then,
+/// so a new connection is refused. A request in flight is cut off: its
+/// connection handler has exited and its response is not sent. Cleanup of
+/// the request's own work may continue after this call returns. Stopping an
+/// endpoint that is not running returns at once. Unexpected listener
+/// failure still reaches the caller through the link.
 pub fn stop(handler: Handler(context)) -> Nil {
-  let reply = process.new_subject()
-  process.send(handler.subject, StopEndpoint(reply))
-  let _ = process.receive(reply, hub_timeout)
-  Nil
+  case process.subject_owner(handler.subject) {
+    Error(Nil) -> Nil
+    Ok(endpoint) -> {
+      let monitor = process.monitor(endpoint)
+      process.send(handler.subject, StopEndpoint)
+      process.new_selector()
+      |> process.select_specific_monitor(monitor, fn(_) { Nil })
+      |> process.selector_receive_forever
+    }
+  }
 }
 
 /// Tells every open `subscriptions/listen` stream that asked for it.
@@ -953,14 +963,13 @@ fn handle_hub(
       process.send(reply, hub.config.max_body_bytes)
       actor.continue(hub)
     }
-    StopEndpoint(reply) -> {
+    StopEndpoint -> {
       dict.each(hub.slots, fn(_, slot) { slot.cancel() })
       each_stream(hub, runtime.close)
       case hub.listener {
         Some(listener) -> http_mist.stop(listener)
         None -> Nil
       }
-      process.send(reply, Nil)
       actor.stop()
     }
   }

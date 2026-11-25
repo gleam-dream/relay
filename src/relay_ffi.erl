@@ -444,9 +444,35 @@ git_head(RepoPath) ->
     Out = os:cmd(Cmd),
     string:trim(unicode:characters_to_binary(Out)).
 
+%% Stops a listener's supervision tree and returns once its sockets are
+%% closed. `sys:terminate` replies before the supervisor shuts its children
+%% down, and a port owned by an exited process closes after the owner's
+%% exit, so the wait is on the supervisor's exit and then on each socket.
+%% The tree's shutdown timeouts bound both waits.
 stop_supervisor(Pid) when is_pid(Pid) ->
-    try sys:terminate(Pid, shutdown, 5000) catch _:_ -> ok end,
+    Sockets = [erlang:monitor(port, Port) || Port <- sockets_under(Pid)],
+    Ref = erlang:monitor(process, Pid),
+    try sys:terminate(Pid, shutdown, infinity) catch _:_ -> ok end,
+    receive {'DOWN', Ref, process, Pid, _} -> ok end,
+    [receive {'DOWN', Socket, port, _, _} -> ok end || Socket <- Sockets],
     nil.
+
+%% TCP sockets, listening or accepted, owned by a process started under
+%% `Supervisor`. Reads each owner's `proc_lib` ancestry instead of asking
+%% the supervisors, so a busy or suspended supervisor cannot delay it.
+sockets_under(Supervisor) ->
+    [Port || Port <- erlang:ports(),
+             erlang:port_info(Port, name) =:= {name, "tcp_inet"},
+             {connected, Owner} <- [erlang:port_info(Port, connected)],
+             lists:member(Supervisor, ancestors(Owner))].
+
+ancestors(Pid) ->
+    case erlang:process_info(Pid, dictionary) of
+        {dictionary, Dictionary} ->
+            proplists:get_value('$ancestors', Dictionary, []);
+        undefined ->
+            []
+    end.
 
 %% The environment of a stdio child: the variables a program needs to run
 %% (the same allow-list the reference MCP SDKs use), inherited from this OS
