@@ -29,6 +29,11 @@
 //// metadata by label: a later release may add fields. Status and reason
 //// fields are enums, never prose.
 ////
+//// A handler belongs to the process that attaches it and is detached when
+//// that process exits, so attach from a process that lives as long as the
+//// observation should, such as a supervised worker, not from a short-lived
+//// task.
+////
 //// ```gleam
 //// import gleam/io
 //// import gleam/option
