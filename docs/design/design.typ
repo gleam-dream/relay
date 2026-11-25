@@ -420,6 +420,11 @@
       #when[The subscription acknowledgement succeeds.]
       #then[Notifications remain readable beyond the relative opening budget while explicit deadlines, cancellation and caller ownership remain effective.]
     ]
+    #behavior(title: "A keepalive does not shorten the notification wait", area: "HTTP client lifetime", level: "interface")[
+      #given[A caller waits for the next notification on an established subscription.]
+      #when[A keepalive comment or part of an event arrives before the wait ends.]
+      #then[The client keeps waiting for the rest of the requested time; it returns no notification only when the whole wait passes without one.]
+    ]
     #md-table(3, (
       [*Client setting*], [*Default*], [*Boundary*],
       [Connect / request timeout], [10 s / 30 s], [Connection startup and individual request; absolute deadline may shorten request budget.],

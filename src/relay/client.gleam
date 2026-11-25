@@ -1174,7 +1174,10 @@ fn gun_failure(
 }
 
 // Server-sent events: blank-line separated, `data:` lines joined, comments
-// and other fields ignored.
+// and other fields ignored. One `next` call waits until a single deadline: a
+// chunk that completes no data event (a keepalive comment, or part of an
+// event) does not end the wait, so `Ok(None)` means only that no event
+// arrived within the requested wait.
 fn sse_stream(stream: body.Body, limit: Int, call: Correlation) -> Stream {
   let buffer = process.new_subject()
   process.send(buffer, <<>>)
@@ -1182,8 +1185,9 @@ fn sse_stream(stream: body.Body, limit: Int, call: Correlation) -> Stream {
     establish: fn() { Ok(Nil) },
     next: fn(wait_ms) {
       let assert Ok(pending) = process.receive(buffer, 0)
+      let deadline = monotonic_ms() + wait_ms
       let #(event, rest, outcome) =
-        next_event(stream, pending, wait_ms, limit, call)
+        next_event(stream, pending, deadline, limit, call)
       process.send(buffer, rest)
       case outcome {
         Error(error) -> Error(error)
@@ -1197,7 +1201,7 @@ fn sse_stream(stream: body.Body, limit: Int, call: Correlation) -> Stream {
 fn next_event(
   stream: body.Body,
   pending: BitArray,
-  wait_ms: Int,
+  deadline: Int,
   limit: Int,
   call: Correlation,
 ) -> #(Option(BitArray), BitArray, Result(Nil, Error)) {
@@ -1205,19 +1209,24 @@ fn next_event(
     Some(#(event, rest)) ->
       case event_data(event) {
         Some(data) -> #(Some(data), rest, Ok(Nil))
-        None -> next_event(stream, rest, wait_ms, limit, call)
+        None -> next_event(stream, rest, deadline, limit, call)
       }
     None ->
       case bit_array.byte_size(pending) > limit {
         True -> #(None, <<>>, Error(Failed(ResponseTooLarge(limit), call)))
         False ->
-          case body.next_within(stream, duration.milliseconds(wait_ms)) {
+          case
+            body.next_within(
+              stream,
+              duration.milliseconds(int.max(0, deadline - monotonic_ms())),
+            )
+          {
             Ok(None) -> #(None, pending, Ok(Nil))
             Ok(Some(body.Chunk(chunk))) ->
               next_event(
                 stream,
                 bit_array.append(pending, chunk),
-                0,
+                deadline,
                 limit,
                 call,
               )
@@ -2638,7 +2647,9 @@ pub fn listening(subscription: Subscription) -> List(Notification) {
 }
 
 /// Waits at most `wait` for the next notification; `Ok(None)` means none
-/// arrived. The stream stays open after a wait. A terminal transport or
+/// arrived within `wait`. Keepalives and other stream traffic that carry no
+/// notification do not end the wait early. The stream stays open after a
+/// wait. A terminal transport or
 /// protocol failure closes the stream and releases its request owner.
 pub fn next_notification(
   subscription: Subscription,
