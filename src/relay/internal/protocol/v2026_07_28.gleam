@@ -252,6 +252,23 @@ pub fn encode_http_routing_error(bytes: BitArray) -> BitArray {
   |> string_to_bytes
 }
 
+/// The error response for a request the server did not admit because it is
+/// at capacity or stopping, or `None` when `bytes` is not a request with a
+/// usable id. The code is JSON-RPC's implementation-defined server error.
+pub fn encode_refusal(bytes: BitArray, message: String) -> Option(BitArray) {
+  let id = case admit_bytes(bytes) {
+    AdmittedRequest(request) -> Some(request_id(request))
+    AdmittedRejected(id, _) -> id
+    _ -> None
+  }
+  use id <- option.map(id)
+  json.to_string(jsonrpc.error_to_json(
+    Some(id),
+    jsonrpc.RpcError(code: -32_000, message: message, data: None),
+  ))
+  |> string_to_bytes
+}
+
 fn string_to_bytes(raw: String) -> BitArray {
   bit_array.from_string(raw <> "
 ")

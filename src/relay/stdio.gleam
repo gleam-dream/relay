@@ -28,15 +28,30 @@
 //// }
 //// ```
 ////
-//// | Setting | Default | Setter |
-//// | --- | --- | --- |
-//// | frame, depth, handler limits | `relay/runtime.config()` | `with_runtime` |
+//// `Config` is a record: change a field with
+//// `stdio.Config(..stdio.config(), write_timeout: duration.seconds(10))`.
+////
+//// | Field | Default |
+//// | --- | --- |
+//// | `runtime`: frame, depth, handler limits | `relay/runtime.config()` |
+//// | `write_timeout`: one write to standard output | 5 s, then `StdoutBroken` |
+////
+//// ## Output pressure
+////
+//// Responses are written one at a time. A parent that reads slowly holds
+//// the write, and the write holds the runtime that produced the response.
+//// A write that does not finish within the write timeout ends `serve` with
+//// `StdoutBroken`; handlers still running are cancelled first. A request
+//// that arrives while the runtime's exchange limit is reached is answered
+//// with JSON-RPC error `-32000`.
 
 import gleam/bit_array
 import gleam/erlang/process.{type Pid, type Subject}
-import gleam/option.{None}
+import gleam/option.{None, Some}
 import gleam/result
+import gleam/time/duration.{type Duration}
 import relay/internal/emit
+import relay/internal/protocol/v2026_07_28 as v2026
 import relay/internal/stdio_frames.{
   type Framer, type ReadOutcome, type Writer, Frame, FrameOversized,
   InvalidTrailingBytes,
@@ -46,31 +61,36 @@ import relay/runtime.{type Runtime}
 import relay/server.{type Server}
 import relay/telemetry
 
-/// Stdio settings. Build with `config()` and `with_runtime`.
-pub opaque type Config {
-  Config(runtime: runtime.Config)
+/// Stdio settings. Start from `config()` and update the fields you need.
+pub type Config {
+  Config(
+    /// The runtime limits: frame size, nesting depth, handler timeout and
+    /// the rest of `relay/runtime.Config`.
+    runtime: runtime.Config,
+    /// How long one write to standard output may take. A write that takes
+    /// longer counts as broken output and `serve` stops with
+    /// `StdoutBroken`. At least 1 ms.
+    write_timeout: Duration,
+  )
 }
 
-/// The default runtime limits.
+/// The default runtime limits and a 5 s write timeout.
 pub fn config() -> Config {
-  Config(runtime: runtime.config())
-}
-
-/// The runtime limits: frame size, nesting depth, handler timeout and the
-/// rest of `relay/runtime.Config`.
-pub fn with_runtime(_config: Config, runtime: runtime.Config) -> Config {
-  Config(runtime: runtime)
+  Config(runtime: runtime.config(), write_timeout: duration.seconds(5))
 }
 
 /// Why `serve` stopped with an error.
 pub type StdioError {
   InvalidRuntimeConfig(field: runtime.ConfigField)
+  /// The write timeout is shorter than 1 ms.
+  InvalidWriteTimeout(timeout: Duration)
   /// The VM reads standard input itself because it was started without
   /// `-noinput`.
   StdinOwnedByVm
   /// Standard input could not be read.
   ReadFailed
-  /// Standard output was closed or failed while writing a reply.
+  /// Standard output was closed, failed, or did not accept a reply within
+  /// the write timeout.
   StdoutBroken
   StartupFailed
   /// Standard input ended in the middle of a frame.
@@ -81,6 +101,7 @@ pub type StdioError {
 pub fn describe_error(error: StdioError) -> String {
   case error {
     InvalidRuntimeConfig(_) -> "a stdio runtime setting is out of range"
+    InvalidWriteTimeout(_) -> "the stdio write timeout must be at least 1 ms"
     StdinOwnedByVm ->
       "the VM reads standard input itself; start it with -noinput"
     ReadFailed -> "standard input could not be read"
@@ -119,6 +140,11 @@ pub fn serve_with(
   context: context,
   config: Config,
 ) -> Result(Nil, StdioError) {
+  let write_timeout_ms = duration.to_milliseconds(config.write_timeout)
+  use _ <- result.try(case write_timeout_ms >= 1 {
+    True -> Ok(Nil)
+    False -> Error(InvalidWriteTimeout(config.write_timeout))
+  })
   use runtime_config <- result.try(
     runtime.validate(config.runtime)
     |> result.map_error(fn(error) {
@@ -130,7 +156,8 @@ pub fn serve_with(
   )
   use _ <- result.try(reserve_stdio() |> result.replace_error(StdinOwnedByVm))
   let previous_leader = lead_output_to_stderr()
-  let outcome = serve_reserved(server, context, runtime_config)
+  let outcome =
+    serve_reserved(server, context, runtime_config, write_timeout_ms)
   restore_group_leader(previous_leader)
   outcome
 }
@@ -139,9 +166,10 @@ fn serve_reserved(
   server: Server(context),
   context: context,
   runtime_config: runtime.Config,
+  write_timeout_ms: Int,
 ) -> Result(Nil, StdioError) {
   use writer <- result.try(
-    stdio_frames.start_writer(write_stdout)
+    stdio_frames.start_writer(write_stdout, write_timeout_ms)
     |> result.replace_error(StartupFailed),
   )
   let write_errors = process.new_subject()
@@ -277,7 +305,12 @@ fn submit(
             Ok(Nil) -> Ok(Nil)
             Error(runtime.FrameTooLarge(..)) -> write(writer, too_large)
             Error(runtime.FrameTooDeep(..)) -> write(writer, too_deep)
-            Error(_) -> Ok(Nil)
+            // The request is refused, not dropped: its caller gets an
+            // answer instead of waiting for its own timeout.
+            Error(runtime.TooManyLiveExchanges(..)) ->
+              refuse(writer, bytes, "Too many requests in progress")
+            Error(runtime.RuntimeStopped) ->
+              refuse(writer, bytes, "The server is stopping")
           }
         FrameOversized(..) -> {
           emit.frame_rejected(0, telemetry.FrameTooLarge, None)
@@ -292,6 +325,22 @@ fn submit(
 }
 
 fn write(writer: Writer, line: String) -> Result(Nil, StdioError) {
-  stdio_frames.write_bytes(writer, bit_array.from_string(line))
+  write_frame(writer, bit_array.from_string(line))
+}
+
+fn write_frame(writer: Writer, bytes: BitArray) -> Result(Nil, StdioError) {
+  stdio_frames.write_bytes(writer, bytes)
   |> result.replace_error(StdoutBroken)
+}
+
+// Answers a request the runtime did not admit. A notification gets nothing.
+fn refuse(
+  writer: Writer,
+  frame: BitArray,
+  message: String,
+) -> Result(Nil, StdioError) {
+  case v2026.encode_refusal(frame, message) {
+    Some(response) -> write_frame(writer, response)
+    None -> Ok(Nil)
+  }
 }
