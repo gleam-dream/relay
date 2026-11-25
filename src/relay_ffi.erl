@@ -8,9 +8,10 @@
     unique_integer/0,
     rescue_run/1,
     monotonic_time_ms/0,
-    set_stdio_binary/0,
-    close_stdin/0,
-    read_stdin/1,
+    reserve_stdio/0,
+    read_stdin/0,
+    lead_output_to_stderr/0,
+    restore_group_leader/1,
     stop_supervisor/1,
     write_stdout/1,
     write_stderr/1,
@@ -231,113 +232,83 @@ rescue_run(Fun) ->
             {error, <<"handler crashed (redacted)">>}
     end.
 
-set_stdio_binary() ->
-    %% Latin-1 makes the I/O server pass every input byte through as one
-    %% character, valid UTF-8 or not; Relay writes its output to the raw
-    %% device, which this encoding does not touch.
-    io:setopts(standard_io, [{binary, true}, {encoding, latin1}]),
-    io:setopts(standard_error, [{binary, true}, {encoding, utf8}]),
-    enable_raw_stdin(),
-    {ok, nil}.
+%% Prepares the VM for serving MCP over its standard streams. Standard input
+%% is Relay's only when the VM never reads it itself, which `-noinput`
+%% guarantees; otherwise the VM's terminal reader already owns descriptor 0.
+%% Every logger handler that writes to standard output is moved to standard
+%% error, so that log events (crash reports and emulator warnings included)
+%% cannot interleave with protocol frames.
+reserve_stdio() ->
+    case init:get_argument(noinput) of
+        error -> {error, nil};
+        {ok, _} ->
+            lists:foreach(fun route_handler_to_stderr/1, logger:get_handler_config()),
+            {ok, nil}
+    end.
 
-close_stdin() ->
-    case erase(relay_stdio_input) of
-        {port, Port} -> try erlang:port_close(Port) catch error:_ -> ok end;
-        _ -> ok
+%% `logger_std_h` cannot change its `type` in place, so the handler is
+%% removed and added again with the same level, filters, formatter and
+%% overload settings.
+route_handler_to_stderr(#{id := Id, module := logger_std_h,
+                          config := #{type := standard_io} = Config} = Handler) ->
+    Overload = maps:with([sync_mode_qlen, drop_mode_qlen, flush_qlen,
+                          burst_limit_enable, burst_limit_max_count,
+                          burst_limit_window_time, overload_kill_enable,
+                          overload_kill_qlen, overload_kill_mem_size,
+                          overload_kill_restart_after], Config),
+    Kept = maps:with([level, filter_default, filters, formatter], Handler),
+    _ = logger:remove_handler(Id),
+    _ = logger:add_handler(Id, logger_std_h,
+                           Kept#{config => Overload#{type => standard_error}}),
+    ok;
+route_handler_to_stderr(_) ->
+    ok.
+
+%% Makes standard error the group leader of the calling process and returns
+%% the previous one. Processes it spawns from now on inherit the new group
+%% leader, so `io` output from the runtime and its handlers goes to standard
+%% error instead of standard output.
+lead_output_to_stderr() ->
+    Previous = group_leader(),
+    case whereis(standard_error) of
+        undefined -> ok;
+        StandardError -> group_leader(StandardError, self())
     end,
-    erase(relay_stdio_pending),
+    Previous.
+
+restore_group_leader(Previous) ->
+    group_leader(Previous, self()),
     nil.
 
-enable_raw_stdin() ->
-    try
-        case whereis(user) of
-            undefined -> ok;
-            User ->
-                case sys:get_status(User) of
-                    {status, _, _, [_, _, _, _, [_, _, {data, [{_, {_, State}}]}]]} ->
-                        Drv = element(3, State),
-                        User ! {Drv, terminal_mode, raw},
-                        ok;
-                    _ -> ok
-                end
-        end
-    catch
-        _:_ -> ok
-    end.
-
-%% Returns the next bytes of standard input, at most ChunkSize of them, as
-%% soon as any are available. A raw file read of standard input waits for
-%% its whole count, so a request shorter than one chunk would not be seen
-%% until more input or end of file arrived. Input is therefore taken from
-%% whichever reader the VM offers, and handed out in chunks from the calling
-%% process's dictionary:
-%%
-%% - Normally the `user` I/O server owns descriptor 0. It is asked for one
-%%   line at a time and reads the pipe only while a request is pending, so
-%%   an unread pipe holds the parent. It returns a line whole, however long,
-%%   so the frame limit applies after the line is in memory.
-%% - Under `-noinput` no I/O server reads standard input. A port in stream
-%%   mode on descriptor 0, owned by the calling process, delivers input as
-%%   the parent writes it; a failing port takes its linked owner down.
-read_stdin(ChunkSize) when ChunkSize =< 0 ->
-    {read_failed, <<"stdin chunk limit must be positive">>};
-read_stdin(ChunkSize) ->
-    case get(relay_stdio_pending) of
-        <<Chunk:ChunkSize/binary, Rest/binary>> ->
-            put(relay_stdio_pending, Rest),
-            {read_chunk, Chunk};
-        <<_, _/binary>> = Chunk ->
-            erase(relay_stdio_pending),
-            {read_chunk, Chunk};
-        _ ->
-            case more_stdin(ensure_stdin_input()) of
-                {ok, Data} ->
-                    put(relay_stdio_pending, Data),
-                    read_stdin(ChunkSize);
-                Outcome ->
-                    Outcome
-            end
-    end.
-
-more_stdin(io_server) ->
-    case io:get_line(standard_io, '') of
-        eof -> read_eof;
-        {error, Reason} -> {read_failed, printable(Reason)};
-        %% `set_stdio_binary` made each input byte one Latin-1 character,
-        %% which a binary result carries as UTF-8; this restores the bytes.
-        Line when is_binary(Line) ->
-            case unicode:characters_to_binary(Line, utf8, latin1) of
-                Bytes when is_binary(Bytes) -> {ok, Bytes};
-                _ -> {read_failed, <<"stdin returned an invalid line">>}
+%% Returns the next bytes of standard input as soon as any arrive. A raw file
+%% read of a pipe waits for its whole count, so input comes from a port in
+%% stream mode on descriptor 0, owned by the calling process. The port
+%% delivers each read as it completes, so the framer bounds a frame while it
+%% grows. A port cannot be paused: input the server has not framed yet waits
+%% in the owner's mailbox.
+read_stdin() ->
+    case ensure_stdin_port() of
+        {ok, Port} ->
+            receive
+                {Port, {data, Data}} -> {read_chunk, Data};
+                {Port, eof} -> read_eof
             end;
-        Line when is_list(Line) ->
-            try {ok, list_to_binary(Line)}
-            catch error:badarg -> {read_failed, <<"stdin returned an invalid line">>}
-            end
-    end;
-more_stdin({port, Port}) ->
-    receive
-        {Port, {data, Data}} -> {ok, Data};
-        {Port, eof} -> read_eof
-    end;
-more_stdin({error, Reason}) ->
-    {read_failed, printable(Reason)}.
+        {error, Reason} ->
+            {read_failed, printable(Reason)}
+    end.
 
-ensure_stdin_input() ->
+ensure_stdin_port() ->
     case get(relay_stdio_input) of
         undefined ->
-            Input = case init:get_argument(noinput) of
-                error -> io_server;
-                {ok, _} ->
-                    try erlang:open_port({fd, 0, 1}, [in, binary, stream, eof]) of
-                        Port -> {port, Port}
-                    catch
-                        error:Reason -> {error, Reason}
-                    end
-            end,
-            put(relay_stdio_input, Input),
-            Input;
-        Input -> Input
+            try erlang:open_port({fd, 0, 1}, [in, binary, stream, eof]) of
+                Port ->
+                    put(relay_stdio_input, Port),
+                    {ok, Port}
+            catch
+                error:Reason -> {error, Reason}
+            end;
+        Port ->
+            {ok, Port}
     end.
 
 mailbox_size(Pid) when is_pid(Pid) ->

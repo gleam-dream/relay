@@ -40,7 +40,7 @@ Use Gleam `>= 1.18.0` with the Erlang target. Commit `gleam.toml` and
 
 ## Server flow and ownership
 
-On the server, the transport admits a request to a runtime actor. The actor serializes protocol state through a pure reducer and starts isolated workers for application handlers. HTTP can build request context and ask a verifier before dispatch; stdio trusts its parent process.
+On the server, the transport admits a request to a runtime actor. The actor serializes protocol state through a pure reducer and starts isolated workers for application handlers. HTTP can build request context and ask a verifier before dispatch; stdio trusts its parent process. A stdio server runs in a VM started with `-noinput` (for example `ERL_FLAGS=-noinput`), so that it is the only reader of standard input, and its standard output carries only protocol frames: serving moves logger output and handler `io` output to standard error.
 
 ```mermaid
 flowchart LR

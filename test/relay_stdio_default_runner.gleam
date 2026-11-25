@@ -1,5 +1,5 @@
 //// A stdio child that serves with the default settings, launched with
-//// `erl -pa build/dev/erlang/*/ebin -noshell -run relay_stdio_default_runner main`.
+//// `erl -pa build/dev/erlang/*/ebin -noinput -run relay_stdio_default_runner main`.
 //// It exits 0 on a clean EOF and 1 on any error.
 
 import gleam/string
