@@ -250,12 +250,19 @@ pub type FrameError {
   RuntimeStopped
 }
 
+/// A submitted frame: its bytes, which the runtime checks and decodes, or a
+/// frame the transport already decoded.
+type Inbound {
+  Encoded(BitArray)
+  Decoded(reducer.Frame)
+}
+
 /// The messages a runtime actor receives; used to name a supervised one.
 pub opaque type Message(context) {
   ReceiveFrame(
     exchange: ExchangeId,
     context: context,
-    bytes: BitArray,
+    inbound: Inbound,
     correlation: Option(Correlation),
     reply: Subject(Result(Nil, FrameError)),
   )
@@ -497,11 +504,38 @@ const call_timeout = 5000
 /// through the sink. The wait lasts as long as the runtime is busy, which is
 /// how a slow sink holds the transport's reader; a runtime that has exited
 /// answers `RuntimeStopped`.
+/// The runtime checks the frame's size and nesting depth, then decodes it
+/// once with `reducer.decode`.
 pub fn send_frame(
   runtime: Runtime(context),
   exchange: ExchangeId,
   context: context,
   bytes: BitArray,
+  correlation: Option(Correlation),
+) -> Result(Nil, FrameError) {
+  submit(runtime, exchange, context, Encoded(bytes), correlation)
+}
+
+/// Submits a frame the transport has already decoded with
+/// `reducer.decode`, for a transport that needs the decoded request before
+/// it submits it (an HTTP endpoint reads its routing fields). The transport
+/// checks the frame's size and nesting depth before it decodes; the runtime
+/// does not decode the frame again.
+pub fn send_decoded(
+  runtime: Runtime(context),
+  exchange: ExchangeId,
+  context: context,
+  frame: reducer.Frame,
+  correlation: Option(Correlation),
+) -> Result(Nil, FrameError) {
+  submit(runtime, exchange, context, Decoded(frame), correlation)
+}
+
+fn submit(
+  runtime: Runtime(context),
+  exchange: ExchangeId,
+  context: context,
+  inbound: Inbound,
   correlation: Option(Correlation),
 ) -> Result(Nil, FrameError) {
   let Runtime(subject) = runtime
@@ -515,7 +549,7 @@ pub fn send_frame(
       let reply = process.new_subject()
       process.send(
         subject,
-        ReceiveFrame(exchange, context, bytes, correlation, reply),
+        ReceiveFrame(exchange, context, inbound, correlation, reply),
       )
       let admitted =
         process.new_selector()
@@ -593,9 +627,9 @@ fn handle_message(
   message: Message(context),
 ) -> actor.Next(State(context), Message(context)) {
   case message {
-    ReceiveFrame(exchange, context, bytes, correlation, reply) -> {
+    ReceiveFrame(exchange, context, inbound, correlation, reply) -> {
       let #(state, result) =
-        receive_frame(state, exchange, context, bytes, correlation)
+        receive_frame(state, exchange, context, inbound, correlation)
       process.send(reply, result)
       actor.continue(state)
     }
@@ -724,19 +758,34 @@ fn receive_frame(
   state: State(context),
   exchange: ExchangeId,
   context: context,
-  bytes: BitArray,
+  inbound: Inbound,
   correlation: Option(Correlation),
 ) -> #(State(context), Result(Nil, FrameError)) {
+  case state.closed, inbound {
+    True, _ -> #(state, Error(RuntimeStopped))
+    False, Decoded(frame) -> admit(state, exchange, context, frame, correlation)
+    False, Encoded(bytes) ->
+      case check_and_decode(state.config, exchange, bytes) {
+        Error(error) -> #(state, Error(error))
+        Ok(frame) -> admit(state, exchange, context, frame, correlation)
+      }
+  }
+}
+
+// Size and depth are checked on the bytes, before the one decode.
+fn check_and_decode(
+  config: Config,
+  exchange: ExchangeId,
+  bytes: BitArray,
+) -> Result(reducer.Frame, FrameError) {
   let size = bit_array.byte_size(bytes)
   let exchange_int = reducer.exchange_id_to_int(exchange)
-  let config = state.config
-  case Nil {
-    _ if state.closed -> #(state, Error(RuntimeStopped))
-    _ if size > config.max_frame_bytes -> {
+  case size > config.max_frame_bytes {
+    True -> {
       emit.frame_rejected(exchange_int, telemetry.FrameTooLarge, config.label)
-      #(state, Error(FrameTooLarge(size, config.max_frame_bytes)))
+      Error(FrameTooLarge(size, config.max_frame_bytes))
     }
-    _ ->
+    False ->
       case v2026.depth_within(bytes, config.max_json_depth) {
         False -> {
           emit.frame_rejected(
@@ -744,57 +793,65 @@ fn receive_frame(
             telemetry.NestingTooDeep,
             config.label,
           )
-          #(state, Error(FrameTooDeep(config.max_json_depth)))
+          Error(FrameTooDeep(config.max_json_depth))
         }
-        True ->
-          case state.live_exchanges >= config.max_live_exchanges {
-            True -> {
-              emit.frame_rejected(
-                exchange_int,
-                telemetry.TooManyExchanges,
-                config.label,
-              )
-              #(
-                state,
-                Error(TooManyLiveExchanges(
-                  state.live_exchanges,
-                  config.max_live_exchanges,
-                )),
-              )
-            }
-            False -> {
-              let correlation = carrier.resolve(correlation, bytes)
-              let #(next, effects) =
-                reducer.step(
-                  state.reducer,
-                  reducer.Received(exchange, context, bytes, Some(correlation)),
-                )
-              // The reducer drops a frame on an exchange it already knows
-              // without effects; only an admitted exchange holds a slot.
-              let #(live, correlations) = case effects {
-                [] -> #(state.live_exchanges, state.exchange_correlations)
-                _ -> #(
-                  state.live_exchanges + 1,
-                  dict.insert(
-                    state.exchange_correlations,
-                    exchange_int,
-                    correlation,
-                  ),
-                )
-              }
-              let state =
-                State(
-                  ..state,
-                  reducer: next,
-                  live_exchanges: live,
-                  frame_correlation: Some(correlation),
-                  exchange_correlations: correlations,
-                )
-              let state = list.fold(effects, state, interpret)
-              #(State(..state, frame_correlation: None), Ok(Nil))
-            }
-          }
+        True -> Ok(reducer.decode(bytes))
       }
+  }
+}
+
+fn admit(
+  state: State(context),
+  exchange: ExchangeId,
+  context: context,
+  frame: reducer.Frame,
+  correlation: Option(Correlation),
+) -> #(State(context), Result(Nil, FrameError)) {
+  let exchange_int = reducer.exchange_id_to_int(exchange)
+  let config = state.config
+  case state.live_exchanges >= config.max_live_exchanges {
+    True -> {
+      emit.frame_rejected(
+        exchange_int,
+        telemetry.TooManyExchanges,
+        config.label,
+      )
+      #(
+        state,
+        Error(TooManyLiveExchanges(
+          state.live_exchanges,
+          config.max_live_exchanges,
+        )),
+      )
+    }
+    False -> {
+      let correlation =
+        carrier.resolve(correlation, reducer.frame_correlation(frame))
+      let #(next, effects) =
+        reducer.step(
+          state.reducer,
+          reducer.Received(exchange, context, frame, Some(correlation)),
+        )
+      // The reducer drops a frame on an exchange it already knows
+      // without effects; only an admitted exchange holds a slot.
+      let #(live, correlations) = case effects {
+        [] -> #(state.live_exchanges, state.exchange_correlations)
+        _ -> #(
+          state.live_exchanges + 1,
+          dict.insert(state.exchange_correlations, exchange_int, correlation),
+        )
+      }
+      let state =
+        State(
+          ..state,
+          reducer: next,
+          live_exchanges: live,
+          frame_correlation: Some(correlation),
+          exchange_correlations: correlations,
+        )
+      let state = list.fold(effects, state, interpret)
+      #(State(..state, frame_correlation: None), Ok(Nil))
+    }
   }
 }
 

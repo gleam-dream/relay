@@ -152,7 +152,7 @@ fn receive(
     reducer.Received(
       reducer.new_exchange_id(),
       "tenant",
-      wire_request(method, fields),
+      reducer.decode(wire_request(method, fields)),
       None,
     ),
   )

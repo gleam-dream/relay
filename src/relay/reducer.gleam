@@ -12,7 +12,9 @@
 //// unless you need to own the scheduling.
 ////
 //// A transport allocates an `ExchangeId` with `new_exchange_id` before
-//// parsing, so that a malformed frame still has a destination. `Input` and
+//// parsing, so that a malformed frame still has a destination, and decodes
+//// the frame's bytes once with `decode`; the reducer never parses them
+//// again. `Input` and
 //// `Effect` are revision-bound: they gain variants only in a major release.
 //// The state keeps up to 10,000 closed exchange records to suppress late or
 //// repeated output, and drops the oldest beyond that.
@@ -26,7 +28,10 @@
 ////   let state = reducer.init(server.new([]))
 ////   let exchange = reducer.new_exchange_id()
 ////   let #(_state, effects) =
-////     reducer.step(state, reducer.Received(exchange, Nil, bytes, None))
+////     reducer.step(
+////       state,
+////       reducer.Received(exchange, Nil, reducer.decode(bytes), None),
+////     )
 ////   effects
 //// }
 //// ```
@@ -44,6 +49,7 @@ import json/blueprint/value.{type Value}
 import relay/content.{type ResourceContents}
 import relay/internal/carrier
 import relay/internal/core
+import relay/internal/frame as inbound
 import relay/internal/jsonrpc.{type ProgressToken, type RequestId}
 import relay/internal/protocol/v2026_07_28 as v2026
 import relay/internal/subscriptions_state as subs
@@ -107,6 +113,23 @@ pub fn outcome_status(outcome: Outcome) -> Status {
   outcome.status
 }
 
+/// An inbound JSON-RPC frame, decoded once by `decode`. A frame that is not
+/// valid JSON-RPC still decodes; the reducer answers it with the matching
+/// error.
+pub type Frame =
+  inbound.Frame
+
+/// Decodes the bytes of one inbound frame. Call it once per frame and pass
+/// the result in `Received`; nothing downstream parses the bytes again.
+pub fn decode(bytes: BitArray) -> Frame {
+  inbound.decode(bytes)
+}
+
+/// The valid correlation a frame carries in `params._meta`, if any.
+pub fn frame_correlation(frame: Frame) -> Option(Correlation) {
+  inbound.correlation(frame)
+}
+
 /// What the reducer reacts to.
 pub type Input(context) {
   /// A frame arrived on a new exchange, with the context and correlation
@@ -115,7 +138,7 @@ pub type Input(context) {
   Received(
     exchange: ExchangeId,
     context: context,
-    bytes: BitArray,
+    frame: Frame,
     correlation: Option(Correlation),
   )
   Finished(invocation: InvocationId, outcome: Outcome)
@@ -325,10 +348,10 @@ pub fn step(
   input: Input(context),
 ) -> #(State(context), List(Effect(context))) {
   case input {
-    Received(exchange, context, bytes, correlation) ->
+    Received(exchange, context, frame, correlation) ->
       case dict.has_key(state.exchanges, key(exchange)) {
         True -> #(state, [])
-        False -> admit(state, exchange, context, bytes, correlation)
+        False -> admit(state, exchange, context, frame, correlation)
       }
     Finished(invocation, outcome) -> finish(state, invocation, outcome.response)
     Crashed(invocation) | TimedOut(invocation) ->
@@ -381,10 +404,10 @@ fn admit(
   state: State(context),
   exchange: ExchangeId,
   context: context,
-  bytes: BitArray,
+  frame: Frame,
   correlation: Option(Correlation),
 ) -> #(State(context), List(Effect(context))) {
-  case v2026.admit_bytes(bytes) {
+  case inbound.admission(frame) {
     v2026.AdmittedRejected(id, error) ->
       immediate(state, exchange, None, jsonrpc.error_to_json(id, error))
     v2026.AdmittedIgnored(_) -> #(mark_done(state, exchange), [Close(exchange)])
@@ -399,7 +422,7 @@ fn admit(
         state,
         exchange,
         context,
-        carrier.resolve(correlation, bytes),
+        carrier.resolve(correlation, inbound.correlation(frame)),
         request,
       )
   }
