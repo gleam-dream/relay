@@ -39,11 +39,9 @@ fn tools() -> List(tool.Tool(Nil)) {
 
 pub fn main() -> Nil {
   let config =
-    stdio.config()
-    // One-byte reads: a larger read waits until that many bytes arrived.
-    |> stdio.with_write_timeout(duration.milliseconds(300))
-    |> stdio.with_runtime(
-      runtime.config() |> runtime.with_max_live_exchanges(1),
+    stdio.Config(
+      runtime: runtime.config() |> runtime.with_max_live_exchanges(1),
+      write_timeout: duration.milliseconds(300),
     )
   case stdio.serve_with(server.new(tools()), Nil, config) {
     Ok(Nil) -> halt(0)

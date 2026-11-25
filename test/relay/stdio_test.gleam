@@ -297,7 +297,7 @@ pub fn stdio_rejects_invalid_settings_before_io_test() {
     stdio.serve_with(
       service,
       Nil,
-      stdio.config() |> stdio.with_runtime(bad_runtime),
+      stdio.Config(..stdio.config(), runtime: bad_runtime),
     )
 
   let bad_frames = runtime.config() |> runtime.with_max_frame_bytes(0)
@@ -305,11 +305,21 @@ pub fn stdio_rejects_invalid_settings_before_io_test() {
     stdio.serve_with(
       service,
       Nil,
-      stdio.config() |> stdio.with_runtime(bad_frames),
+      stdio.Config(..stdio.config(), runtime: bad_frames),
     )
 
   let assert "standard input ended in the middle of a frame" =
     stdio.describe_error(stdio.InvalidTrailingData(<<"x">>))
+
+  // Every write to standard output is timed; a timeout that cannot be met
+  // is refused before any I/O.
+  assert stdio.config().write_timeout == duration.seconds(5)
+  let assert Error(stdio.InvalidWriteTimeout(_)) =
+    stdio.serve_with(
+      service,
+      Nil,
+      stdio.Config(..stdio.config(), write_timeout: duration.milliseconds(0)),
+    )
 }
 
 // --- framer ------------------------------------------------------------------
@@ -388,25 +398,28 @@ pub fn framer_incomplete_eof_test() {
 
 pub fn writer_failure_is_returned_to_the_caller_test() {
   let assert Ok(writer) =
-    stdio_frames.start_writer(fn(_bytes) { Error("closed pipe") })
+    stdio_frames.start_writer(fn(_bytes) { Error("closed pipe") }, 1000)
   let assert Error(stdio_frames.SinkFailed("closed pipe")) =
-    stdio_frames.write_bytes(writer, <<"response\n">>, 1000)
-  stdio_frames.stop_writer(writer, 1000)
+    stdio_frames.write_bytes(writer, <<"response\n">>)
+  stdio_frames.stop_writer(writer)
 }
 
 pub fn stalled_writer_times_out_and_then_fails_at_once_test() {
   let release = process.new_subject()
   let assert Ok(writer) =
-    stdio_frames.start_writer(fn(_bytes) {
-      // A sink that never returns, like a write to a full pipe.
-      process.receive_forever(release)
-    })
+    stdio_frames.start_writer(
+      fn(_bytes) {
+        // A sink that never returns, like a write to a full pipe.
+        process.receive_forever(release)
+      },
+      50,
+    )
   let assert Error(stdio_frames.WriteTimedOut) =
-    stdio_frames.write_bytes(writer, <<"first\n">>, 50)
-  // The stuck writer is gone: a later write does not wait for its timeout.
+    stdio_frames.write_bytes(writer, <<"first\n">>)
+  // The stuck writer is gone: a later write fails without waiting.
   let assert Error(stdio_frames.WriterStopped) =
-    stdio_frames.write_bytes(writer, <<"second\n">>, 60_000)
-  stdio_frames.stop_writer(writer, 60_000)
+    stdio_frames.write_bytes(writer, <<"second\n">>)
+  stdio_frames.stop_writer(writer)
 }
 
 // --- a spawned child over OS pipes -------------------------------------------

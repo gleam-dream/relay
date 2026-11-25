@@ -28,10 +28,13 @@
 //// }
 //// ```
 ////
-//// | Setting | Default | Setter |
-//// | --- | --- | --- |
-//// | frame, depth, handler limits | `relay/runtime.config()` | `with_runtime` |
-//// | one write to standard output | 5 s, then `StdoutBroken` | `with_write_timeout` |
+//// `Config` is a record: change a field with
+//// `stdio.Config(..stdio.config(), write_timeout: duration.seconds(10))`.
+////
+//// | Field | Default |
+//// | --- | --- |
+//// | `runtime`: frame, depth, handler limits | `relay/runtime.config()` |
+//// | `write_timeout`: one write to standard output | 5 s, then `StdoutBroken` |
 ////
 //// ## Output pressure
 ////
@@ -44,7 +47,6 @@
 
 import gleam/bit_array
 import gleam/erlang/process.{type Pid, type Subject}
-import gleam/int
 import gleam/option.{None, Some}
 import gleam/result
 import gleam/time/duration.{type Duration}
@@ -59,35 +61,29 @@ import relay/runtime.{type Runtime}
 import relay/server.{type Server}
 import relay/telemetry
 
-/// Stdio settings. Build with `config()` and `with_runtime`.
-pub opaque type Config {
-  Config(runtime: runtime.Config, write_timeout_ms: Int)
-}
-
-/// The default runtime limits.
-pub fn config() -> Config {
-  Config(runtime: runtime.config(), write_timeout_ms: 5000)
-}
-
-/// How long one write to standard output may take before the output counts
-/// as broken and `serve` stops with `StdoutBroken`. Default 5 s; a shorter
-/// value than 1 ms is treated as 1 ms.
-pub fn with_write_timeout(config: Config, timeout: Duration) -> Config {
+/// Stdio settings. Start from `config()` and update the fields you need.
+pub type Config {
   Config(
-    ..config,
-    write_timeout_ms: int.max(1, duration.to_milliseconds(timeout)),
+    /// The runtime limits: frame size, nesting depth, handler timeout and
+    /// the rest of `relay/runtime.Config`.
+    runtime: runtime.Config,
+    /// How long one write to standard output may take. A write that takes
+    /// longer counts as broken output and `serve` stops with
+    /// `StdoutBroken`. At least 1 ms.
+    write_timeout: Duration,
   )
 }
 
-/// The runtime limits: frame size, nesting depth, handler timeout and the
-/// rest of `relay/runtime.Config`.
-pub fn with_runtime(config: Config, runtime: runtime.Config) -> Config {
-  Config(..config, runtime: runtime)
+/// The default runtime limits and a 5 s write timeout.
+pub fn config() -> Config {
+  Config(runtime: runtime.config(), write_timeout: duration.seconds(5))
 }
 
 /// Why `serve` stopped with an error.
 pub type StdioError {
   InvalidRuntimeConfig(field: runtime.ConfigField)
+  /// The write timeout is shorter than 1 ms.
+  InvalidWriteTimeout(timeout: Duration)
   /// The VM reads standard input itself because it was started without
   /// `-noinput`.
   StdinOwnedByVm
@@ -105,6 +101,7 @@ pub type StdioError {
 pub fn describe_error(error: StdioError) -> String {
   case error {
     InvalidRuntimeConfig(_) -> "a stdio runtime setting is out of range"
+    InvalidWriteTimeout(_) -> "the stdio write timeout must be at least 1 ms"
     StdinOwnedByVm ->
       "the VM reads standard input itself; start it with -noinput"
     ReadFailed -> "standard input could not be read"
@@ -143,6 +140,11 @@ pub fn serve_with(
   context: context,
   config: Config,
 ) -> Result(Nil, StdioError) {
+  let write_timeout_ms = duration.to_milliseconds(config.write_timeout)
+  use _ <- result.try(case write_timeout_ms >= 1 {
+    True -> Ok(Nil)
+    False -> Error(InvalidWriteTimeout(config.write_timeout))
+  })
   use runtime_config <- result.try(
     runtime.validate(config.runtime)
     |> result.map_error(fn(error) {
@@ -154,7 +156,8 @@ pub fn serve_with(
   )
   use _ <- result.try(reserve_stdio() |> result.replace_error(StdinOwnedByVm))
   let previous_leader = lead_output_to_stderr()
-  let outcome = serve_reserved(server, context, config, runtime_config)
+  let outcome =
+    serve_reserved(server, context, runtime_config, write_timeout_ms)
   restore_group_leader(previous_leader)
   outcome
 }
@@ -162,11 +165,11 @@ pub fn serve_with(
 fn serve_reserved(
   server: Server(context),
   context: context,
-  config: Config,
   runtime_config: runtime.Config,
+  write_timeout_ms: Int,
 ) -> Result(Nil, StdioError) {
   use writer <- result.try(
-    stdio_frames.start_writer(write_stdout)
+    stdio_frames.start_writer(write_stdout, write_timeout_ms)
     |> result.replace_error(StartupFailed),
   )
   let write_errors = process.new_subject()
@@ -174,7 +177,7 @@ fn serve_reserved(
     case output {
       runtime.OutputClose(_) -> Ok(Nil)
       runtime.OutputWrite(_, bytes) ->
-        case stdio_frames.write_bytes(writer, bytes, config.write_timeout_ms) {
+        case stdio_frames.write_bytes(writer, bytes) {
           Ok(Nil) -> Ok(Nil)
           Error(_) -> {
             process.send(write_errors, StdoutBroken)
@@ -186,27 +189,18 @@ fn serve_reserved(
   // One runtime per OS process: hold the server so calls copy no tool.
   case runtime.start_holding(server, runtime_config, sink) {
     Error(_) -> {
-      stdio_frames.stop_writer(writer, config.write_timeout_ms)
+      stdio_frames.stop_writer(writer)
       Error(StartupFailed)
     }
     Ok(rt) -> {
       let framer =
         stdio_frames.new_framer(runtime.max_frame_bytes(runtime_config))
       let reader = start_reader()
-      let outcome =
-        read_loop(
-          rt,
-          context,
-          reader,
-          writer,
-          config.write_timeout_ms,
-          framer,
-          write_errors,
-        )
+      let outcome = read_loop(rt, context, reader, writer, framer, write_errors)
       process.kill(reader.0)
       runtime.close(rt)
       runtime.stop(rt)
-      stdio_frames.stop_writer(writer, config.write_timeout_ms)
+      stdio_frames.stop_writer(writer)
       use _ <- result.try(outcome)
       case process.receive(write_errors, 0) {
         Ok(error) -> Error(error)
@@ -243,7 +237,6 @@ fn read_loop(
   context: context,
   reader: #(Pid, Subject(ReadOutcome)),
   writer: Writer,
-  write_timeout_ms: Int,
   framer: Framer,
   write_errors: Subject(StdioError),
 ) -> Result(Nil, StdioError) {
@@ -253,13 +246,13 @@ fn read_loop(
     |> process.select_map(reader.1, Stdin)
     |> process.select_map(write_errors, WriteFailed)
     |> process.select_specific_monitor(monitor, fn(_) { ReaderDown })
-  loop(rt, context, #(writer, write_timeout_ms), framer, selector)
+  loop(rt, context, writer, framer, selector)
 }
 
 fn loop(
   rt: Runtime(context),
   context: context,
-  writer: #(Writer, Int),
+  writer: Writer,
   framer: Framer,
   selector: process.Selector(Signal),
 ) -> Result(Nil, StdioError) {
@@ -292,7 +285,7 @@ const too_deep =
 fn submit(
   rt: Runtime(context),
   context: context,
-  writer: #(Writer, Int),
+  writer: Writer,
   frames: List(stdio_frames.FramerResult),
 ) -> Result(Nil, StdioError) {
   case frames {
@@ -331,21 +324,18 @@ fn submit(
   }
 }
 
-fn write(writer: #(Writer, Int), line: String) -> Result(Nil, StdioError) {
+fn write(writer: Writer, line: String) -> Result(Nil, StdioError) {
   write_frame(writer, bit_array.from_string(line))
 }
 
-fn write_frame(
-  writer: #(Writer, Int),
-  bytes: BitArray,
-) -> Result(Nil, StdioError) {
-  stdio_frames.write_bytes(writer.0, bytes, writer.1)
+fn write_frame(writer: Writer, bytes: BitArray) -> Result(Nil, StdioError) {
+  stdio_frames.write_bytes(writer, bytes)
   |> result.replace_error(StdoutBroken)
 }
 
 // Answers a request the runtime did not admit. A notification gets nothing.
 fn refuse(
-  writer: #(Writer, Int),
+  writer: Writer,
   frame: BitArray,
   message: String,
 ) -> Result(Nil, StdioError) {

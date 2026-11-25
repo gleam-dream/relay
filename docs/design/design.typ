@@ -495,7 +495,7 @@
       [Cancelled handler grace before kill], [5 s], [`runtime.with_cancellation_grace`],
       [Tombstones], [60 s, at most 10,000], [`runtime.with_tombstone_retention`, `runtime.with_max_tombstones`],
       [Closed exchange records per connection], [About 10,000], [Fixed],
-      [Stdio write to standard output], [5 s, then StdoutBroken], [`stdio.with_write_timeout`],
+      [Stdio write to standard output], [5 s, then StdoutBroken], [`stdio.Config` field `write_timeout`; every write is timed],
       [Client request timeout], [30 s], [`client.with_timeout`; per call `client.with_deadline`],
       [Client connect], [10 s], [`client.with_connect_timeout`],
       [Client response size], [1 MiB], [`client.with_max_response_bytes`],

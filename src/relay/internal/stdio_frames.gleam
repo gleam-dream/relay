@@ -161,7 +161,7 @@ type WriterMessage {
 }
 
 pub opaque type Writer {
-  Writer(subject: Subject(WriterMessage), pid: Pid)
+  Writer(subject: Subject(WriterMessage), pid: Pid, timeout_ms: Int)
 }
 
 /// Why a write did not complete.
@@ -175,11 +175,13 @@ pub type WriteError {
   WriterStopped
 }
 
-/// Starts a process that runs `sink` for one write at a time. The writer is
-/// not linked to its caller: it stops when the calling process exits, and a
-/// write that times out stops it.
+/// Starts a process that runs `sink` for one write at a time. Every write
+/// waits at most `timeout_ms` for the sink. The writer is not linked to its
+/// caller: it stops when the calling process exits, and a write that times
+/// out stops it.
 pub fn start_writer(
   sink: fn(BitArray) -> Result(Nil, String),
+  timeout_ms: Int,
 ) -> Result(Writer, actor.StartError) {
   let owner = process.self()
   let builder =
@@ -214,22 +216,18 @@ pub fn start_writer(
       // Stopping the writer after a stalled write must not take its owner
       // with it; the writer watches the owner through its monitor instead.
       process.unlink(started.pid)
-      Ok(Writer(started.data, started.pid))
+      Ok(Writer(started.data, started.pid, timeout_ms))
     }
     Error(err) -> Error(err)
   }
 }
 
-/// Writes `bytes` and waits at most `timeout_ms` for the sink to finish.
+/// Writes `bytes` and waits at most the writer's timeout for the sink.
 /// The wait is the back-pressure a slow reader puts on the producer. When it
 /// runs out the output is treated as broken: the writer is stopped, because
 /// a sink that is stuck in a write cannot serve the writes behind it.
-pub fn write_bytes(
-  writer: Writer,
-  bytes: BitArray,
-  timeout_ms: Int,
-) -> Result(Nil, WriteError) {
-  let Writer(subject, pid) = writer
+pub fn write_bytes(writer: Writer, bytes: BitArray) -> Result(Nil, WriteError) {
+  let Writer(subject, pid, timeout_ms) = writer
   let monitor = process.monitor(pid)
   let reply = process.new_subject()
   process.send(subject, WriteBytes(bytes, reply))
@@ -248,10 +246,10 @@ pub fn write_bytes(
   }
 }
 
-/// Stops the writer after the writes already sent to it, waiting at most
-/// `timeout_ms` before stopping it regardless.
-pub fn stop_writer(writer: Writer, timeout_ms: Int) -> Nil {
-  let Writer(subject, pid) = writer
+/// Stops the writer after the writes already sent to it, waiting at most the
+/// writer's timeout before stopping it regardless.
+pub fn stop_writer(writer: Writer) -> Nil {
+  let Writer(subject, pid, timeout_ms) = writer
   let monitor = process.monitor(pid)
   let reply = process.new_subject()
   process.send(subject, CloseWriter(reply))

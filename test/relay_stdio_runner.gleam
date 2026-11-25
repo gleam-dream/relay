@@ -81,12 +81,12 @@ fn tools() -> List(tool.Tool(String)) {
 
 pub fn main() -> Nil {
   let config =
-    stdio.config()
-    |> stdio.with_runtime(
-      runtime.config()
-      |> runtime.with_max_frame_bytes(1024)
-      |> runtime.with_max_json_depth(16)
-      |> runtime.with_cancellation_grace(duration.milliseconds(500)),
+    stdio.Config(
+      ..stdio.config(),
+      runtime: runtime.config()
+        |> runtime.with_max_frame_bytes(1024)
+        |> runtime.with_max_json_depth(16)
+        |> runtime.with_cancellation_grace(duration.milliseconds(500)),
     )
   case stdio.serve_with(server.new(tools()), "child-server", config) {
     Ok(Nil) -> halt(0)
