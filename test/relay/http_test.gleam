@@ -995,6 +995,18 @@ pub fn mounted_handler_refuses_deep_json_test() {
   string.contains(testing.body_text(response), "-32602") |> should.be_true
 }
 
+pub fn depth_is_checked_before_the_body_is_parsed_test() {
+  let handler = mounted(http.new(echo_server()))
+  // Deeper than the limit and not valid JSON: the depth scan refuses it
+  // before any parse is attempted.
+  let deep_and_broken =
+    testing.request("tools/call", [])
+    |> request.set_body(bit_array.from_string(string.repeat("[", 70)))
+  let response = http.handle(handler, deep_and_broken)
+  response.status |> should.equal(400)
+  string.contains(testing.body_text(response), "nesting") |> should.be_true
+}
+
 pub fn context_builder_sees_the_request_test() {
   let invoked = process.new_subject()
   let whoami =

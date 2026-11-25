@@ -76,6 +76,7 @@
 //// request worker, not to the process calling buffered `handle`.
 
 import gleam/bit_array
+import gleam/bool
 import gleam/bytes_tree.{type BytesTree}
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Pid, type Subject}
@@ -101,6 +102,7 @@ import relay/authorization.{
 }
 import relay/internal/carrier
 import relay/internal/emit
+import relay/internal/frame as inbound
 import relay/internal/held.{type Held}
 import relay/internal/http_mist
 import relay/internal/jsonrpc
@@ -1370,7 +1372,11 @@ fn dispatch(
 ) -> http_mist.Reply {
   let config = held.get(lease.config)
   let body = request.body
-  // One parse of the body gives the routing fields and the admission.
+  // The nesting depth is checked on the bytes, then one decode of the body
+  // gives the routing fields and the admitted request the runtime receives.
+  use <- bool.lazy_guard(!v2026.depth_within(body, config.max_json_depth), fn() {
+    too_deep(config, correlation)
+  })
   case v2026.http_inspect(body) {
     Error(Nil) ->
       reject(
@@ -1380,7 +1386,7 @@ fn dispatch(
         correlation,
         "Invalid MCP JSON-RPC envelope",
       )
-    Ok(#(route, admission)) ->
+    Ok(#(route, decoded)) ->
       case
         valid_route_headers(request, route)
         && valid_parameter_headers(request, config.server, route)
@@ -1398,7 +1404,7 @@ fn dispatch(
           ))
         }
         True ->
-          case v2026.http_admission_failure(admission) {
+          case v2026.http_admission_failure(decoded.admission) {
             Some(v2026.HttpFailure(status, failure)) ->
               http_mist.Buffered(json_response(status, failure))
             None ->
@@ -1416,7 +1422,7 @@ fn dispatch(
                     handler,
                     lease,
                     route,
-                    body,
+                    inbound.from_decoded(decoded),
                     context,
                     correlation,
                     scope,
@@ -1428,11 +1434,31 @@ fn dispatch(
   }
 }
 
+fn too_deep(
+  config: Config(context),
+  correlation: Correlation,
+) -> http_mist.Reply {
+  emit.http_rejected(400, telemetry.MalformedBody, correlation, config.label)
+  http_mist.Buffered(json_response(
+    400,
+    bit_array.from_string(
+      json.to_string(jsonrpc.error_to_json(
+        None,
+        jsonrpc.RpcError(
+          jsonrpc.invalid_request_code,
+          "JSON nesting exceeds the configured depth.",
+          None,
+        ),
+      )),
+    ),
+  ))
+}
+
 fn run(
   handler: Handler(context),
   lease: Lease(context),
   route: v2026.HttpRoute,
-  body: BitArray,
+  frame: reducer.Frame,
   context: context,
   correlation: Correlation,
   scope: request_owner.Scope,
@@ -1486,30 +1512,14 @@ fn run(
           let exchange = reducer.new_exchange_id()
           attach_runtime(broker, rt, exchange)
           case
-            runtime.send_frame(rt, exchange, context, body, Some(correlation))
+            runtime.send_decoded(
+              rt,
+              exchange,
+              context,
+              frame,
+              Some(correlation),
+            )
           {
-            Error(runtime.FrameTooDeep(_)) -> {
-              finish(broker, rt)
-              emit.http_rejected(
-                400,
-                telemetry.MalformedBody,
-                correlation,
-                config.label,
-              )
-              http_mist.Buffered(json_response(
-                400,
-                bit_array.from_string(
-                  json.to_string(jsonrpc.error_to_json(
-                    None,
-                    jsonrpc.RpcError(
-                      jsonrpc.invalid_request_code,
-                      "JSON nesting exceeds the configured depth.",
-                      None,
-                    ),
-                  )),
-                ),
-              ))
-            }
             Error(_) -> {
               finish(broker, rt)
               http_mist.Buffered(plain(

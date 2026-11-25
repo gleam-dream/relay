@@ -847,7 +847,7 @@ pub fn call_accessors_expose_the_invocation_test() {
       reducer.Received(
         exchange,
         "prefix:",
-        tools_call_bytes("probe", "hello"),
+        reducer.decode(tools_call_bytes("probe", "hello")),
         Some(corr),
       ),
     )

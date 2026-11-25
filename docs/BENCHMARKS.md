@@ -34,6 +34,21 @@ in the endpoint and classifies the response once.
 | 110 kB | 3.33 (3.20-3.38)    | 2.44 (2.42-2.53)    |
 | 1.1 MB | 32.4 (31.4-33.9)    | 25.9 (23.7-26.3)    |
 
+## Decoding the request once
+
+Measured on 2026-11-25 on the same shared 10-core Apple Silicon Mac with other
+builds running, three runs each, median and range in milliseconds per request.
+"Before" is the "After" build above: the endpoint parses the body once for
+routing and admission, then the reducer parses it again and extracts the
+arguments with exact numbers a second time. "After" decodes the body once,
+with exact numbers, and the runtime receives the decoded request.
+
+| Body   | Before              | After               |
+| ------ | ------------------- | ------------------- |
+| 1.3 kB | 0.138 (0.138-0.139) | 0.125 (0.121-0.174) |
+| 110 kB | 2.43 (2.35-2.43)    | 1.05 (1.05-1.09)    |
+| 1.1 MB | 23.5 (23.0-23.9)    | 9.28 (9.25-9.43)    |
+
 ## Limits
 
 The benchmark measures one request at a time on one scheduler's worth of work.

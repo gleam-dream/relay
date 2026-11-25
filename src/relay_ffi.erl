@@ -3,8 +3,7 @@
     is_null/1,
     dynamic_to_json_string/1,
     raw_json/1,
-    extract_arguments_as_blueprint_value/1,
-    extract_input_responses_as_blueprint_value/1,
+    decode_frame/1,
     unique_integer/0,
     rescue_run/1,
     monotonic_time_ms/0,
@@ -97,45 +96,69 @@ dynamic_to_json_string(Data) ->
         _:_ -> <<"{}"/utf8>>
     end.
 
-extract_arguments_as_blueprint_value(RawJsonBin) ->
+%% Decodes a JSON-RPC frame once. Numbers are kept as their source text, so
+%% `tools/call` arguments and `inputResponses` become exact JSON Blueprint
+%% values; those two members are then replaced by `null` in the returned
+%% envelope, and every other number in it becomes an ordinary integer or
+%% float. Returns `{ok, {Envelope, {extracted, Arguments, InputResponses}}}`
+%% or `{error, nil}` when the bytes are not one JSON value.
+decode_frame(Bin) ->
     Decoders = #{
         float => fun(B) -> {raw_number, B} end,
         integer => fun(B) -> {raw_number, B} end
     },
     try
-        {Root, ok, <<>>} = json:decode(RawJsonBin, ok, Decoders),
-        Params = maps:get(<<"params">>, Root, #{}),
-        case maps:find(<<"arguments">>, Params) of
-            {ok, ArgsTerm} ->
-                Limits = json@blueprint@number:limits(1024, 100, 1000),
-                case term_to_blueprint_value(ArgsTerm, Limits) of
-                    {ok, {object, Entries}} -> {ok, {object, Entries}};
-                    _ -> {error, invalid_arguments}
-                end;
-            error ->
-                {ok, {object, []}}
+        {Root, ok, Rest} = json:decode(Bin, ok, Decoders),
+        case is_json_whitespace(Rest) of
+            true -> {ok, split_frame(Root)};
+            false -> {error, nil}
         end
     catch
-        _:_ -> {error, parse_error}
+        _:_ -> {error, nil}
     end.
 
-extract_input_responses_as_blueprint_value(RawJsonBin) ->
-    Decoders = #{
-        float => fun(B) -> {raw_number, B} end,
-        integer => fun(B) -> {raw_number, B} end
-    },
-    try
-        {Root, ok, <<>>} = json:decode(RawJsonBin, ok, Decoders),
-        Params = maps:get(<<"params">>, Root, #{}),
-        case maps:find(<<"inputResponses">>, Params) of
-            {ok, Responses} when is_map(Responses) ->
-                Limits = json@blueprint@number:limits(1024, 100, 1000),
-                term_to_blueprint_value(Responses, Limits);
-            _ -> {error, invalid_input_responses}
-        end
-    catch
-        _:_ -> {error, parse_error}
+is_json_whitespace(<<>>) -> true;
+is_json_whitespace(<<C, Rest/binary>>) when C =:= $\s; C =:= $\t; C =:= $\n; C =:= $\r ->
+    is_json_whitespace(Rest);
+is_json_whitespace(_) -> false.
+
+split_frame(#{<<"params">> := Params} = Root) when is_map(Params) ->
+    Limits = json@blueprint@number:limits(1024, 100, 1000),
+    {Arguments, Params1} =
+        case {maps:get(<<"method">>, Root, undefined), maps:find(<<"arguments">>, Params)} of
+            {<<"tools/call">>, {ok, Args}} ->
+                {object_value(Args, Limits), Params#{<<"arguments">> := null}};
+            _ ->
+                {{ok, {object, []}}, Params}
+        end,
+    {Responses, Params2} =
+        case maps:find(<<"inputResponses">>, Params1) of
+            {ok, Found} when is_map(Found) ->
+                {term_to_blueprint_value(Found, Limits), Params1#{<<"inputResponses">> := null}};
+            {ok, _} ->
+                {{error, nil}, Params1#{<<"inputResponses">> := null}};
+            error ->
+                {{error, nil}, Params1}
+        end,
+    {native_numbers(Root#{<<"params">> := Params2}), {extracted, Arguments, Responses}};
+split_frame(Root) ->
+    {native_numbers(Root), {extracted, {ok, {object, []}}, {error, nil}}}.
+
+object_value(Term, Limits) ->
+    case term_to_blueprint_value(Term, Limits) of
+        {ok, {object, Entries}} -> {ok, {object, Entries}};
+        _ -> {error, nil}
     end.
+
+native_numbers({raw_number, Text}) ->
+    {Number, ok, _} = json:decode(Text, ok, #{}),
+    Number;
+native_numbers(Map) when is_map(Map) ->
+    maps:map(fun(_Key, Value) -> native_numbers(Value) end, Map);
+native_numbers(List) when is_list(List) ->
+    [native_numbers(Item) || Item <- List];
+native_numbers(Other) ->
+    Other.
 
 term_to_blueprint_value(null, _Limits) -> {ok, null};
 term_to_blueprint_value(true, _Limits) -> {ok, {bool, true}};

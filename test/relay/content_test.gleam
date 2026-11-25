@@ -298,7 +298,12 @@ pub fn rich_content_families_survive_server_wire_encoding_test() {
   let #(next, effects) =
     reducer.step(
       reducer.init(srv),
-      reducer.Received(reducer.new_exchange_id(), Nil, body, None),
+      reducer.Received(
+        reducer.new_exchange_id(),
+        Nil,
+        reducer.decode(body),
+        None,
+      ),
     )
   let assert [reducer.Admitted(_, "tools/call"), reducer.Start(invocation)] =
     effects

@@ -102,7 +102,10 @@ fn reducer_doc_example(bytes: BitArray) -> List(reducer.Effect(Nil)) {
   let state = reducer.init(server.new([]))
   let exchange = reducer.new_exchange_id()
   let #(_state, effects) =
-    reducer.step(state, reducer.Received(exchange, Nil, bytes, None))
+    reducer.step(
+      state,
+      reducer.Received(exchange, Nil, reducer.decode(bytes), None),
+    )
   effects
 }
 
