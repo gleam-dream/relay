@@ -31,7 +31,7 @@
     watch_client_close/1,
     set_send_timeout/2,
     decode_base64_strict/1,
-    start_stdio_client_port/3,
+    start_stdio_client_port/4,
     send_stdio_client_command/2,
     close_stdio_client_port/1,
     json_depth_within/2,
@@ -448,18 +448,40 @@ stop_supervisor(Pid) when is_pid(Pid) ->
     try sys:terminate(Pid, shutdown, 5000) catch _:_ -> ok end,
     nil.
 
-start_stdio_client_port(CmdBin, ArgsList, GleamSubject) ->
+%% The environment of a stdio child: the variables a program needs to run
+%% (the same allow-list the reference MCP SDKs use), inherited from this OS
+%% process, plus the ones the caller added. A port inherits the whole
+%% environment unless each other variable is unset, so the rest are unset.
+child_environment(Added) ->
+    Allowed = case os:type() of
+        {win32, _} ->
+            ["APPDATA", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "PATH",
+             "PROCESSOR_ARCHITECTURE", "SYSTEMDRIVE", "SYSTEMROOT", "TEMP",
+             "USERNAME", "USERPROFILE", "PROGRAMFILES"];
+        _ ->
+            ["HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER"]
+    end,
+    Explicit = [{unicode:characters_to_list(Name), unicode:characters_to_list(Value)}
+                || {Name, Value} <- Added],
+    ExplicitNames = [Name || {Name, _} <- Explicit],
+    Unset = [{Name, false} || {Name, _} <- os:env(),
+                              not lists:member(Name, Allowed),
+                              not lists:member(Name, ExplicitNames)],
+    Unset ++ Explicit.
+
+start_stdio_client_port(CmdBin, ArgsList, Added, GleamSubject) ->
     Parent = self(),
     OpenRef = make_ref(),
     Cmd = binary_to_list(CmdBin),
     Args = [binary_to_list(A) || A <- ArgsList],
+    Env = child_environment(Added),
     case resolve_stdio_executable(Cmd) of
         {error, Reason} -> {error, Reason};
         {ok, Executable} ->
             {Pid, Monitor} = spawn_monitor(fun() ->
                 try erlang:open_port(
                     {spawn_executable, Executable},
-                    [stream, binary, use_stdio, exit_status, {args, Args}]
+                    [stream, binary, use_stdio, exit_status, {args, Args}, {env, Env}]
                 ) of
                     Port ->
                         Parent ! {port_ready, OpenRef, {ok, self()}},

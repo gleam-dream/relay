@@ -63,10 +63,7 @@ pub opaque type Client {
 }
 
 type Message {
-  OpenPort(
-    command: fn() -> #(String, List(String)),
-    reply: Subject(Result(Nil, Nil)),
-  )
+  OpenPort(command: fn() -> Command, reply: Subject(Result(Nil, Nil)))
   Request(
     bytes: BitArray,
     id: String,
@@ -116,10 +113,21 @@ type State {
   )
 }
 
+/// What to launch: the executable, its arguments, and the variables added
+/// to the child's allow-listed environment.
+pub type Command {
+  Command(
+    executable: String,
+    arguments: List(String),
+    environment: List(#(String, String)),
+  )
+}
+
 @external(erlang, "relay_ffi", "start_stdio_client_port")
 fn start_port(
   executable: String,
   args: List(String),
+  environment: List(#(String, String)),
   subject: Subject(Message),
 ) -> Result(Pid, String)
 
@@ -135,10 +143,11 @@ fn monotonic_ms() -> Int
 @external(erlang, "relay_ffi", "mailbox_size")
 fn mailbox_size(pid: Pid) -> Int
 
-/// Starts the child. `command` returns the executable and its arguments;
-/// the executable is launched directly, never through a shell.
+/// Starts the child. `command` returns what to launch; the executable is
+/// launched directly, never through a shell, with an allow-listed
+/// environment and the command's own variables.
 pub fn connect(
-  command: fn() -> #(String, List(String)),
+  command: fn() -> Command,
   timeout_ms: Int,
   max_frame_bytes: Int,
 ) -> Result(Client, Nil) {
@@ -322,8 +331,8 @@ fn handle_message(
 ) -> actor.Next(State, Message) {
   case message {
     OpenPort(command, reply) -> {
-      let #(executable, args) = command()
-      case start_port(executable, args, state.subject) {
+      let Command(executable, args, environment) = command()
+      case start_port(executable, args, environment, state.subject) {
         Error(_) -> {
           process.send(reply, Error(Nil))
           actor.continue(state)

@@ -143,6 +143,7 @@ pub opaque type Config {
     http_client: Option(http_gun.Client),
     max_pending_calls: Int,
     label: Option(String),
+    environment: fn() -> List(#(String, String)),
   )
 }
 
@@ -161,6 +162,7 @@ fn defaults(target: Target) -> Config {
     http_client: None,
     max_pending_calls: 64,
     label: None,
+    environment: fn() { [] },
   )
 }
 
@@ -291,6 +293,12 @@ fn unbracket(host: String) -> String {
 /// standard input and output. The executable runs directly, never through a
 /// shell. The command is held in a closure, so it does not print in
 /// `string.inspect`, crash reports or logs.
+///
+/// The child does not inherit this VM's environment. It receives only the
+/// variables a program needs to run (`HOME`, `LOGNAME`, `PATH`, `SHELL`,
+/// `TERM` and `USER`; on Windows the system and profile directories,
+/// `PATH`, `TEMP` and `USERNAME`), and the ones added with
+/// `with_environment`.
 pub fn stdio(executable: String, arguments: List(String)) -> Config {
   defaults(StdioTarget(fn() { #(executable, arguments) }))
 }
@@ -364,6 +372,21 @@ pub fn allow_plaintext_headers(config: Config) -> Config {
   Config(..config, plaintext_headers: True)
 }
 
+/// Adds variables to a stdio child's environment, on top of the allow-listed
+/// ones it inherits; a variable named here replaces an inherited one. Each
+/// call adds to the earlier ones. The values are held in a closure, so they
+/// do not print in `string.inspect`, crash reports or logs. A name must be
+/// non-empty and contain no `=`, and no name or value may contain a NUL
+/// byte; `connect` refuses the configuration otherwise, and for an HTTP or
+/// in-process target, with `InvalidConfig(Environment)`.
+pub fn with_environment(
+  config: Config,
+  variables: List(#(String, String)),
+) -> Config {
+  let earlier = config.environment
+  Config(..config, environment: fn() { list.append(earlier(), variables) })
+}
+
 /// Trusts the CA certificates in this PEM file instead of the system's, for
 /// HTTPS.
 pub fn with_ca_cert_file(config: Config, path: String) -> Config {
@@ -400,6 +423,7 @@ pub type ConfigField {
   CaCertFile
   MaxPendingCalls
   Headers
+  Environment
 }
 
 /// Whether the server may have received a request.
@@ -648,6 +672,7 @@ fn config_field_name(field: ConfigField) -> String {
     CaCertFile -> "the CA certificate file"
     MaxPendingCalls -> "the pending call limit"
     Headers -> "the request headers"
+    Environment -> "the stdio child environment"
   }
 }
 
@@ -728,8 +753,14 @@ fn validate(config: Config) -> Result(Config, Error) {
       case ms(config.timeout) > 0, ms(config.connect_timeout) > 0 {
         False, _ -> Error(config_error(RequestTimeout))
         _, False -> Error(config_error(ConnectTimeout))
-        True, True ->
+        True, True -> {
+          let environment = config.environment()
+          let environment_fits = case config.target {
+            StdioTarget(_) -> valid_environment(environment)
+            HttpTarget(..) | InProcessTarget(_) -> environment == []
+          }
           case config.ca_cert_file, config.target {
+            _, _ if !environment_fits -> Error(config_error(Environment))
             Some(""), _ -> Error(config_error(CaCertFile))
             Some(_), HttpTarget(secure: False, ..) ->
               Error(config_error(CaCertFile))
@@ -737,8 +768,19 @@ fn validate(config: Config) -> Result(Config, Error) {
               Error(config_error(CaCertFile))
             _, _ -> Ok(config)
           }
+        }
       }
   }
+}
+
+fn valid_environment(variables: List(#(String, String))) -> Bool {
+  list.all(variables, fn(variable) {
+    let #(name, value) = variable
+    name != ""
+    && !string.contains(name, "=")
+    && !string.contains(name, "\u{0000}")
+    && !string.contains(value, "\u{0000}")
+  })
 }
 
 /// Validates the configuration and connects: starts the HTTP client, the
@@ -1408,7 +1450,10 @@ fn stdio_peer(
 ) -> Result(Peer, Error) {
   case
     stdio_client.connect(
-      command,
+      fn() {
+        let #(executable, arguments) = command()
+        stdio_client.Command(executable, arguments, config.environment())
+      },
       ms(config.connect_timeout),
       config.max_response_bytes,
     )

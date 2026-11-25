@@ -23,6 +23,9 @@ fn put_marker(key: String, value: Bool) -> Dynamic
 @external(erlang, "relay_stdio_noise_ffi", "make_noise")
 fn make_noise() -> Nil
 
+@external(erlang, "relay_stdio_env_ffi", "getenv")
+fn getenv(name: String) -> String
+
 @external(erlang, "persistent_term", "get")
 fn get_marker(key: String, default: Bool) -> Bool
 
@@ -76,7 +79,11 @@ fn tools() -> List(tool.Tool(String)) {
       make_noise()
       Ok(True)
     })
-  [greet, fail, slow, wait, was_cancelled, noisy]
+  // Reports one variable of this child's environment.
+  let env =
+    tool.define("env", property("name", codec.string()), codec.string())
+    |> tool.handle(fn(name) { Ok(getenv(name)) })
+  [greet, fail, slow, wait, was_cancelled, noisy, env]
 }
 
 pub fn main() -> Nil {
