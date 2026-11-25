@@ -81,7 +81,10 @@ stop_with_slow_listener(Port, Stop) ->
                     inet:sockname(P) =:= {ok, {{127, 0, 0, 1}, Port}},
                     {connected, O} <- [erlang:port_info(P, connected)]],
     erlang:suspend_process(Owner),
-    spawn(fun() -> timer:sleep(200), catch erlang:resume_process(Owner) end),
+    spawn(fun() ->
+        timer:sleep(200),
+        try erlang:resume_process(Owner) catch _:_ -> ok end
+    end),
     Stop(),
     case gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000) of
         {ok, Socket} -> gen_tcp:close(Socket), accepted;
