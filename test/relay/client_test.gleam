@@ -1607,6 +1607,43 @@ pub fn stdio_client_uses_typed_request_surface_test() {
   client.close(peer)
 }
 
+@external(erlang, "relay_stdio_env_ffi", "putenv")
+fn putenv(name: String, value: String) -> Nil
+
+pub fn stdio_child_gets_only_allowed_and_explicit_variables_test() {
+  // A secret in this VM's environment must not reach the child.
+  putenv("RELAY_TEST_SECRET", "s3cret")
+  let config =
+    runner_config()
+    |> client.with_environment([#("RELAY_TEST_EXTRA", "given")])
+  let assert Ok(peer) = client.connect(config)
+  let env = tool.define("env", named_input(), codec.string())
+  let assert Ok(client.Succeeded("(unset)", _)) =
+    client.call(peer, env, "RELAY_TEST_SECRET")
+  let assert Ok(client.Succeeded("given", _)) =
+    client.call(peer, env, "RELAY_TEST_EXTRA")
+  // An allow-listed variable is inherited.
+  let assert Ok(client.Succeeded(path, _)) = client.call(peer, env, "PATH")
+  assert path != "(unset)"
+  client.close(peer)
+}
+
+pub fn environment_is_refused_for_a_non_stdio_target_test() {
+  let assert Ok(config) = client.http("http://127.0.0.1:1/")
+  let assert Error(error) =
+    config
+    |> client.with_environment([#("NAME", "value")])
+    |> client.connect
+  assert client.reason(error) == client.InvalidConfig(client.Environment)
+
+  // A name with `=` cannot be set in a child environment.
+  let assert Error(error) =
+    runner_config()
+    |> client.with_environment([#("A=B", "value")])
+    |> client.connect
+  assert client.reason(error) == client.InvalidConfig(client.Environment)
+}
+
 pub fn stdio_client_redacts_its_command_test() {
   let config = client.stdio("/usr/local/bin/secret-server", ["secret-token"])
   let printed = string.inspect(config)

@@ -20,6 +20,9 @@ fn halt(status: Int) -> Nil
 @external(erlang, "persistent_term", "put")
 fn put_marker(key: String, value: Bool) -> Dynamic
 
+@external(erlang, "relay_stdio_env_ffi", "getenv")
+fn getenv(name: String) -> String
+
 @external(erlang, "persistent_term", "get")
 fn get_marker(key: String, default: Bool) -> Bool
 
@@ -66,7 +69,11 @@ fn tools() -> List(tool.Tool(String)) {
   let was_cancelled =
     tool.define("was_cancelled", codec.success(Nil), codec.bool())
     |> tool.handle(fn(_) { Ok(get_marker(cancelled_marker, False)) })
-  [greet, fail, slow, wait, was_cancelled]
+  // Reports one variable of this child's environment.
+  let env =
+    tool.define("env", property("name", codec.string()), codec.string())
+    |> tool.handle(fn(name) { Ok(getenv(name)) })
+  [greet, fail, slow, wait, was_cancelled, env]
 }
 
 pub fn main() -> Nil {

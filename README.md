@@ -166,6 +166,7 @@ This section states only what Relay copies between processes.
 - Only MCP `2026-07-28` is implemented. Legacy `2025-11-25` sessions, MCP client OAuth flows, tasks, resource-read continuation, and `logging/setLevel` are not implemented.
 - Tool input schemas use Blueprint's finite admitted profile. Unsupported schemas are reported explicitly; Relay does not claim to accept every valid JSON Schema.
 - Stdio provides no bearer authorization. Run it under a trusted parent process.
+- A stdio child launched with `client.stdio` does not inherit the application's environment: it gets `HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM` and `USER` (on Windows, the system and profile directories, `PATH`, `TEMP` and `USERNAME`), plus the variables passed to `client.with_environment`.
 - A client error with `MaybeSent` evidence means the operation may have run. Relay never retries automatically and does not provide durable idempotency receipts; the application owns retry and reconciliation policy.
 - The built-in resource-template matcher supports one simple `{name}` variable per segment. Use `resources.template_with_matcher` for other patterns.
 
