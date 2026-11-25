@@ -36,6 +36,9 @@ fn disconnect_after_first_sse_event(
   body: BitArray,
 ) -> Result(Int, String)
 
+@external(erlang, "relay_http_ffi", "keepalive_before_notification_server")
+fn keepalive_before_notification_server(gap_ms: Int) -> Int
+
 @external(erlang, "relay_ffi", "monotonic_time_ms")
 fn monotonic_ms() -> Int
 
@@ -1716,6 +1719,20 @@ fn next_before(
         Error(_) -> Error(Nil)
       }
   }
+}
+
+// An SSE keepalive comment is not an answer to the wait: the client keeps
+// waiting for the rest of the requested time, so a notification that follows
+// a keepalive within that time is returned.
+pub fn http_subscription_keepalive_keeps_the_remaining_wait_test() {
+  let port = keepalive_before_notification_server(100)
+  let peer = connect_url("http://127.0.0.1:" <> int.to_string(port) <> "/")
+  let assert Ok(subscription) =
+    client.listen(peer, [subscriptions.ToolsListChanged])
+  let event = client.next_notification(subscription, duration.seconds(2))
+  client.close_subscription(subscription)
+  client.close(peer)
+  let assert Ok(Some(subscriptions.ToolsListChanged)) = event
 }
 
 pub fn http_subscription_fails_when_the_endpoint_stops_test() {
