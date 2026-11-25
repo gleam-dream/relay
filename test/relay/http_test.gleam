@@ -992,7 +992,36 @@ pub fn mounted_handler_refuses_deep_json_test() {
     ])
   let response = http.handle(handler, shallow)
   response.status |> should.equal(200)
-  string.contains(testing.body_text(response), "-32602") |> should.be_true
+  string.contains(testing.body_text(response), "\"isError\":true")
+  |> should.be_true
+}
+
+pub fn invalid_arguments_are_a_tool_error_with_detail_test() {
+  let handler = mounted(http.new(echo_server()))
+  // `text` must be a string; the value sent is a number the reply must not
+  // repeat.
+  let wrong_type =
+    testing.request("tools/call", [
+      #("name", json.string("echo")),
+      #("arguments", json.object([#("text", json.int(918_273))])),
+    ])
+  let response = http.handle(handler, wrong_type)
+  response.status |> should.equal(200)
+  let body = testing.body_text(response)
+  string.contains(body, "\"isError\":true") |> should.be_true
+  string.contains(body, "$[\\\"text\\\"]: expected a string")
+  |> should.be_true
+  string.contains(body, "918273") |> should.be_false
+
+  // A missing field names the field.
+  let missing =
+    testing.request("tools/call", [
+      #("name", json.string("echo")),
+      #("arguments", json.object([])),
+    ])
+  let body = testing.body_text(http.handle(handler, missing))
+  string.contains(body, "\"isError\":true") |> should.be_true
+  string.contains(body, "$[\\\"text\\\"]: missing field") |> should.be_true
 }
 
 pub fn context_builder_sees_the_request_test() {
