@@ -1347,6 +1347,8 @@ fn stdio_failure(failure: stdio_client.Failure, call: Correlation) -> Error {
     stdio_client.NotRunning -> Failed(ConnectionClosed(NotSent), call)
     stdio_client.Busy(limit) -> Failed(TooManyPendingCalls(limit), call)
     stdio_client.TimedOut -> Failed(TimedOut(MaybeSent), call)
+    stdio_client.TimedOutUnsent -> Failed(TimedOut(NotSent), call)
+    stdio_client.CancelledUnsent -> Failed(Cancelled(NotSent), call)
     stdio_client.Exited -> Failed(ConnectionClosed(MaybeSent), call)
     stdio_client.ClientClosed -> Failed(Cancelled(MaybeSent), call)
     stdio_client.Cancelled -> Failed(Cancelled(MaybeSent), call)
