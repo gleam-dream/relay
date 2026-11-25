@@ -7,7 +7,7 @@ import gleam/http/response
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import gleam/time/duration
@@ -1169,6 +1169,90 @@ pub fn listen_streams_beyond_the_cap_get_503_test() {
   client.close_subscription(second)
   client.close(peer)
   http.stop(listener)
+}
+
+@external(erlang, "relay_ffi", "monotonic_time_ms")
+fn monotonic_ms() -> Int
+
+// Reads the stream until a notification or an error arrives, or until `until`
+// passes. Keepalives end a single wait early with `Ok(None)`.
+fn wait_for_notification(
+  subscription: client.Subscription,
+  until: Int,
+) -> Result(Option(subscriptions.Notification), client.Error) {
+  let left = until - monotonic_ms()
+  case left <= 0 {
+    True -> Ok(None)
+    False ->
+      case client.next_notification(subscription, duration.milliseconds(left)) {
+        Ok(None) -> wait_for_notification(subscription, until)
+        other -> other
+      }
+  }
+}
+
+// The request timeout bounds opening a stream, not the established stream:
+// every HTTP call has a finite deadline, so a stream's is the listen timeout.
+pub fn listen_streams_outlive_the_request_timeout_test() {
+  let listener =
+    http.new(echo_server())
+    |> http.with_sse_keepalive(duration.milliseconds(50))
+    |> started
+  let assert Ok(config) =
+    client.http(
+      "http://127.0.0.1:" <> int.to_string(http.port(listener)) <> "/",
+    )
+  let assert Ok(peer) =
+    config
+    |> client.with_timeout(duration.milliseconds(300))
+    |> client.connect
+  let assert Ok(subscription) =
+    client.listen(peer, [subscriptions.ToolsListChanged])
+
+  wait_for_notification(subscription, monotonic_ms() + 1500)
+  |> should.equal(Ok(None))
+  http.notify(listener, subscriptions.ToolsListChanged)
+  client.next_notification(subscription, duration.seconds(2))
+  |> should.equal(Ok(Some(subscriptions.ToolsListChanged)))
+
+  client.close_subscription(subscription)
+  client.close(peer)
+  http.stop(listener)
+}
+
+pub fn listen_streams_end_at_the_listen_timeout_test() {
+  let listener =
+    http.new(echo_server())
+    |> http.with_sse_keepalive(duration.milliseconds(50))
+    |> started
+  let assert Ok(config) =
+    client.http(
+      "http://127.0.0.1:" <> int.to_string(http.port(listener)) <> "/",
+    )
+  let assert Ok(peer) =
+    config
+    |> client.with_listen_timeout(duration.milliseconds(300))
+    |> client.connect
+  let assert Ok(subscription) =
+    client.listen(peer, [subscriptions.ToolsListChanged])
+
+  let assert Error(client.TimedOut(_)) =
+    wait_for_notification(subscription, monotonic_ms() + 2000)
+    |> reason_support.of
+
+  client.close(peer)
+  http.stop(listener)
+}
+
+pub fn listen_timeout_must_be_positive_test() {
+  let assert Ok(config) = client.http("http://127.0.0.1:1/")
+  let assert Error(error) =
+    config
+    |> client.with_listen_timeout(duration.milliseconds(0))
+    |> client.connect
+  client.describe_error(error)
+  |> string.contains("the listen timeout")
+  |> should.be_true
 }
 
 // --- mounting in an application's mist server ---------------------------------

@@ -63,6 +63,7 @@
 //// | --- | --- | --- |
 //// | request timeout | 30 s | `with_timeout`, per call `with_deadline` |
 //// | connect | 10 s | `with_connect_timeout` |
+//// | HTTP listen stream lifetime | 1 h | `with_listen_timeout`, per call `with_deadline` |
 //// | response size | 1 MiB | `with_max_response_bytes` |
 //// | listings | 256 pages, 10,000 items | `with_listing_limits` |
 //// | stdio pending calls | 64, then `TooManyPendingCalls` | `with_max_pending_calls` |
@@ -133,6 +134,7 @@ pub opaque type Config {
     target: Target,
     timeout: Duration,
     connect_timeout: Duration,
+    listen_timeout: Duration,
     max_response_bytes: Int,
     input_methods: List(tool.InputMethod),
     max_listing_pages: Int,
@@ -152,6 +154,7 @@ fn defaults(target: Target) -> Config {
     target: target,
     timeout: duration.seconds(30),
     connect_timeout: duration.seconds(10),
+    listen_timeout: duration.hours(1),
     max_response_bytes: 1_048_576,
     input_methods: [],
     max_listing_pages: 256,
@@ -317,9 +320,18 @@ pub fn in_process(server: Server(context), context: context) -> Config {
 
 /// How long one request may take, including dynamic headers. A view's
 /// `with_deadline` can shorten it. For subscriptions this bounds opening and
-/// acknowledgement; an established stream keeps its own lifetime.
+/// acknowledgement; an established HTTP stream lasts until the listen
+/// timeout.
 pub fn with_timeout(config: Config, timeout: Duration) -> Config {
   Config(..config, timeout: timeout)
+}
+
+/// How long an established HTTP `listen` stream stays open. The stream
+/// ends with `TimedOut` when the time is up, or earlier at a view's
+/// `with_deadline`; reopen it with `listen`. Every HTTP request needs a
+/// finite bound, so a stream cannot stay open forever.
+pub fn with_listen_timeout(config: Config, timeout: Duration) -> Config {
+  Config(..config, listen_timeout: timeout)
 }
 
 /// How long connecting, or starting the stdio child, may take.
@@ -418,6 +430,7 @@ pub type ConfigField {
   Url
   RequestTimeout
   ConnectTimeout
+  ListenTimeout
   MaxResponseBytes
   ListingLimits
   CaCertFile
@@ -667,6 +680,7 @@ fn config_field_name(field: ConfigField) -> String {
     Url -> "the URL"
     RequestTimeout -> "the request timeout"
     ConnectTimeout -> "the connect timeout"
+    ListenTimeout -> "the listen timeout"
     MaxResponseBytes -> "the response size limit"
     ListingLimits -> "the listing limits"
     CaCertFile -> "the CA certificate file"
@@ -750,10 +764,15 @@ fn validate(config: Config) -> Result(Config, Error) {
       Error(config_error(ListingLimits))
     _ if config.max_pending_calls <= 0 -> Error(config_error(MaxPendingCalls))
     _ ->
-      case ms(config.timeout) > 0, ms(config.connect_timeout) > 0 {
-        False, _ -> Error(config_error(RequestTimeout))
-        _, False -> Error(config_error(ConnectTimeout))
-        True, True -> {
+      case
+        ms(config.timeout) > 0,
+        ms(config.connect_timeout) > 0,
+        ms(config.listen_timeout) > 0
+      {
+        False, _, _ -> Error(config_error(RequestTimeout))
+        _, False, _ -> Error(config_error(ConnectTimeout))
+        _, _, False -> Error(config_error(ListenTimeout))
+        True, True, True -> {
           let environment = config.environment()
           let environment_fits = case config.target {
             StdioTarget(_) -> valid_environment(environment)
@@ -944,7 +963,6 @@ fn http_peer(
         gun_config.default()
         |> gun_config.with_destination(policy)
         |> gun_config.with_connect_timeout(config.connect_timeout)
-        |> gun_config.with_request_timeout(gun_config.After(config.timeout))
         |> gun_config.with_max_response_body_bytes(config.max_response_bytes)
         // `close` cancels in-flight calls instead of draining them: stopping
         // closes each open response's connection at once, which is how MCP
@@ -1027,7 +1045,7 @@ fn http_peer(
       request.set_header(req, string.lowercase(header.0), header.1)
     })
   }
-  let view = fn(budget: Budget, timeout: gun_config.Timeout) {
+  let view = fn(budget: Budget, timeout: Duration) {
     let view = http_gun.with_timeout(gun, timeout)
     let view = case budget.deadline {
       Some(deadline) -> http_gun.with_deadline(view, deadline)
@@ -1044,10 +1062,7 @@ fn http_peer(
       send: fn(out, budget) {
         use #(headers, owner) <- result.try(acquire(budget))
         let client =
-          view(
-            budget,
-            gun_config.After(duration.milliseconds(remaining_ms(budget))),
-          )
+          view(budget, config.listen_timeout)
           |> http_gun.with_body_limit(budget.max_bytes, http_gun.Fail)
           |> http_gun.with_additional_cancellation(http_owner.token(owner))
         let outcome =
@@ -1091,7 +1106,7 @@ fn http_peer(
       listen: fn(out, budget) {
         use #(headers, owner) <- result.try(acquire(budget))
         let client =
-          view(budget, gun_config.Infinity)
+          view(budget, config.listen_timeout)
           |> http_gun.with_additional_cancellation(http_owner.token(owner))
         case
           http_gun.open(
@@ -2763,8 +2778,9 @@ pub opaque type Subscription {
 /// Opens a stream for these notifications; `ResourceUpdated(uri)` subscribes
 /// to one resource. Returns once the server acknowledged it. One request budget
 /// covers dynamic headers, transport opening and acknowledgement. The relative
-/// timeout stops applying after acknowledgement; explicit absolute deadlines
-/// and cancellation continue to apply to the established stream.
+/// timeout stops applying after acknowledgement; over HTTP the established
+/// stream lasts until the listen timeout (`with_listen_timeout`), and explicit
+/// absolute deadlines and cancellation continue to apply to it.
 pub fn listen(
   client: Client,
   notifications: List(Notification),
