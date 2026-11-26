@@ -10,6 +10,7 @@ import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import json/blueprint/number
 import json/blueprint/value.{type Value}
 import relay/content.{type ContentBlock, type ResourceContents}
 import relay/internal/carrier
@@ -122,8 +123,99 @@ pub type Decoded {
   Decoded(admission: Admission, correlation: Option(String))
 }
 
-@external(erlang, "relay_ffi", "decode_frame")
-fn ffi_decode_frame(bytes: BitArray) -> Result(#(Dynamic, Extracted), Nil)
+/// Parses one JSON value, keeping every number as its source text.
+@external(erlang, "relay_ffi", "decode_json_exact")
+fn ffi_decode_json_exact(bytes: BitArray) -> Result(Dynamic, Nil)
+
+/// Converts a value parsed by `ffi_decode_json_exact` to a JSON Blueprint
+/// value, parsing its numbers within `limits`.
+@external(erlang, "relay_ffi", "exact_to_value")
+fn ffi_exact_to_value(
+  term: Dynamic,
+  limits: number.Limits,
+) -> Result(Value, Nil)
+
+/// Converts a value parsed by `ffi_decode_json_exact` to the ordinary
+/// Erlang form, numbers as integers or floats.
+@external(erlang, "relay_ffi", "exact_to_native")
+fn ffi_exact_to_native(term: Dynamic) -> Dynamic
+
+/// Decodes a JSON-RPC frame once. Numbers are kept as their source text, so
+/// `tools/call` arguments and `inputResponses` become exact JSON Blueprint
+/// values; those two members are then `null` in the returned envelope, and
+/// every other number in it becomes an ordinary integer or float.
+fn ffi_decode_frame(bytes: BitArray) -> Result(#(Dynamic, Extracted), Nil) {
+  ffi_decode_json_exact(bytes) |> result.map(split_frame)
+}
+
+fn split_frame(root: Dynamic) -> #(Dynamic, Extracted) {
+  let limits =
+    number.limits(
+      max_token_bytes: 1024,
+      max_significant_digits: 100,
+      max_exponent: 1000,
+    )
+  let no_extraction = Extracted(Ok(value.Object([])), Error(Nil))
+  case object_fields(root) {
+    Error(Nil) -> #(ffi_exact_to_native(root), no_extraction)
+    Ok(fields) ->
+      case dict.get(fields, "params") |> result.try(object_fields) {
+        Error(Nil) -> #(ffi_exact_to_native(root), no_extraction)
+        Ok(params) -> {
+          let method =
+            dict.get(fields, "method")
+            |> result.try(fn(raw) {
+              decode.run(raw, decode.string) |> result.replace_error(Nil)
+            })
+          let #(arguments, params) = case
+            method,
+            dict.get(params, "arguments")
+          {
+            Ok("tools/call"), Ok(raw) -> #(
+              object_value(raw, limits),
+              dict.insert(params, "arguments", dynamic.nil()),
+            )
+            _, _ -> #(Ok(value.Object([])), params)
+          }
+          let #(input_responses, params) = case
+            dict.get(params, "inputResponses")
+          {
+            Ok(raw) -> #(
+              object_value(raw, limits),
+              dict.insert(params, "inputResponses", dynamic.nil()),
+            )
+            Error(Nil) -> #(Error(Nil), params)
+          }
+          let envelope =
+            dict.insert(fields, "params", object_dynamic(params))
+            |> object_dynamic
+          #(
+            ffi_exact_to_native(envelope),
+            Extracted(arguments, input_responses),
+          )
+        }
+      }
+  }
+}
+
+fn object_fields(raw: Dynamic) -> Result(Dict(String, Dynamic), Nil) {
+  decode.run(raw, decode.dict(decode.string, decode.dynamic))
+  |> result.replace_error(Nil)
+}
+
+fn object_dynamic(fields: Dict(String, Dynamic)) -> Dynamic {
+  dict.to_list(fields)
+  |> list.map(fn(entry) { #(dynamic.string(entry.0), entry.1) })
+  |> dynamic.properties
+}
+
+// An exact value that must be a JSON object.
+fn object_value(raw: Dynamic, limits: number.Limits) -> Result(Value, Nil) {
+  case object_fields(raw) {
+    Error(Nil) -> Error(Nil)
+    Ok(_) -> ffi_exact_to_value(raw, limits)
+  }
+}
 
 @external(erlang, "relay_ffi", "json_depth_within")
 fn ffi_json_depth_within(bytes: BitArray, max_depth: Int) -> Bool

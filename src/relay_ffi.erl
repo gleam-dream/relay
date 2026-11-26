@@ -3,7 +3,9 @@
     is_null/1,
     dynamic_to_json_string/1,
     raw_json/1,
-    decode_frame/1,
+    decode_json_exact/1,
+    exact_to_value/2,
+    exact_to_native/1,
     unique_integer/0,
     rescue_run/1,
     monotonic_time_ms/0,
@@ -98,13 +100,10 @@ dynamic_to_json_string(Data) ->
         _:_ -> <<"{}"/utf8>>
     end.
 
-%% Decodes a JSON-RPC frame once. Numbers are kept as their source text, so
-%% `tools/call` arguments and `inputResponses` become exact JSON Blueprint
-%% values; those two members are then replaced by `null` in the returned
-%% envelope, and every other number in it becomes an ordinary integer or
-%% float. Returns `{ok, {Envelope, {extracted, Arguments, InputResponses}}}`
-%% or `{error, nil}` when the bytes are not one JSON value.
-decode_frame(Bin) ->
+%% Parses one JSON value and nothing after it but whitespace, keeping every
+%% number as its source text in a `{raw_number, Text}` tuple. Returns
+%% `{ok, Term}` or `{error, nil}`.
+decode_json_exact(Bin) ->
     Decoders = #{
         float => fun(B) -> {raw_number, B} end,
         integer => fun(B) -> {raw_number, B} end
@@ -112,7 +111,7 @@ decode_frame(Bin) ->
     try
         {Root, ok, Rest} = json:decode(Bin, ok, Decoders),
         case is_json_whitespace(Rest) of
-            true -> {ok, split_frame(Root)};
+            true -> {ok, Root};
             false -> {error, nil}
         end
     catch
@@ -124,43 +123,21 @@ is_json_whitespace(<<C, Rest/binary>>) when C =:= $\s; C =:= $\t; C =:= $\n; C =
     is_json_whitespace(Rest);
 is_json_whitespace(_) -> false.
 
-split_frame(#{<<"params">> := Params} = Root) when is_map(Params) ->
-    Limits = json@blueprint@number:limits(1024, 100, 1000),
-    {Arguments, Params1} =
-        case {maps:get(<<"method">>, Root, undefined), maps:find(<<"arguments">>, Params)} of
-            {<<"tools/call">>, {ok, Args}} ->
-                {object_value(Args, Limits), Params#{<<"arguments">> := null}};
-            _ ->
-                {{ok, {object, []}}, Params}
-        end,
-    {Responses, Params2} =
-        case maps:find(<<"inputResponses">>, Params1) of
-            {ok, Found} when is_map(Found) ->
-                {term_to_blueprint_value(Found, Limits), Params1#{<<"inputResponses">> := null}};
-            {ok, _} ->
-                {{error, nil}, Params1#{<<"inputResponses">> := null}};
-            error ->
-                {{error, nil}, Params1}
-        end,
-    {native_numbers(Root#{<<"params">> := Params2}), {extracted, Arguments, Responses}};
-split_frame(Root) ->
-    {native_numbers(Root), {extracted, {ok, {object, []}}, {error, nil}}}.
-
-object_value(Term, Limits) ->
-    case term_to_blueprint_value(Term, Limits) of
-        {ok, {object, Entries}} -> {ok, {object, Entries}};
-        _ -> {error, nil}
-    end.
-
-native_numbers({raw_number, Text}) ->
+%% A term from `decode_json_exact` with its numbers as integers and floats.
+exact_to_native({raw_number, Text}) ->
     {Number, ok, _} = json:decode(Text, ok, #{}),
     Number;
-native_numbers(Map) when is_map(Map) ->
-    maps:map(fun(_Key, Value) -> native_numbers(Value) end, Map);
-native_numbers(List) when is_list(List) ->
-    [native_numbers(Item) || Item <- List];
-native_numbers(Other) ->
+exact_to_native(Map) when is_map(Map) ->
+    maps:map(fun(_Key, Value) -> exact_to_native(Value) end, Map);
+exact_to_native(List) when is_list(List) ->
+    [exact_to_native(Item) || Item <- List];
+exact_to_native(Other) ->
     Other.
+
+%% A term from `decode_json_exact` as a JSON Blueprint value, its numbers
+%% parsed within `Limits`.
+exact_to_value(Term, Limits) ->
+    term_to_blueprint_value(Term, Limits).
 
 term_to_blueprint_value(null, _Limits) -> {ok, null};
 term_to_blueprint_value(true, _Limits) -> {ok, {bool, true}};
