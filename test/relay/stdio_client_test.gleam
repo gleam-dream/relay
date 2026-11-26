@@ -3,6 +3,7 @@
 //// hold other callers.
 
 import gleam/erlang/process
+import gleam/list
 import gleam/option.{None}
 import gleam/time/duration
 import http_gun/cancellation
@@ -180,5 +181,41 @@ pub fn request_that_times_out_during_a_notification_wait_is_cancelled_test() {
   // The child was told, its late answer was dropped, and it stays usable.
   assert answer(peer, "cancels") == "1"
   client.close_subscription(subscription)
+  client.close(peer)
+}
+
+pub fn cancelled_queued_requests_are_never_written_however_many_test() {
+  let assert Ok(peer) =
+    client.stdio("python3", ["test/fixtures/stdio/scripted-peer.py"])
+    |> client.with_timeout(duration.seconds(5))
+    |> client.with_max_pending_calls(400)
+    |> client.connect
+  let held = hold_the_child(peer)
+  // More queued requests are cancelled than the 256 given-up ids the child
+  // owner remembers for late responses.
+  let done = process.new_subject()
+  list.repeat(Nil, 300)
+  |> list.each(fn(_) {
+    process.spawn(fn() {
+      let outcome = {
+        use token <- cancellation.with_token
+        let _ =
+          process.spawn(fn() {
+            process.sleep(300)
+            cancellation.cancel(token)
+          })
+        peer
+        |> client.with_cancellation(token)
+        |> client.call(scripted("mutate"), 0)
+      }
+      process.send(done, outcome |> reason_support.of)
+    })
+  })
+  list.repeat(Nil, 300)
+  |> list.each(fn(_) {
+    let assert Ok(Error(client.Cancelled(_))) = process.receive(done, 5000)
+  })
+  let assert Ok(True) = process.receive(held, 5000)
+  assert answer(peer, "count") == "0"
   client.close(peer)
 }

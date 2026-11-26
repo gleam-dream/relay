@@ -571,6 +571,25 @@ fn watching(
   |> process.select_specific_monitor(monitor, fn(_) { CallerDown })
 }
 
+// Removes the queued request with this id, returning its reply subject.
+fn take_request(
+  queued: List(Message),
+  id: String,
+) -> Result(#(Subject(Result(BitArray, Failure)), List(Message)), Nil) {
+  case
+    list.split_while(queued, fn(message) {
+      case message {
+        Request(id: found, ..) -> found != id
+        _ -> True
+      }
+    })
+  {
+    #(before, [Request(reply: reply, ..), ..after]) ->
+      Ok(#(reply, list.append(before, after)))
+    _ -> Error(Nil)
+  }
+}
+
 fn abandon(state: State, id: String) -> State {
   case list.contains(state.abandoned, id) {
     True -> state
@@ -814,16 +833,31 @@ fn receive(
               }
               Failed(Cancelled, abandon(state, id), queued)
             }
-            // A request that is still waiting, or was already answered.
+            // A request that is still waiting leaves the queue unwritten;
+            // the id of one already answered is remembered.
             _ ->
-              receive(
-                abandon(state, target),
-                deadline,
-                queued,
-                continue,
-                in_flight,
-                selector,
-              )
+              case take_request(queued, target) {
+                Ok(#(reply, queued)) -> {
+                  process.send(reply, Error(CancelledUnsent))
+                  receive(
+                    state,
+                    deadline,
+                    queued,
+                    continue,
+                    in_flight,
+                    selector,
+                  )
+                }
+                Error(Nil) ->
+                  receive(
+                    abandon(state, target),
+                    deadline,
+                    queued,
+                    continue,
+                    in_flight,
+                    selector,
+                  )
+              }
           }
         Ok(CallerDown) ->
           case in_flight {
