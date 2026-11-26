@@ -1,6 +1,10 @@
 //// Emission helpers for the events in `relay/telemetry`.
 
+import gleam/int
+import gleam/json
+import gleam/list
 import gleam/option.{type Option}
+import json/blueprint/codec
 import relay/telemetry
 import sinal
 import sinal/correlation.{type Correlation}
@@ -107,4 +111,36 @@ pub fn client_call(duration_ms: Int, meta: telemetry.ClientCallMeta) -> Nil {
     telemetry.ClientCallMeasurements(duration_ms:),
     meta,
   )
+}
+
+pub fn arguments_rejected(
+  error: codec.DecodeError,
+  invocation_id: Int,
+  tool: String,
+  correlation: Correlation,
+  listener: Option(String),
+) -> Nil {
+  sinal.emit(
+    telemetry.arguments_rejected_event(),
+    Nil,
+    telemetry.ArgumentsRejectedMeta(
+      invocation_id:,
+      tool:,
+      path: path_text(error.path),
+      detail: codec.describe_decode_error(error),
+      correlation:,
+      listener:,
+    ),
+  )
+}
+
+// The JSON path Blueprint writes in its descriptions, such as `$["a"][0]`.
+fn path_text(path: List(codec.PathSegment)) -> String {
+  list.fold(path, "$", fn(text, segment) {
+    case segment {
+      codec.Field(name) ->
+        text <> "[" <> json.to_string(json.string(name)) <> "]"
+      codec.Index(index) -> text <> "[" <> int.to_string(index) <> "]"
+    }
+  })
 }

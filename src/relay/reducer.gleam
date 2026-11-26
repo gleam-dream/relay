@@ -106,12 +106,41 @@ fn ffi_read_cursor(
 
 /// The result of `perform`, fed back with `Finished`.
 pub opaque type Outcome {
-  Outcome(response: json.Json, status: Status)
+  Outcome(
+    response: json.Json,
+    status: Status,
+    rejected_arguments: Option(codec.DecodeError),
+  )
+}
+
+// The decode error as the caller may read it: an application's custom
+// message is replaced by Blueprint's fixed text for one.
+fn published(error: codec.DecodeError) -> String {
+  case error.reason {
+    codec.Custom(_) ->
+      codec.describe_decode_error(
+        codec.DecodeError(..error, reason: codec.Custom("")),
+      )
+    _ -> codec.describe_decode_error(error)
+  }
+}
+
+fn outcome(response: json.Json, status: Status) -> Outcome {
+  Outcome(response:, status:, rejected_arguments: None)
 }
 
 /// How the invocation behind an outcome finished.
 pub fn outcome_status(outcome: Outcome) -> Status {
   outcome.status
+}
+
+/// The input codec's error when the tool's arguments did not decode. It
+/// keeps the codec's own message, which the response to the caller leaves
+/// out; read it on the server only.
+pub fn outcome_rejected_arguments(
+  outcome: Outcome,
+) -> Option(codec.DecodeError) {
+  outcome.rejected_arguments
 }
 
 /// An inbound JSON-RPC frame, decoded once by `decode`. A frame that is not
@@ -1023,7 +1052,7 @@ pub fn perform(
     ToolWork(entry, arguments, request_state) ->
       case entry.invoke(call, arguments) {
         core.Completed(structured, blocks) ->
-          Outcome(
+          outcome(
             v2026.encode_call_response(
               id,
               structured,
@@ -1034,7 +1063,7 @@ pub fn perform(
             telemetry.Succeeded,
           )
         core.Failed(blocks, structured) ->
-          Outcome(
+          outcome(
             v2026.encode_call_response(
               id,
               structured,
@@ -1047,25 +1076,23 @@ pub fn perform(
         core.AwaitingInput(requests) ->
           input_required(invocation, requests, request_state)
         // MCP reports input validation as a tool execution error, so the
-        // model can correct the call. The text names the path and the
-        // expectation, never the value that was sent.
+        // model can correct the call. The text names the path and Blueprint's
+        // own expectation, never the value that was sent; a message the
+        // application's codec wrote stays on the server.
         core.InvalidArguments(error) ->
           Outcome(
-            v2026.encode_call_response(
+            response: v2026.encode_call_response(
               id,
               None,
-              [
-                content.text(
-                  "Invalid arguments: " <> codec.describe_decode_error(error),
-                ),
-              ],
+              [content.text("Invalid arguments: " <> published(error))],
               True,
               invocation.identity,
             ),
-            telemetry.ToolFailed,
+            status: telemetry.ToolFailed,
+            rejected_arguments: Some(error),
           )
         core.InvalidOutput ->
-          Outcome(
+          outcome(
             jsonrpc.error_to_json(Some(id), jsonrpc.internal_error()),
             telemetry.Failed,
           )
@@ -1073,12 +1100,12 @@ pub fn perform(
     ResourceWork(read, uri) ->
       case read(invocation.context, uri) {
         Ok(contents) ->
-          Outcome(
+          outcome(
             v2026.encode_resources_read_response(id, contents),
             telemetry.Succeeded,
           )
         Error(Nil) ->
-          Outcome(
+          outcome(
             jsonrpc.error_to_json(Some(id), jsonrpc.resource_not_found(uri)),
             telemetry.Failed,
           )
@@ -1086,14 +1113,14 @@ pub fn perform(
     PromptWork(prompt, arguments, request_state) ->
       case prompt.get(call, arguments) {
         Ok(core.Complete(rendered, _, _)) ->
-          Outcome(
+          outcome(
             v2026.encode_prompts_get_response(id, rendered),
             telemetry.Succeeded,
           )
         Ok(core.NeedsInput(requests)) ->
           input_required(invocation, requests, request_state)
         Error(Nil) ->
-          Outcome(
+          outcome(
             jsonrpc.error_to_json(Some(id), jsonrpc.invalid_params()),
             telemetry.Failed,
           )
@@ -1101,12 +1128,12 @@ pub fn perform(
     CompletionWork(core.Completion(complete), query) ->
       case complete(invocation.context, query) {
         Ok(completion) ->
-          Outcome(
+          outcome(
             v2026.encode_completion_response(id, completion),
             telemetry.Succeeded,
           )
         Error(Nil) ->
-          Outcome(
+          outcome(
             jsonrpc.error_to_json(Some(id), jsonrpc.internal_error()),
             telemetry.Failed,
           )
@@ -1125,7 +1152,7 @@ fn input_required(
       let #(_, request) = entry
       v2026.client_supports_input_request(invocation.metadata, request.method)
     })
-  Outcome(
+  outcome(
     v2026.encode_input_required_response(
       invocation.request_id,
       supported,

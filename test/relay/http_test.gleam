@@ -999,6 +999,62 @@ pub fn mounted_handler_refuses_deep_json_test() {
   |> should.be_true
 }
 
+pub fn an_input_codec_message_reaches_telemetry_not_the_client_test() {
+  // The application's own check writes the value it refused into its
+  // message, which must not be published.
+  let pin = {
+    use pin <- codec.field(
+      "pin",
+      codec.string()
+        |> codec.try_map(
+          decode: fn(pin) {
+            case string.length(pin) == 4 {
+              True -> Ok(pin)
+              False -> Error("pin " <> pin <> " is not four digits")
+            }
+          },
+          encode: Ok,
+          placeholder: "0000",
+        ),
+      get: fn(pin) { pin },
+    )
+    codec.success(pin)
+  }
+  let unlock = tool.handle(tool.define("unlock", pin, codec.string()), Ok)
+  let handler = mounted(http.new(server.new([unlock])))
+  let rejected = process.new_subject()
+  let attachment =
+    sinal.observe(telemetry.arguments_rejected_event(), fn(_, meta) {
+      process.send(rejected, meta)
+    })
+
+  let response =
+    http.handle(
+      handler,
+      testing.request("tools/call", [
+        #("name", json.string("unlock")),
+        #("arguments", json.object([#("pin", json.string("918273"))])),
+      ]),
+    )
+  response.status |> should.equal(200)
+  let body = testing.body_text(response)
+  string.contains(body, "\"isError\":true") |> should.be_true
+  string.contains(
+    body,
+    "Invalid arguments: $[\\\"pin\\\"]: custom validation failed",
+  )
+  |> should.be_true
+  string.contains(body, "918273") |> should.be_false
+  string.contains(body, "four digits") |> should.be_false
+
+  // The server's own observers get the codec's message.
+  let assert Ok(meta) = process.receive(rejected, 1000)
+  meta.tool |> should.equal("unlock")
+  meta.path |> should.equal("$[\"pin\"]")
+  meta.detail |> should.equal("$[\"pin\"]: pin 918273 is not four digits")
+  sinal.detach(attachment)
+}
+
 pub fn invalid_arguments_are_a_tool_error_with_detail_test() {
   let handler = mounted(http.new(echo_server()))
   // `text` must be a string; the value sent is a number the reply must not

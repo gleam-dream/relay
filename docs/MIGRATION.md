@@ -22,7 +22,7 @@ If your application imports Sinal or HTTP Gun itself, move those to `sinal >= 0.
 | [New `ConfigField` and `StdioError` variants](#new-configfield-and-stdioerror-variants)           | Code with an exhaustive `case` over these types                       |
 | [Wire changes](#wire-changes)                                                                     | Peers that depended on the old header encoding or on dropped requests |
 
-New in 0.3.0 and not breaking: `client.with_environment`, `client.with_listen_timeout`, `reducer.decode`, `reducer.frame_correlation`, `runtime.send_decoded`, and HTTP client support for event-stream responses to ordinary requests.
+New in 0.3.0 and not breaking: `telemetry.arguments_rejected_event`, `reducer.outcome_rejected_arguments`, `client.with_environment`, `client.with_listen_timeout`, `reducer.decode`, `reducer.frame_correlation`, `runtime.send_decoded`, and HTTP client support for event-stream responses to ordinary requests.
 
 ## Stdio servers need `-noinput`
 
@@ -77,11 +77,11 @@ A name must be non-empty and contain no `=`, and no name or value may contain a 
 
 ## Invalid tool arguments are a tool error
 
-**What changed.** A `tools/call` whose arguments do not decode is answered with a successful JSON-RPC response carrying an `isError` result. Its text starts with `Invalid arguments:` and names the path and the expectation, never the value that was sent. A Relay client sees `Ok(client.ToolFailed(blocks, None))` where 0.2 returned `Error` with `RpcError(-32602, ..)`. The invocation telemetry reports status `ToolFailed` instead of `Failed`.
+**What changed.** A `tools/call` whose arguments do not decode is answered with a successful JSON-RPC response carrying an `isError` result. Its text starts with `Invalid arguments:` and names the path and JSON Blueprint's own description of the failure, such as `$["text"]: expected a string`, never the value that was sent. A message your input codec wrote (with `codec.try_map` or `codec.decode_failure`) never reaches the caller: the text says `custom validation failed` at that path instead. The server's observers receive the codec's message in the new `[relay, invocation, arguments_rejected]` telemetry event (`telemetry.arguments_rejected_event()`, fields `tool`, `path` and `detail`), and a transport that drives the reducer reads it with `reducer.outcome_rejected_arguments`. A Relay client sees `Ok(client.ToolFailed(blocks, None))` where 0.2 returned `Error` with `RpcError(-32602, ..)`. The invocation telemetry reports status `ToolFailed` instead of `Failed`.
 
 **Why.** MCP `2026-07-28` reports input validation as a tool execution error, so the model can correct its call.
 
-**What to do.** Handle `ToolFailed` (already required for handler failures). Replace any match on `-32602` for argument errors with a match on `ToolFailed`. Requests with a malformed envelope, such as a missing tool name, still get `-32602`.
+**What to do.** Handle `ToolFailed` (already required for handler failures). Replace any match on `-32602` for argument errors with a match on `ToolFailed`. Requests with a malformed envelope, such as a missing tool name, still get `-32602`. To log why your own codec refused arguments, observe `telemetry.arguments_rejected_event()`; its `detail` can contain the value your message names, so treat it as you treat the arguments.
 
 ## `next_notification` waits the whole wait
 

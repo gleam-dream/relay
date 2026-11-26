@@ -4,7 +4,7 @@
 >
 > - A stdio server's VM must start with `-noinput`, and `stdio.Config` is a record with `runtime` and `write_timeout`.
 > - A stdio child launched by the client gets an allow-listed environment; add variables with `client.with_environment`.
-> - Invalid tool arguments return a tool error with detail (`ToolFailed`) instead of JSON-RPC `-32602`.
+> - Invalid tool arguments return a tool error (`ToolFailed`) with the failing path instead of JSON-RPC `-32602`; a message your input codec wrote goes only to the `arguments_rejected` telemetry event, never to the caller.
 > - Over HTTP, `next_notification`'s `Ok(None)` means only that the wait ended, and a `listen` stream ends at the listen timeout (1 h); ordinary calls keep the 30 s request timeout.
 > - `http.stop` returns only after the listening socket has closed.
 > - Depend on `json_blueprint >= 3.0.0 and < 4.0.0`; Relay now uses `sinal` 0.2 and `http_gun` 0.4.

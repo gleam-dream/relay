@@ -1058,7 +1058,18 @@ fn finish_worker(
     Ok(worker) -> {
       let state = remove_worker(state, id, worker)
       case input {
-        reducer.Finished(_, outcome) ->
+        reducer.Finished(_, outcome) -> {
+          case reducer.outcome_rejected_arguments(outcome), worker.tool {
+            Some(error), Some(tool) ->
+              emit.arguments_rejected(
+                error,
+                id,
+                tool,
+                worker.correlation,
+                state.config.label,
+              )
+            _, _ -> Nil
+          }
           emit.invocation_completed(
             int.max(0, monotonic_ms() - worker.started_at),
             telemetry.InvocationCompletedMeta(
@@ -1071,6 +1082,7 @@ fn finish_worker(
               listener: state.config.label,
             ),
           )
+        }
         _ ->
           emit.invocation_crashed(crash_meta(
             state,

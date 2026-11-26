@@ -203,7 +203,8 @@
       #given[A call names a callable tool and its arguments do not decode with the tool's input codec.]
       #when[The server answers that call.]
       #then[The caller receives a result with isError true, not a JSON-RPC error.]
-      #then[Its text names the path and the expectation that failed.]
+      #then[Its text names the path that failed and Relay's or JSON Blueprint's own fixed description of the failure.]
+      #then[A message the application's codec wrote never reaches the caller: the text says custom validation failed instead, and the server's observers receive the codec's message in the invocation arguments_rejected telemetry event.]
       #then[The text does not repeat the value the caller sent, and the handler does not run.]
     ]
     #behavior(title: "Re-evaluate visibility on named calls", area: "Tool access", level: "interface")[
