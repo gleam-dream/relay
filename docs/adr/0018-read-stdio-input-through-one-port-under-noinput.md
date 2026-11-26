@@ -48,3 +48,21 @@ design kept two readers, the I/O server by default and the port under
   before `serve` keep their group leader and must not print to standard
   output; `erlang:display` writes to the descriptor directly and is outside
   Relay's reach.
+
+## Verification
+
+Tests in `test/relay/stdio_test.gleam` drive a stdio server in a spawned VM
+over OS pipes:
+
+- `default_settings_answer_a_small_request_while_stdin_stays_open_test`: a
+  request shorter than one read is answered while the pipe stays open.
+- `oversized_frame_is_refused_before_its_newline_arrives_test`: an oversized
+  frame is refused while it grows.
+- `stdio_refuses_to_serve_while_the_vm_reads_stdin_test`, in the test VM,
+  which runs without `-noinput`: `serve` returns `StdinOwnedByVm` before it
+  reads anything.
+- `log_and_print_output_while_serving_stays_off_stdout_test`: logger output
+  and handler `io` output reach standard error, never standard output.
+
+No test bounds input that waits in the reader's mailbox, because the
+consequences above leave it unbounded.
