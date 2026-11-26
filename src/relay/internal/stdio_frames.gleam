@@ -157,7 +157,6 @@ fn strip_trailing_cr(line: BitArray) -> BitArray {
 type WriterMessage {
   WriteBytes(bytes: BitArray, reply: Subject(Result(Nil, String)))
   CloseWriter(reply: Subject(Nil))
-  OwnerDown
 }
 
 pub opaque type Writer {
@@ -186,13 +185,8 @@ pub fn start_writer(
   let owner = process.self()
   let builder =
     actor.new_with_initialiser(5000, fn(subject) {
-      let monitor = process.monitor(owner)
+      guard_owner(owner, process.self())
       actor.initialised(Nil)
-      |> actor.selecting(
-        process.new_selector()
-        |> process.select(subject)
-        |> process.select_specific_monitor(monitor, fn(_) { OwnerDown }),
-      )
       |> actor.returning(subject)
       |> Ok
     })
@@ -207,19 +201,38 @@ pub fn start_writer(
           process.send(reply, Nil)
           actor.stop()
         }
-        OwnerDown -> actor.stop()
       }
     })
 
   case actor.start(builder) {
     Ok(started) -> {
       // Stopping the writer after a stalled write must not take its owner
-      // with it; the writer watches the owner through its monitor instead.
+      // with it; a guard process watches the owner instead.
       process.unlink(started.pid)
       Ok(Writer(started.data, started.pid, timeout_ms))
     }
     Error(err) -> Error(err)
   }
+}
+
+// Kills the writer when its owner exits, also while the writer is stuck in
+// its sink and reads no message, and ends with the writer.
+fn guard_owner(owner: Pid, writer: Pid) -> Nil {
+  let _ =
+    process.spawn_unlinked(fn() {
+      let owner_monitor = process.monitor(owner)
+      let writer_monitor = process.monitor(writer)
+      let owner_exited =
+        process.new_selector()
+        |> process.select_specific_monitor(owner_monitor, fn(_) { True })
+        |> process.select_specific_monitor(writer_monitor, fn(_) { False })
+        |> process.selector_receive_forever
+      case owner_exited {
+        True -> process.kill(writer)
+        False -> Nil
+      }
+    })
+  Nil
 }
 
 /// Writes `bytes` and waits at most the writer's timeout for the sink.

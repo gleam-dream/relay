@@ -422,6 +422,31 @@ pub fn stalled_writer_times_out_and_then_fails_at_once_test() {
   stdio_frames.stop_writer(writer)
 }
 
+pub fn writer_stuck_in_its_sink_stops_when_its_owner_exits_test() {
+  let writing = process.new_subject()
+  let owner =
+    process.spawn_unlinked(fn() {
+      let assert Ok(writer) =
+        stdio_frames.start_writer(
+          fn(_bytes) {
+            // Report the process running the sink, then never return.
+            process.send(writing, process.self())
+            process.sleep_forever()
+            Ok(Nil)
+          },
+          60_000,
+        )
+      stdio_frames.write_bytes(writer, <<"response\n">>)
+    })
+  let assert Ok(sink) = process.receive(writing, 1000)
+  let monitor = process.monitor(sink)
+  process.kill(owner)
+  let assert Ok(_) =
+    process.new_selector()
+    |> process.select_specific_monitor(monitor, fn(down) { down })
+    |> process.selector_receive(1000)
+}
+
 // --- a spawned child over OS pipes -------------------------------------------
 
 pub fn spawned_child_stdio_server_test() {
