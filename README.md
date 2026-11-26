@@ -1,5 +1,14 @@
 # Relay
 
+> **Relay 0.3.0 is a breaking release.** Read the [migration guide](https://github.com/gleam-dream/relay/blob/main/docs/MIGRATION.md) before you upgrade from 0.2.
+>
+> - A stdio server's VM must start with `-noinput`, and `stdio.Config` is a record with `runtime` and `write_timeout`.
+> - A stdio child launched by the client gets an allow-listed environment; add variables with `client.with_environment`.
+> - Invalid tool arguments return a tool error with detail (`ToolFailed`) instead of JSON-RPC `-32602`.
+> - Over HTTP, `next_notification`'s `Ok(None)` means only that the wait ended, and a listen stream ends at the listen timeout (1 h).
+> - `http.stop` returns only after the listening socket has closed.
+> - Depend on `json_blueprint >= 3.0.0 and < 4.0.0`; Relay now uses `sinal` 0.2 and `http_gun` 0.4.
+
 [![CI](https://github.com/gleam-dream/relay/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gleam-dream/relay/actions/workflows/ci.yml)
 [![relay on Hex](https://img.shields.io/hexpm/v/relay?label=Hex%3A%20relay)](https://hex.pm/packages/relay)
 [![Gleam](https://img.shields.io/badge/Gleam-FFAFF3?logo=gleam&logoColor=000000)](https://gleam.run/)
@@ -29,11 +38,11 @@ Use Relay to expose typed Gleam operations to MCP peers or call an MCP server wi
 Add Relay and JSON Blueprint from Hex; add Sinal or HTTP Gun directly when your application imports their modules or types.
 
 ```sh
-gleam add relay json_blueprint@2
+gleam add relay json_blueprint@3
 ```
 
-Relay requires JSON Blueprint 2.2.0 or later: copying an earlier combinator
-codec to another process cost many times its size in the heap.
+Relay 0.3 requires JSON Blueprint 3.x (`>= 3.0.0 and < 4.0.0`), Sinal 0.2
+(`>= 0.2.0 and < 0.3.0`) and HTTP Gun 0.4 (`>= 0.4.0 and < 0.5.0`).
 
 Use Gleam `>= 1.18.0` with the Erlang target. Commit `gleam.toml` and
 `manifest.toml` so builds use the same resolved versions.
@@ -172,6 +181,7 @@ This section states only what Relay copies between processes.
 
 ## Learn more
 
+- [Migrating from 0.2 to 0.3](https://github.com/gleam-dream/relay/blob/main/docs/MIGRATION.md)
 - [Runnable usage recipes](examples/relay_usage/README.md)
 - [Public API modules](src/relay/): `tool`, `server`, `http`, `stdio`, `client`, and `authorization`
 - [Design and contracts](docs/design/design-layer.pdf)
