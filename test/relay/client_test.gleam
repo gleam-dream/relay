@@ -1797,6 +1797,29 @@ pub fn stdio_child_gets_only_allowed_and_explicit_variables_test() {
   client.close(peer)
 }
 
+@external(erlang, "relay_stdio_env_ffi", "windows_unset")
+fn windows_unset(
+  inherited: List(#(String, String)),
+  added: List(#(String, String)),
+) -> List(String)
+
+pub fn windows_child_keeps_allowed_variables_in_any_case_test() {
+  // Windows variable names ignore case and keep the spelling they were set
+  // with, so `Path` and `SystemRoot` are the allow-listed PATH and
+  // SYSTEMROOT. An added `path` replaces the inherited `Path`.
+  let unset =
+    windows_unset(
+      [
+        #("Path", "C:\\Windows"),
+        #("SystemRoot", "C:\\Windows"),
+        #("Secret_Token", "s3cret"),
+        #("Extra", "old"),
+      ],
+      [#("EXTRA", "new")],
+    )
+  assert unset == ["Secret_Token"]
+}
+
 pub fn environment_is_refused_for_a_non_stdio_target_test() {
   let assert Ok(config) = client.http("http://127.0.0.1:1/")
   let assert Error(error) =

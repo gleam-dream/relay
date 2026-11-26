@@ -12,6 +12,7 @@
     lead_output_to_stderr/0,
     restore_group_leader/1,
     stop_supervisor/1,
+    child_environment/3,
     write_stdout/1,
     write_stderr/1,
     spawn_stdio_child/1,
@@ -479,7 +480,10 @@ ancestors(Pid) ->
 %% process, plus the ones the caller added. A port inherits the whole
 %% environment unless each other variable is unset, so the rest are unset.
 child_environment(Added) ->
-    Allowed = case os:type() of
+    child_environment(os:type(), os:env(), Added).
+
+child_environment(OsType, Inherited, Added) ->
+    Allowed = case OsType of
         {win32, _} ->
             ["APPDATA", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "PATH",
              "PROCESSOR_ARCHITECTURE", "SYSTEMDRIVE", "SYSTEMROOT", "TEMP",
@@ -487,12 +491,17 @@ child_environment(Added) ->
         _ ->
             ["HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER"]
     end,
+    %% Windows variable names ignore case and keep the spelling they were
+    %% set with; Unix names are compared exactly.
+    Key = case OsType of
+        {win32, _} -> fun string:uppercase/1;
+        _ -> fun(Name) -> Name end
+    end,
     Explicit = [{unicode:characters_to_list(Name), unicode:characters_to_list(Value)}
                 || {Name, Value} <- Added],
-    ExplicitNames = [Name || {Name, _} <- Explicit],
-    Unset = [{Name, false} || {Name, _} <- os:env(),
-                              not lists:member(Name, Allowed),
-                              not lists:member(Name, ExplicitNames)],
+    Kept = [Key(Name) || Name <- Allowed ++ [Name || {Name, _} <- Explicit]],
+    Unset = [{Name, false} || {Name, _} <- Inherited,
+                              not lists:member(Key(Name), Kept)],
     Unset ++ Explicit.
 
 start_stdio_client_port(CmdBin, ArgsList, Added, GleamSubject) ->

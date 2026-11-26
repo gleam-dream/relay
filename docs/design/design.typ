@@ -515,7 +515,7 @@
       [Client request timeout], [30 s], [`client.with_timeout`; per call `client.with_deadline`],
       [Client connect], [10 s], [`client.with_connect_timeout`],
       [Client response size], [1 MiB], [`client.with_max_response_bytes`],
-      [Stdio child environment], [HOME, LOGNAME, PATH, SHELL, TERM, USER inherited; nothing else], [`client.with_environment` adds variables],
+      [Stdio child environment], [The platform allow-list named in `client.stdio` inherited, names compared without case on Windows; nothing else], [`client.with_environment` adds variables],
       [Client listings], [256 pages, 10,000 items], [`client.with_listing_limits`],
       [Client stdio pending calls], [64, then `TooManyPendingCalls`], [`client.with_max_pending_calls`],
       [Client input methods advertised], [None], [`client.with_input_methods`],
