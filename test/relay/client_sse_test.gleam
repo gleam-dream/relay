@@ -9,6 +9,7 @@ import gleam/http/response.{type Response}
 import gleam/int
 import gleam/list
 import gleam/string
+import gleam/time/duration
 import gleeunit/should
 import json/blueprint/codec.{type Codec}
 import mist
@@ -51,6 +52,26 @@ type Ending {
 /// delivers it as an event stream: a comment, a progress notification, then
 /// the response. `seen` receives the `Accept` header of every request.
 fn start_streaming_server(seen: Subject(String), ending: Ending) -> Int {
+  start_chunked_server(seen, ending, fn(text) {
+    [
+      ": keepalive\n\n"
+      <> "event: message\ndata: "
+      <> progress
+      <> "\n\n"
+      <> "event: message\r\ndata: "
+      <> text
+      <> "\r\n\r\n",
+    ]
+  })
+}
+
+/// Like `start_streaming_server`, with the stream written as the chunks
+/// `chunks` builds from the response text, 50 ms apart.
+fn start_chunked_server(
+  seen: Subject(String),
+  ending: Ending,
+  chunks: fn(String) -> List(String),
+) -> Int {
   let assert Ok(relay) = http.handler(http.new(echo_server()))
   let ports = process.new_subject()
   let assert Ok(_) =
@@ -63,22 +84,18 @@ fn start_streaming_server(seen: Subject(String), ending: Ending) -> Int {
       let answer = http.handle(relay, buffered)
       let assert Ok(text) =
         bit_array.to_string(bytes_tree.to_bit_array(answer.body))
-      let events =
-        ": keepalive\n\n"
-        <> "event: message\ndata: "
-        <> progress
-        <> "\n\n"
-        <> "event: message\r\ndata: "
-        <> text
-        <> "\r\n\r\n"
+      let events = chunks(text)
       mist.chunked(
         request: incoming,
         response: response.new(200)
           |> response.set_header("content-type", "text/event-stream"),
         init: fn(self) { process.send(self, Write) },
         loop: fn(state, _step: StreamStep, connection) {
-          let assert Ok(Nil) =
-            mist.send_chunk(connection, bit_array.from_string(events))
+          list.each(events, fn(chunk) {
+            let assert Ok(Nil) =
+              mist.send_chunk(connection, bit_array.from_string(chunk))
+            process.sleep(50)
+          })
           case ending {
             Ends -> mist.chunk_stop()
             StaysOpen -> mist.chunk_continue(state)
@@ -129,5 +146,31 @@ pub fn call_returns_at_the_response_when_the_stream_stays_open_test() {
   // The connection is released, so a second call succeeds too.
   let assert Ok(client.Succeeded("echo: again", _)) =
     client.call(peer, echo_definition(), "again")
+  client.close(peer)
+}
+
+pub fn call_finds_a_response_whose_blank_line_ends_in_the_next_chunk_test() {
+  let seen = process.new_subject()
+  // The first chunk holds a whole progress event and the response up to
+  // its first newline; the second chunk is the newline that ends it.
+  let port =
+    start_chunked_server(seen, StaysOpen, fn(text) {
+      [
+        "data: "
+          <> progress
+          <> "\n\n"
+          <> "data: "
+          <> string.trim_end(text)
+          <> "\n",
+        "\n",
+      ]
+    })
+  let assert Ok(config) =
+    client.http("http://127.0.0.1:" <> int.to_string(port) <> "/")
+  let assert Ok(peer) =
+    config |> client.with_timeout(duration.seconds(2)) |> client.connect
+
+  let assert Ok(client.Succeeded("echo: split", _)) =
+    client.call(peer, echo_definition(), "split")
   client.close(peer)
 }

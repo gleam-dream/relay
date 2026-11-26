@@ -1278,7 +1278,7 @@ fn stream_response(
       use #(pending, read) <- result.try(read_to_blank_line(
         stream,
         pending,
-        AtText,
+        line_end(pending),
         read,
         limit,
         call,
@@ -1321,6 +1321,16 @@ fn read_to_blank_line(
         Ok(body.End(_)) -> Error(Failed(ConnectionClosed(MaybeSent), call))
         Error(failure) -> Error(gun_failure(failure, limit, call))
       }
+  }
+}
+
+// Where a scan of the bytes after `pending` starts: bytes left over from a
+// chunk that held an earlier event may already end in a newline.
+fn line_end(pending: BitArray) -> LineEnd {
+  case blank_line(pending, AtText) {
+    Error(at) -> at
+    // `pending` holds no complete event, so it holds no blank line.
+    Ok(Nil) -> AtText
   }
 }
 
