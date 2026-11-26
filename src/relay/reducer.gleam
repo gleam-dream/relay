@@ -12,7 +12,9 @@
 //// unless you need to own the scheduling.
 ////
 //// A transport allocates an `ExchangeId` with `new_exchange_id` before
-//// parsing, so that a malformed frame still has a destination. `Input` and
+//// parsing, so that a malformed frame still has a destination, and decodes
+//// the frame's bytes once with `decode`; the reducer never parses them
+//// again. `Input` and
 //// `Effect` are revision-bound: they gain variants only in a major release.
 //// The state keeps up to 10,000 closed exchange records to suppress late or
 //// repeated output, and drops the oldest beyond that.
@@ -26,7 +28,10 @@
 ////   let state = reducer.init(server.new([]))
 ////   let exchange = reducer.new_exchange_id()
 ////   let #(_state, effects) =
-////     reducer.step(state, reducer.Received(exchange, Nil, bytes, None))
+////     reducer.step(
+////       state,
+////       reducer.Received(exchange, Nil, reducer.decode(bytes), None),
+////     )
 ////   effects
 //// }
 //// ```
@@ -40,10 +45,12 @@ import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import json/blueprint/codec
 import json/blueprint/value.{type Value}
 import relay/content.{type ResourceContents}
 import relay/internal/carrier
 import relay/internal/core
+import relay/internal/frame as inbound
 import relay/internal/jsonrpc.{type ProgressToken, type RequestId}
 import relay/internal/protocol/v2026_07_28 as v2026
 import relay/internal/subscriptions_state as subs
@@ -99,12 +106,58 @@ fn ffi_read_cursor(
 
 /// The result of `perform`, fed back with `Finished`.
 pub opaque type Outcome {
-  Outcome(response: json.Json, status: Status)
+  Outcome(
+    response: json.Json,
+    status: Status,
+    rejected_arguments: Option(codec.DecodeError),
+  )
+}
+
+// The decode error as the caller may read it: an application's custom
+// message is replaced by Blueprint's fixed text for one.
+fn published(error: codec.DecodeError) -> String {
+  case error.reason {
+    codec.Custom(_) ->
+      codec.describe_decode_error(
+        codec.DecodeError(..error, reason: codec.Custom("")),
+      )
+    _ -> codec.describe_decode_error(error)
+  }
+}
+
+fn outcome(response: json.Json, status: Status) -> Outcome {
+  Outcome(response:, status:, rejected_arguments: None)
 }
 
 /// How the invocation behind an outcome finished.
 pub fn outcome_status(outcome: Outcome) -> Status {
   outcome.status
+}
+
+/// The input codec's error when the tool's arguments did not decode. It
+/// keeps the codec's own message, which the response to the caller leaves
+/// out; read it on the server only.
+pub fn outcome_rejected_arguments(
+  outcome: Outcome,
+) -> Option(codec.DecodeError) {
+  outcome.rejected_arguments
+}
+
+/// An inbound JSON-RPC frame, decoded once by `decode`. A frame that is not
+/// valid JSON-RPC still decodes; the reducer answers it with the matching
+/// error.
+pub type Frame =
+  inbound.Frame
+
+/// Decodes the bytes of one inbound frame. Call it once per frame and pass
+/// the result in `Received`; nothing downstream parses the bytes again.
+pub fn decode(bytes: BitArray) -> Frame {
+  inbound.decode(bytes)
+}
+
+/// The valid correlation a frame carries in `params._meta`, if any.
+pub fn frame_correlation(frame: Frame) -> Option(Correlation) {
+  inbound.correlation(frame)
 }
 
 /// What the reducer reacts to.
@@ -115,7 +168,7 @@ pub type Input(context) {
   Received(
     exchange: ExchangeId,
     context: context,
-    bytes: BitArray,
+    frame: Frame,
     correlation: Option(Correlation),
   )
   Finished(invocation: InvocationId, outcome: Outcome)
@@ -325,10 +378,10 @@ pub fn step(
   input: Input(context),
 ) -> #(State(context), List(Effect(context))) {
   case input {
-    Received(exchange, context, bytes, correlation) ->
+    Received(exchange, context, frame, correlation) ->
       case dict.has_key(state.exchanges, key(exchange)) {
         True -> #(state, [])
-        False -> admit(state, exchange, context, bytes, correlation)
+        False -> admit(state, exchange, context, frame, correlation)
       }
     Finished(invocation, outcome) -> finish(state, invocation, outcome.response)
     Crashed(invocation) | TimedOut(invocation) ->
@@ -381,10 +434,10 @@ fn admit(
   state: State(context),
   exchange: ExchangeId,
   context: context,
-  bytes: BitArray,
+  frame: Frame,
   correlation: Option(Correlation),
 ) -> #(State(context), List(Effect(context))) {
-  case v2026.admit_bytes(bytes) {
+  case inbound.admission(frame) {
     v2026.AdmittedRejected(id, error) ->
       immediate(state, exchange, None, jsonrpc.error_to_json(id, error))
     v2026.AdmittedIgnored(_) -> #(mark_done(state, exchange), [Close(exchange)])
@@ -399,7 +452,7 @@ fn admit(
         state,
         exchange,
         context,
-        carrier.resolve(correlation, bytes),
+        carrier.resolve(correlation, inbound.correlation(frame)),
         request,
       )
   }
@@ -999,7 +1052,7 @@ pub fn perform(
     ToolWork(entry, arguments, request_state) ->
       case entry.invoke(call, arguments) {
         core.Completed(structured, blocks) ->
-          Outcome(
+          outcome(
             v2026.encode_call_response(
               id,
               structured,
@@ -1010,7 +1063,7 @@ pub fn perform(
             telemetry.Succeeded,
           )
         core.Failed(blocks, structured) ->
-          Outcome(
+          outcome(
             v2026.encode_call_response(
               id,
               structured,
@@ -1022,13 +1075,24 @@ pub fn perform(
           )
         core.AwaitingInput(requests) ->
           input_required(invocation, requests, request_state)
-        core.InvalidArguments(_) ->
+        // MCP reports input validation as a tool execution error, so the
+        // model can correct the call. The text names the path and Blueprint's
+        // own expectation, never the value that was sent; a message the
+        // application's codec wrote stays on the server.
+        core.InvalidArguments(error) ->
           Outcome(
-            jsonrpc.error_to_json(Some(id), jsonrpc.invalid_params()),
-            telemetry.Failed,
+            response: v2026.encode_call_response(
+              id,
+              None,
+              [content.text("Invalid arguments: " <> published(error))],
+              True,
+              invocation.identity,
+            ),
+            status: telemetry.ToolFailed,
+            rejected_arguments: Some(error),
           )
         core.InvalidOutput ->
-          Outcome(
+          outcome(
             jsonrpc.error_to_json(Some(id), jsonrpc.internal_error()),
             telemetry.Failed,
           )
@@ -1036,12 +1100,12 @@ pub fn perform(
     ResourceWork(read, uri) ->
       case read(invocation.context, uri) {
         Ok(contents) ->
-          Outcome(
+          outcome(
             v2026.encode_resources_read_response(id, contents),
             telemetry.Succeeded,
           )
         Error(Nil) ->
-          Outcome(
+          outcome(
             jsonrpc.error_to_json(Some(id), jsonrpc.resource_not_found(uri)),
             telemetry.Failed,
           )
@@ -1049,14 +1113,14 @@ pub fn perform(
     PromptWork(prompt, arguments, request_state) ->
       case prompt.get(call, arguments) {
         Ok(core.Complete(rendered, _, _)) ->
-          Outcome(
+          outcome(
             v2026.encode_prompts_get_response(id, rendered),
             telemetry.Succeeded,
           )
         Ok(core.NeedsInput(requests)) ->
           input_required(invocation, requests, request_state)
         Error(Nil) ->
-          Outcome(
+          outcome(
             jsonrpc.error_to_json(Some(id), jsonrpc.invalid_params()),
             telemetry.Failed,
           )
@@ -1064,12 +1128,12 @@ pub fn perform(
     CompletionWork(core.Completion(complete), query) ->
       case complete(invocation.context, query) {
         Ok(completion) ->
-          Outcome(
+          outcome(
             v2026.encode_completion_response(id, completion),
             telemetry.Succeeded,
           )
         Error(Nil) ->
-          Outcome(
+          outcome(
             jsonrpc.error_to_json(Some(id), jsonrpc.internal_error()),
             telemetry.Failed,
           )
@@ -1088,7 +1152,7 @@ fn input_required(
       let #(_, request) = entry
       v2026.client_supports_input_request(invocation.metadata, request.method)
     })
-  Outcome(
+  outcome(
     v2026.encode_input_required_response(
       invocation.request_id,
       supported,

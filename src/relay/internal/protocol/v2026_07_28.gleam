@@ -10,6 +10,7 @@ import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import json/blueprint/number
 import json/blueprint/value.{type Value}
 import relay/content.{type ContentBlock, type ResourceContents}
 import relay/internal/carrier
@@ -109,15 +110,112 @@ pub type Admission {
   AdmittedRejected(id: Option(RequestId), error: RpcError)
 }
 
-@external(erlang, "relay_ffi", "extract_arguments_as_blueprint_value")
-fn ffi_extract_arguments_as_blueprint_value(
-  raw_bytes: BitArray,
-) -> Result(Value, Dynamic)
+/// The parts of a frame kept as exact JSON Blueprint values by the one
+/// decode: the `tools/call` arguments (an empty object when absent) and the
+/// `inputResponses` object. In the decoded envelope both members are `null`.
+pub type Extracted {
+  Extracted(arguments: Result(Value, Nil), input_responses: Result(Value, Nil))
+}
 
-@external(erlang, "relay_ffi", "extract_input_responses_as_blueprint_value")
-fn ffi_extract_input_responses_as_blueprint_value(
-  raw_bytes: BitArray,
-) -> Result(Value, Dynamic)
+/// A frame decoded once: its admission and the correlation text it carries
+/// in `params._meta`, if any.
+pub type Decoded {
+  Decoded(admission: Admission, correlation: Option(String))
+}
+
+/// Parses one JSON value, keeping every number as its source text.
+@external(erlang, "relay_ffi", "decode_json_exact")
+fn ffi_decode_json_exact(bytes: BitArray) -> Result(Dynamic, Nil)
+
+/// Converts a value parsed by `ffi_decode_json_exact` to a JSON Blueprint
+/// value, parsing its numbers within `limits`.
+@external(erlang, "relay_ffi", "exact_to_value")
+fn ffi_exact_to_value(
+  term: Dynamic,
+  limits: number.Limits,
+) -> Result(Value, Nil)
+
+/// Converts a value parsed by `ffi_decode_json_exact` to the ordinary
+/// Erlang form, numbers as integers or floats.
+@external(erlang, "relay_ffi", "exact_to_native")
+fn ffi_exact_to_native(term: Dynamic) -> Dynamic
+
+/// Decodes a JSON-RPC frame once. Numbers are kept as their source text, so
+/// `tools/call` arguments and `inputResponses` become exact JSON Blueprint
+/// values; those two members are then `null` in the returned envelope, and
+/// every other number in it becomes an ordinary integer or float.
+fn ffi_decode_frame(bytes: BitArray) -> Result(#(Dynamic, Extracted), Nil) {
+  ffi_decode_json_exact(bytes) |> result.map(split_frame)
+}
+
+fn split_frame(root: Dynamic) -> #(Dynamic, Extracted) {
+  let limits =
+    number.limits(
+      max_token_bytes: 1024,
+      max_significant_digits: 100,
+      max_exponent: 1000,
+    )
+  let no_extraction = Extracted(Ok(value.Object([])), Error(Nil))
+  case object_fields(root) {
+    Error(Nil) -> #(ffi_exact_to_native(root), no_extraction)
+    Ok(fields) ->
+      case dict.get(fields, "params") |> result.try(object_fields) {
+        Error(Nil) -> #(ffi_exact_to_native(root), no_extraction)
+        Ok(params) -> {
+          let method =
+            dict.get(fields, "method")
+            |> result.try(fn(raw) {
+              decode.run(raw, decode.string) |> result.replace_error(Nil)
+            })
+          let #(arguments, params) = case
+            method,
+            dict.get(params, "arguments")
+          {
+            Ok("tools/call"), Ok(raw) -> #(
+              object_value(raw, limits),
+              dict.insert(params, "arguments", dynamic.nil()),
+            )
+            _, _ -> #(Ok(value.Object([])), params)
+          }
+          let #(input_responses, params) = case
+            dict.get(params, "inputResponses")
+          {
+            Ok(raw) -> #(
+              object_value(raw, limits),
+              dict.insert(params, "inputResponses", dynamic.nil()),
+            )
+            Error(Nil) -> #(Error(Nil), params)
+          }
+          let envelope =
+            dict.insert(fields, "params", object_dynamic(params))
+            |> object_dynamic
+          #(
+            ffi_exact_to_native(envelope),
+            Extracted(arguments, input_responses),
+          )
+        }
+      }
+  }
+}
+
+fn object_fields(raw: Dynamic) -> Result(Dict(String, Dynamic), Nil) {
+  decode.run(raw, decode.dict(decode.string, decode.dynamic))
+  |> result.replace_error(Nil)
+}
+
+fn object_dynamic(fields: Dict(String, Dynamic)) -> Dynamic {
+  dict.to_list(fields)
+  |> list.map(fn(entry) { #(dynamic.string(entry.0), entry.1) })
+  |> dynamic.properties
+}
+
+// An exact value that must be a JSON object.
+fn object_value(raw: Dynamic, limits: number.Limits) -> Result(Value, Nil) {
+  case object_fields(raw) {
+    Error(Nil) -> Error(Nil)
+    Ok(_) -> ffi_exact_to_value(raw, limits)
+  }
+}
 
 @external(erlang, "relay_ffi", "json_depth_within")
 fn ffi_json_depth_within(bytes: BitArray, max_depth: Int) -> Bool
@@ -135,12 +233,49 @@ pub fn admit_message(raw_json: String) -> Admission {
 
 /// Reads the HTTP routing fields without executing or admitting the request.
 pub fn http_route(bytes: BitArray) -> Result(HttpRoute, Nil) {
+  use #(envelope, extracted) <- result.try(ffi_decode_frame(bytes))
+  route_of(envelope, fn() { option.from_result(extracted.arguments) })
+}
+
+/// Reads the HTTP routing fields and admits the request from the one decode
+/// of the body.
+pub fn http_inspect(bytes: BitArray) -> Result(#(HttpRoute, Decoded), Nil) {
+  use #(envelope, extracted) <- result.try(ffi_decode_frame(bytes))
+  let admission = admit_dynamic(envelope, extracted)
+  use route <- result.map(
+    route_of(envelope, fn() { option.from_result(extracted.arguments) }),
+  )
+  #(route, Decoded(admission, carried_correlation(envelope)))
+}
+
+/// Decodes a frame once and admits it.
+pub fn decode(bytes: BitArray) -> Decoded {
+  case ffi_decode_frame(bytes) {
+    Error(Nil) -> Decoded(AdmittedRejected(None, jsonrpc.parse_error()), None)
+    Ok(#(envelope, extracted)) ->
+      Decoded(admit_dynamic(envelope, extracted), carried_correlation(envelope))
+  }
+}
+
+fn parse_envelope(bytes: BitArray) -> Result(Dynamic, Nil) {
   use raw <- result.try(
     bit_array.to_string(bytes) |> result.map_error(fn(_) { Nil }),
   )
-  use dynamic <- result.try(
-    json.parse(raw, decode.dynamic) |> result.map_error(fn(_) { Nil }),
+  json.parse(raw, decode.dynamic) |> result.map_error(fn(_) { Nil })
+}
+
+fn carried_correlation(envelope: Dynamic) -> Option(String) {
+  decode.run(
+    envelope,
+    decode.at(["params", "_meta", carrier.meta_key], decode.string),
   )
+  |> option.from_result
+}
+
+fn route_of(
+  dynamic: Dynamic,
+  tool_arguments: fn() -> Option(Value),
+) -> Result(HttpRoute, Nil) {
   use fields <- result.try(
     decode.run(dynamic, decode.dict(decode.string, decode.dynamic))
     |> result.map_error(fn(_) { Nil }),
@@ -208,18 +343,15 @@ pub fn http_route(bytes: BitArray) -> Result(HttpRoute, Nil) {
       }
   }
   let arguments = case method {
-    "tools/call" ->
-      ffi_extract_arguments_as_blueprint_value(bytes)
-      |> result.map(Some)
-      |> result.unwrap(None)
+    "tools/call" -> tool_arguments()
     _ -> None
   }
   Ok(HttpRoute(method, name, arguments, protocol_version, has_id))
 }
 
 /// Returns an HTTP status and JSON-RPC error for messages rejected at admission.
-pub fn http_admission_failure(bytes: BitArray) -> Option(HttpFailure) {
-  case admit_bytes(bytes) {
+pub fn http_admission_failure(admission: Admission) -> Option(HttpFailure) {
+  case admission {
     AdmittedRejected(id, error) -> {
       let status_code = case error.code == jsonrpc.method_not_found_code {
         True -> 404
@@ -252,6 +384,23 @@ pub fn encode_http_routing_error(bytes: BitArray) -> BitArray {
   |> string_to_bytes
 }
 
+/// The error response for a request the server did not admit because it is
+/// at capacity or stopping, or `None` when `bytes` is not a request with a
+/// usable id. The code is JSON-RPC's implementation-defined server error.
+pub fn encode_refusal(bytes: BitArray, message: String) -> Option(BitArray) {
+  let id = case admit_bytes(bytes) {
+    AdmittedRequest(request) -> Some(request_id(request))
+    AdmittedRejected(id, _) -> id
+    _ -> None
+  }
+  use id <- option.map(id)
+  json.to_string(jsonrpc.error_to_json(
+    Some(id),
+    jsonrpc.RpcError(code: -32_000, message: message, data: None),
+  ))
+  |> string_to_bytes
+}
+
 fn string_to_bytes(raw: String) -> BitArray {
   bit_array.from_string(raw <> "
 ")
@@ -274,76 +423,48 @@ fn request_id(request: Request) -> RequestId {
 
 /// True for a JSON-RPC response or error object, false for a notification.
 pub fn is_response_frame(bytes: BitArray) -> Bool {
-  case bit_array.to_string(bytes) {
-    Error(_) -> False
-    Ok(raw) ->
-      case json.parse(raw, decode.dynamic) {
-        Error(_) -> False
-        Ok(dynamic) ->
-          case decode.run(dynamic, decode.dict(decode.string, decode.dynamic)) {
-            Error(_) -> False
-            Ok(fields) -> {
-              let has_id_or_error =
-                dict.has_key(fields, "id") || dict.has_key(fields, "error")
-              !dict.has_key(fields, "method") && has_id_or_error
-            }
-          }
-      }
-  }
+  result.is_ok(response_status(bytes))
 }
 
 /// Returns the Streamable HTTP status required for protocol-level errors.
 pub fn http_response_status(bytes: BitArray) -> Option(Int) {
-  case bit_array.to_string(bytes) {
-    Error(_) -> None
-    Ok(raw) ->
-      case json.parse(raw, decode.dynamic) {
-        Error(_) -> None
-        Ok(dynamic) ->
-          case decode.run(dynamic, decode.dict(decode.string, decode.dynamic)) {
-            Error(_) -> None
-            Ok(fields) ->
-              case dict.get(fields, "error") {
-                Error(_) -> None
-                Ok(error) ->
-                  case
-                    decode.run(
-                      error,
-                      decode.dict(decode.string, decode.dynamic),
-                    )
-                  {
-                    Error(_) -> None
-                    Ok(error) ->
-                      case dict.get(error, "code") {
-                        Error(_) -> None
-                        Ok(code) ->
-                          case decode.run(code, decode.int) {
-                            Error(_) -> None
-                            Ok(-32_601) -> Some(404)
-                            Ok(-32_021) | Ok(-32_022) -> Some(400)
-                            Ok(_) -> None
-                          }
-                      }
-                  }
-              }
-          }
-      }
+  case parse_envelope(bytes) {
+    Ok(dynamic) -> error_status(dynamic)
+    Error(Nil) -> None
+  }
+}
+
+/// Classifies an outgoing frame from one parse: `Error` for a notification
+/// or an unreadable frame, `Ok` for a response or error object, with the
+/// Streamable HTTP status its error code requires, if any.
+pub fn response_status(bytes: BitArray) -> Result(Option(Int), Nil) {
+  use dynamic <- result.try(parse_envelope(bytes))
+  use fields <- result.try(
+    decode.run(dynamic, decode.dict(decode.string, decode.dynamic))
+    |> result.replace_error(Nil),
+  )
+  let has_id_or_error =
+    dict.has_key(fields, "id") || dict.has_key(fields, "error")
+  case !dict.has_key(fields, "method") && has_id_or_error {
+    True -> Ok(error_status(dynamic))
+    False -> Error(Nil)
+  }
+}
+
+fn error_status(message: Dynamic) -> Option(Int) {
+  case decode.run(message, decode.at(["error", "code"], decode.int)) {
+    Ok(-32_601) -> Some(404)
+    Ok(-32_021) | Ok(-32_022) -> Some(400)
+    _ -> None
   }
 }
 
 /// Admits and parses an incoming BitArray message.
 pub fn admit_bytes(bytes: BitArray) -> Admission {
-  case bit_array.to_string(bytes) {
-    Error(_) -> AdmittedRejected(None, jsonrpc.parse_error())
-    Ok(str) ->
-      case json.parse(from: str, using: decode.dynamic) {
-        Error(_) -> AdmittedRejected(None, jsonrpc.parse_error())
-        Ok(raw_dynamic) -> admit_dynamic(raw_dynamic, bytes)
-      }
-  }
+  decode(bytes).admission
 }
 
-fn admit_dynamic(data: Dynamic, bytes: BitArray) -> Admission {
+fn admit_dynamic(data: Dynamic, extracted: Extracted) -> Admission {
   let root_decoder = decode.dict(decode.string, decode.dynamic)
 
   case decode.run(data, root_decoder) {
@@ -352,7 +473,7 @@ fn admit_dynamic(data: Dynamic, bytes: BitArray) -> Admission {
       case dict.get(obj, "jsonrpc") {
         Ok(jsonrpc_val) ->
           case decode.run(jsonrpc_val, decode.string) {
-            Ok("2.0") -> classify_envelope(obj, bytes)
+            Ok("2.0") -> classify_envelope(obj, extracted)
             _ -> AdmittedRejected(None, jsonrpc.invalid_request())
           }
         _ -> AdmittedRejected(None, jsonrpc.invalid_request())
@@ -361,7 +482,10 @@ fn admit_dynamic(data: Dynamic, bytes: BitArray) -> Admission {
   }
 }
 
-fn classify_envelope(obj: Dict(String, Dynamic), bytes: BitArray) -> Admission {
+fn classify_envelope(
+  obj: Dict(String, Dynamic),
+  extracted: Extracted,
+) -> Admission {
   // Check if this is an unexpected response message
   case dict.get(obj, "result"), dict.get(obj, "error") {
     Ok(_), _ -> AdmittedIgnored(UnexpectedResponseReason)
@@ -382,7 +506,7 @@ fn classify_envelope(obj: Dict(String, Dynamic), bytes: BitArray) -> Admission {
                 Ok(None) -> route_notification(method, dict.get(obj, "params"))
                 // Request (with ID)
                 Ok(Some(id)) ->
-                  route_request(id, method, dict.get(obj, "params"), bytes)
+                  route_request(id, method, dict.get(obj, "params"), extracted)
               }
             }
           }
@@ -438,7 +562,7 @@ fn route_request(
   id: RequestId,
   method: String,
   params_opt: Result(Dynamic, Nil),
-  bytes: BitArray,
+  extracted: Extracted,
 ) -> Admission {
   case params_opt {
     Error(_) -> AdmittedRejected(Some(id), jsonrpc.invalid_params())
@@ -459,10 +583,11 @@ fn route_request(
               parse_subscriptions_listen_params(id, meta, params_dyn)
             "prompts/list" -> parse_prompts_list_params(id, meta, params_dyn)
             "prompts/get" ->
-              parse_prompts_get_params(id, meta, params_dyn, bytes)
+              parse_prompts_get_params(id, meta, params_dyn, extracted)
             "completion/complete" ->
               parse_completion_params(id, meta, params_dyn)
-            "tools/call" -> parse_tools_call_params(id, meta, params_dyn, bytes)
+            "tools/call" ->
+              parse_tools_call_params(id, meta, params_dyn, extracted)
             _ -> AdmittedRejected(Some(id), jsonrpc.method_not_found())
           }
       }
@@ -601,7 +726,7 @@ fn parse_prompts_get_params(
   id: RequestId,
   meta: RequestMetadata,
   params_dyn: Dynamic,
-  bytes: BitArray,
+  extracted: Extracted,
 ) -> Admission {
   case decode.run(params_dyn, decode.dict(decode.string, decode.dynamic)) {
     Error(_) -> AdmittedRejected(Some(id), jsonrpc.invalid_params())
@@ -615,7 +740,7 @@ fn parse_prompts_get_params(
               case
                 parse_string_arguments(dict.get(params, "arguments")),
                 parse_optional_string(params, "requestState"),
-                parse_optional_input_responses(params, bytes)
+                parse_optional_input_responses(params, extracted)
               {
                 Ok(arguments), Ok(request_state), Ok(input_responses) ->
                   AdmittedRequest(PromptsGet(
@@ -957,7 +1082,7 @@ fn parse_tools_call_params(
   id: RequestId,
   meta: RequestMetadata,
   params_dyn: Dynamic,
-  bytes: BitArray,
+  extracted: Extracted,
 ) -> Admission {
   let continuation_check = decode.dict(decode.string, decode.dynamic)
   case decode.run(params_dyn, continuation_check) {
@@ -974,12 +1099,12 @@ fn parse_tools_call_params(
                 tool_name -> {
                   let args = case dict.get(params_map, "arguments") {
                     Error(_) -> Ok(value.Object([]))
-                    Ok(_) -> ffi_extract_arguments_as_blueprint_value(bytes)
+                    Ok(_) -> extracted.arguments
                   }
                   let request_state =
                     parse_optional_string(params_map, "requestState")
                   let input_responses =
-                    parse_optional_input_responses(params_map, bytes)
+                    parse_optional_input_responses(params_map, extracted)
                   case args, request_state, input_responses {
                     Ok(args), Ok(request_state), Ok(input_responses) ->
                       AdmittedRequest(ToolsCall(
@@ -1016,12 +1141,12 @@ fn parse_optional_string(
 
 fn parse_optional_input_responses(
   params: Dict(String, Dynamic),
-  bytes: BitArray,
+  extracted: Extracted,
 ) -> Result(Option(Value), Nil) {
   case dict.get(params, "inputResponses") {
     Error(_) -> Ok(None)
     Ok(_) ->
-      case ffi_extract_input_responses_as_blueprint_value(bytes) {
+      case extracted.input_responses {
         Ok(parsed) ->
           case parsed {
             value.Object(_) -> Ok(Some(parsed))

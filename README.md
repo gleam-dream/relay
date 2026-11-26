@@ -1,5 +1,14 @@
 # Relay
 
+> **Relay 0.3.0 is a breaking release.** Read the [migration guide](https://github.com/gleam-dream/relay/blob/main/docs/MIGRATION.md) before you upgrade from 0.2.
+>
+> - A stdio server's VM must start with `-noinput`, and `stdio.Config` is a record with `runtime`, `write_timeout` and `max_unframed_bytes` (standard input not yet framed is bounded, 4 MiB by default).
+> - A stdio child launched by the client gets an allow-listed environment; add variables with `client.with_environment`.
+> - Invalid tool arguments return a tool error (`ToolFailed`) with the failing path instead of JSON-RPC `-32602`; a message your input codec wrote goes only to the `arguments_rejected` telemetry event, never to the caller.
+> - Over HTTP, `next_notification`'s `Ok(None)` means only that the wait ended, and a `listen` stream ends at the listen timeout (1 h); ordinary calls keep the 30 s request timeout.
+> - `http.stop` returns only after the listening socket has closed.
+> - Depend on `json_blueprint >= 3.0.0 and < 4.0.0`; Relay now uses `sinal` 0.2 and `http_gun` 0.4.
+
 [![CI](https://github.com/gleam-dream/relay/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gleam-dream/relay/actions/workflows/ci.yml)
 [![relay on Hex](https://img.shields.io/hexpm/v/relay?label=Hex%3A%20relay)](https://hex.pm/packages/relay)
 [![Gleam](https://img.shields.io/badge/Gleam-FFAFF3?logo=gleam&logoColor=000000)](https://gleam.run/)
@@ -29,18 +38,18 @@ Use Relay to expose typed Gleam operations to MCP peers or call an MCP server wi
 Add Relay and JSON Blueprint from Hex; add Sinal or HTTP Gun directly when your application imports their modules or types.
 
 ```sh
-gleam add relay json_blueprint@2
+gleam add relay json_blueprint@3
 ```
 
-Relay requires JSON Blueprint 2.2.0 or later: copying an earlier combinator
-codec to another process cost many times its size in the heap.
+Relay 0.3 requires JSON Blueprint 3.x (`>= 3.0.0 and < 4.0.0`), Sinal 0.2
+(`>= 0.2.0 and < 0.3.0`) and HTTP Gun 0.4 (`>= 0.4.0 and < 0.5.0`).
 
 Use Gleam `>= 1.18.0` with the Erlang target. Commit `gleam.toml` and
 `manifest.toml` so builds use the same resolved versions.
 
 ## Server flow and ownership
 
-On the server, the transport admits a request to a runtime actor. The actor serializes protocol state through a pure reducer and starts isolated workers for application handlers. HTTP can build request context and ask a verifier before dispatch; stdio trusts its parent process.
+On the server, the transport admits a request to a runtime actor. The actor serializes protocol state through a pure reducer and starts isolated workers for application handlers. HTTP can build request context and ask a verifier before dispatch; stdio trusts its parent process. A stdio server runs in a VM started with `-noinput` (for example `ERL_FLAGS=-noinput`), so that it is the only reader of standard input, and its standard output carries only protocol frames: serving moves logger output and handler `io` output to standard error.
 
 ```mermaid
 flowchart LR
@@ -105,7 +114,7 @@ pub fn serve_and_call() -> Nil {
 
 ## Mount in an application
 
-Use `http.handler` when the host router should own HTTP listening. The [complete example](examples/relay_usage/src/relay_usage/mount.gleam) supplies
+Use `http.handler` when the host router should own HTTP listening. The [complete example](https://github.com/gleam-dream/relay/blob/main/examples/relay_usage/src/relay_usage/mount.gleam) supplies
 the imports and `Tenant` type. It reads a tenant header as example input; derive
 trusted tenant authority through your application's authentication and policy. This buffered interface cannot stream progress or observe client disconnects and returns 406 for `subscriptions/listen`; mount `http.mist_handler` when streaming and disconnect cancellation matter. Call `http.stop` when the mounted endpoint shuts down.
 
@@ -133,7 +142,7 @@ pub fn mount(service: server.Server(Tenant)) -> http.Handler(Tenant) {
 
 Requests that carry an `Origin` header must match an entry in `http.with_allowed_origins` by scheme, host and port. An entry without a port stands for the scheme's default, so a browser page served from `http://localhost:3000` needs `"http://localhost:3000"` listed explicitly. The default admits `http://localhost`, `http://127.0.0.1` and `http://[::1]` on port 80, plus, for a listener from `http.start` or `http.supervised`, its own origin on the bound port (the loopback names for a loopback or wildcard bind, and the bind host itself for a specific bind); a mounted handler knows no port, so list the host application's origins. A request carrying more than one `Origin` header is refused when the transport preserves repeated headers; mist 6.0.3 keeps only the last repeated header, so a listener started by Relay checks that last value (browsers never send more than one `Origin`). `Host` values are compared without their port.
 
-For bearer-protected endpoints, see the [protection recipe](examples/relay_usage/src/relay_usage/protect.gleam). Relay checks the verifier's attested resource and scopes and formats challenges and metadata; the verifier owns token authenticity, issuer, and expiry checks.
+For bearer-protected endpoints, see the [protection recipe](https://github.com/gleam-dream/relay/blob/main/examples/relay_usage/src/relay_usage/protect.gleam). Relay checks the verifier's attested resource and scopes and formats challenges and metadata; the verifier owns token authenticity, issuer, and expiry checks.
 
 ## Tool codecs and process copies
 
@@ -166,12 +175,14 @@ This section states only what Relay copies between processes.
 - Only MCP `2026-07-28` is implemented. Legacy `2025-11-25` sessions, MCP client OAuth flows, tasks, resource-read continuation, and `logging/setLevel` are not implemented.
 - Tool input schemas use Blueprint's finite admitted profile. Unsupported schemas are reported explicitly; Relay does not claim to accept every valid JSON Schema.
 - Stdio provides no bearer authorization. Run it under a trusted parent process.
+- A stdio child launched with `client.stdio` does not inherit the application's environment: it gets `HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM` and `USER` (on Windows, `APPDATA`, `HOMEDRIVE`, `HOMEPATH`, `LOCALAPPDATA`, `PATH`, `PROCESSOR_ARCHITECTURE`, `SYSTEMDRIVE`, `SYSTEMROOT`, `TEMP`, `USERNAME`, `USERPROFILE` and `PROGRAMFILES`, matched without regard to case), plus the variables passed to `client.with_environment`. The allow-list holds against the environment at launch, not against an `os:putenv` that another process in the same VM makes while the child launches.
 - A client error with `MaybeSent` evidence means the operation may have run. Relay never retries automatically and does not provide durable idempotency receipts; the application owns retry and reconciliation policy.
 - The built-in resource-template matcher supports one simple `{name}` variable per segment. Use `resources.template_with_matcher` for other patterns.
 
 ## Learn more
 
-- [Runnable usage recipes](examples/relay_usage/README.md)
-- [Public API modules](src/relay/): `tool`, `server`, `http`, `stdio`, `client`, and `authorization`
-- [Design and contracts](docs/design/design-layer.pdf)
-- [Protocol and conformance evidence, including its limits](docs/ORACLE.md)
+- [Migrating from 0.2 to 0.3](https://github.com/gleam-dream/relay/blob/main/docs/MIGRATION.md)
+- [Runnable usage recipes](https://github.com/gleam-dream/relay/blob/main/examples/relay_usage/README.md)
+- [Public API modules](https://github.com/gleam-dream/relay/tree/main/src/relay): `tool`, `server`, `http`, `stdio`, `client`, and `authorization`
+- [Design and contracts](https://github.com/gleam-dream/relay/blob/main/docs/design/design-layer.pdf)
+- [Protocol and conformance evidence, including its limits](https://github.com/gleam-dream/relay/blob/main/docs/ORACLE.md)

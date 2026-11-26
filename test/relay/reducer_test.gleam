@@ -523,7 +523,10 @@ pub fn closed_exchange_records_are_bounded_test() {
 
   // While the record is kept, a repeated frame on the exchange is ignored.
   let #(state, effects) =
-    reducer.step(state, Received(old, "ctx", discover_frame(), None))
+    reducer.step(
+      state,
+      Received(old, "ctx", reducer.decode(discover_frame()), None),
+    )
   effects |> should.equal([])
 
   // Close 10,000 more exchanges: the reducer drops its oldest records.
@@ -532,12 +535,18 @@ pub fn closed_exchange_records_are_bounded_test() {
 
   // The pruned record no longer suppresses the frame...
   let #(state, effects) =
-    reducer.step(state, Received(old, "ctx", discover_frame(), None))
+    reducer.step(
+      state,
+      Received(old, "ctx", reducer.decode(discover_frame()), None),
+    )
   let assert [Admitted(_, "server/discover"), Write(_, _), Close(_)] = effects
 
   // ...while a recent one still does.
   let #(_state, effects) =
-    reducer.step(state, Received(recent, "ctx", discover_frame(), None))
+    reducer.step(
+      state,
+      Received(recent, "ctx", reducer.decode(discover_frame()), None),
+    )
   effects |> should.equal([])
 }
 

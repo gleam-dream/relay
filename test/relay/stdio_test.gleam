@@ -1,6 +1,7 @@
 import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
+import gleam/erlang/process
 import gleam/json
 import gleam/list
 import gleam/string
@@ -11,7 +12,7 @@ import relay/server
 import relay/stdio
 
 const runner =
-  "erl -pa build/dev/erlang/*/ebin -noshell -run relay_stdio_runner main"
+  "erl -pa build/dev/erlang/*/ebin -noinput -run relay_stdio_runner main"
 
 @external(erlang, "relay_ffi", "spawn_stdio_child")
 fn spawn_child(cmd: String) -> Dynamic
@@ -90,12 +91,273 @@ fn at(message: Dynamic, path: List(String), decoder: decode.Decoder(a)) -> a {
   found
 }
 
+// --- output pressure -----------------------------------------------------------
+
+const pressure_runner =
+  "erl -pa build/dev/erlang/*/ebin -noinput -run relay_stdio_pressure_runner main"
+
+// Reads from the child until its output contains `wanted` and returns all of
+// it, or what arrived when the child went quiet for `quiet_ms`.
+fn read_until(
+  child: Dynamic,
+  wanted: String,
+  quiet_ms: Int,
+  seen: String,
+) -> String {
+  case string.contains(seen, wanted) {
+    True -> seen
+    False ->
+      case receive_from_child(child, quiet_ms) {
+        Ok(chunk) -> {
+          let assert Ok(text) = bit_array.to_string(chunk)
+          read_until(child, wanted, quiet_ms, seen <> text)
+        }
+        Error(_) -> seen
+      }
+  }
+}
+
+pub fn stalled_stdout_stops_the_server_with_a_typed_error_test() {
+  // The server's standard output is a pipe that `sleep` never reads. Its
+  // standard error and exit status come back on descriptor 3.
+  let child =
+    spawn_child(
+      "sh -c '{ { "
+      <> pressure_runner
+      <> " 2>&3; echo \"exit=$?\" >&3; } | sleep 20; } 3>&1'",
+    )
+  send_to_child(
+    child,
+    request_line("big", "tools/call", [
+      #("name", json.string("big")),
+      #("arguments", json.object([#("bytes", json.int(2_000_000))])),
+    ]),
+  )
+  let report = read_until(child, "exit=", 9000, "")
+  close_child(child)
+  assert string.contains(
+    report,
+    "stopped: standard output failed while writing a reply",
+  )
+  assert string.contains(report, "exit=1")
+}
+
+@external(erlang, "relay_stdio_input_ffi", "write_from_any_process")
+fn write_from_any_process(child: Dynamic, bytes: BitArray) -> Nil
+
+const backlog_runner =
+  "erl -pa build/dev/erlang/*/ebin -noinput -run relay_stdio_backlog_runner main"
+
+pub fn unframed_input_past_its_limit_stops_the_server_test() {
+  // Standard output stalls on a large answer, so the server stops framing
+  // while the parent keeps writing requests.
+  let child =
+    spawn_child(
+      "sh -c '{ { "
+      <> backlog_runner
+      <> " 2>&3; echo \"exit=$?\" >&3; } | sleep 20; } 3>&1'",
+    )
+  send_to_child(
+    child,
+    request_line("big", "tools/call", [
+      #("name", json.string("big")),
+      #("arguments", json.object([#("bytes", json.int(2_000_000))])),
+    ]),
+  )
+  process.sleep(200)
+  // 1 MiB of requests while the answer's write is stalled, from another
+  // process: once the server stops reading, a write to its full input pipe
+  // blocks.
+  process.spawn_unlinked(fn() {
+    list.repeat(Nil, 16)
+    |> list.each(fn(_) {
+      write_from_any_process(
+        child,
+        string.repeat("{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n", 1900)
+          |> bit_array.from_string,
+      )
+    })
+  })
+  let report = read_until(child, "exit=", 4000, "")
+  close_child(child)
+  assert string.contains(
+    report,
+    "stopped: standard input held more unframed bytes than the limit",
+  )
+  assert string.contains(report, "exit=1")
+}
+
+pub fn request_beyond_the_exchange_limit_gets_an_error_response_test() {
+  let child = spawn_child(pressure_runner)
+  send_to_child(
+    child,
+    request_line("first", "tools/call", [
+      #("name", json.string("slow")),
+      #("arguments", json.object([#("ms", json.int(500))])),
+    ]),
+  )
+  send_to_child(
+    child,
+    request_line("second", "tools/call", [
+      #("name", json.string("slow")),
+      #("arguments", json.object([#("ms", json.int(0))])),
+    ]),
+  )
+  let assert [refused, answered] = read_lines(child, 2)
+  close_child(child)
+  assert at(refused, ["id"], decode.string) == "second"
+  assert at(refused, ["error", "code"], decode.int) == -32_000
+  assert at(answered, ["id"], decode.string) == "first"
+  assert at(answered, ["result", "structuredContent"], decode.string)
+    == "slow response"
+}
+
+// --- default settings over a real pipe ---------------------------------------
+
+// The server with default settings.
+const default_runner =
+  "erl -pa build/dev/erlang/*/ebin -noinput -run relay_stdio_default_runner main"
+
+fn size_request(id: String, bytes: Int) -> BitArray {
+  request_line(id, "tools/call", [
+    #("name", json.string("size")),
+    #(
+      "arguments",
+      json.object([#("text", json.string(string.repeat("x", bytes)))]),
+    ),
+  ])
+}
+
+pub fn default_settings_answer_a_small_request_while_stdin_stays_open_test() {
+  let child = spawn_child(default_runner)
+  // Far less than one read chunk, and the pipe stays open afterwards.
+  send_to_child(child, size_request("small", 5))
+  let small = read_one(child)
+  assert at(small, ["id"], decode.string) == "small"
+  assert at(small, ["result", "structuredContent"], decode.int) == 5
+
+  // A request of many chunks, then another small one on the same pipe.
+  send_to_child(child, size_request("large", 300_000))
+  let large = read_one(child)
+  assert at(large, ["result", "structuredContent"], decode.int) == 300_000
+  send_to_child(child, size_request("again", 7))
+  assert at(read_one(child), ["result", "structuredContent"], decode.int) == 7
+  close_child(child)
+}
+
+pub fn default_settings_stop_cleanly_when_stdin_closes_test() {
+  // `printf` writes one request and exits, which closes the server's input.
+  let request =
+    "{\"jsonrpc\":\"2.0\",\"id\":\"eof\",\"method\":\"server/discover\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{}}}}"
+  let child =
+    spawn_child(
+      "sh -c 'printf \"%s\\n\" \"$0\" | "
+      <> default_runner
+      <> "' '"
+      <> request
+      <> "'",
+    )
+  assert at(read_one(child), ["id"], decode.string) == "eof"
+  expect_exit(child, 0)
+}
+
+// --- standard output carries only frames -------------------------------------
+
+pub fn log_and_print_output_while_serving_stays_off_stdout_test() {
+  let child = spawn_child(runner)
+  send_to_child(
+    child,
+    request_line("noisy", "tools/call", [
+      #("name", json.string("noisy")),
+      #("arguments", json.object([])),
+    ]),
+  )
+  // A second request gives asynchronous log output time to be written.
+  send_to_child(child, request_line("after-noise", "server/discover", []))
+  let lines = read_raw_lines(child, 2, "")
+  // Every line on standard output is a JSON-RPC message.
+  let messages =
+    list.map(lines, fn(line) {
+      let assert Ok(message) = json.parse(line, decode.dynamic) as line
+      message
+    })
+  let ids =
+    list.map(messages, at(_, ["id"], decode.string))
+    |> list.sort(string.compare)
+  assert ids == ["after-noise", "noisy"]
+  close_child(child)
+}
+
+// Reads from the child until `count` complete lines arrived, unparsed.
+fn read_raw_lines(child: Dynamic, count: Int, buffer: String) -> List(String) {
+  let lines =
+    string.split(buffer, "\n")
+    |> list.reverse
+    |> list.drop(1)
+    |> list.reverse
+  case list.length(lines) >= count {
+    True -> list.take(lines, count)
+    False -> {
+      let assert Ok(chunk) = receive_from_child(child, 5000)
+      let assert Ok(text) = bit_array.to_string(chunk)
+      read_raw_lines(child, count, buffer <> text)
+    }
+  }
+}
+
+// --- frame bound ---------------------------------------------------------------
+
+pub fn oversized_frame_is_refused_before_its_newline_arrives_test() {
+  let child = spawn_child(runner)
+  // More than the runner's 1,024-byte frame limit, and no newline yet: the
+  // refusal must not wait for the whole line.
+  send_to_child(child, bit_array.from_string(string.repeat("x", 2000)))
+  let refusal = read_one(child)
+  assert at(refusal, ["error", "code"], decode.int) == -32_600
+  assert at(refusal, ["error", "message"], decode.string) == "Frame too large"
+  // The rest of the oversized line is dropped as it arrives.
+  send_to_child(child, bit_array.from_string(string.repeat("y", 5000) <> "\n"))
+  send_to_child(child, request_line("after-oversized", "server/discover", []))
+  assert at(read_one(child), ["id"], decode.string) == "after-oversized"
+  close_child(child)
+}
+
 // --- configuration -----------------------------------------------------------
+
+pub fn stdio_refuses_to_serve_while_the_vm_reads_stdin_test() {
+  // The test VM runs without `-noinput`, so its terminal reader owns
+  // standard input and `serve` must return before reading anything.
+  let assert Error(stdio.StdinOwnedByVm) = stdio.serve(server.new([]), Nil)
+  assert stdio.describe_error(stdio.StdinOwnedByVm)
+    == "the VM reads standard input itself; start it with -noinput"
+}
+
+pub fn unframed_limit_below_a_frame_or_a_pipe_read_is_refused_test() {
+  let service = server.new([])
+  assert stdio.config().max_unframed_bytes == 4_194_304
+  // Below the frame limit: one frame could not wait whole.
+  let assert Error(stdio.InvalidUnframedLimit(1_000_000)) =
+    stdio.serve_with(
+      service,
+      Nil,
+      stdio.Config(..stdio.config(), max_unframed_bytes: 1_000_000),
+    )
+  // Below one pipe read, with a small frame limit.
+  let small = runtime.config() |> runtime.with_max_frame_bytes(1024)
+  let assert Error(stdio.InvalidUnframedLimit(4096)) =
+    stdio.serve_with(
+      service,
+      Nil,
+      stdio.Config(
+        runtime: small,
+        write_timeout: duration.seconds(5),
+        max_unframed_bytes: 4096,
+      ),
+    )
+}
 
 pub fn stdio_rejects_invalid_settings_before_io_test() {
   let service = server.new([])
-  let assert Error(stdio.InvalidChunkSize(0)) =
-    stdio.serve_with(service, Nil, stdio.config() |> stdio.with_chunk_size(0))
 
   let bad_runtime =
     runtime.config()
@@ -104,7 +366,7 @@ pub fn stdio_rejects_invalid_settings_before_io_test() {
     stdio.serve_with(
       service,
       Nil,
-      stdio.config() |> stdio.with_runtime(bad_runtime),
+      stdio.Config(..stdio.config(), runtime: bad_runtime),
     )
 
   let bad_frames = runtime.config() |> runtime.with_max_frame_bytes(0)
@@ -112,12 +374,21 @@ pub fn stdio_rejects_invalid_settings_before_io_test() {
     stdio.serve_with(
       service,
       Nil,
-      stdio.config() |> stdio.with_runtime(bad_frames),
+      stdio.Config(..stdio.config(), runtime: bad_frames),
     )
 
-  let assert True = stdio.describe_error(stdio.InvalidChunkSize(0)) != ""
   let assert "standard input ended in the middle of a frame" =
     stdio.describe_error(stdio.InvalidTrailingData(<<"x">>))
+
+  // Every write to standard output is timed; a timeout that cannot be met
+  // is refused before any I/O.
+  assert stdio.config().write_timeout == duration.seconds(5)
+  let assert Error(stdio.InvalidWriteTimeout(_)) =
+    stdio.serve_with(
+      service,
+      Nil,
+      stdio.Config(..stdio.config(), write_timeout: duration.milliseconds(0)),
+    )
 }
 
 // --- framer ------------------------------------------------------------------
@@ -196,10 +467,53 @@ pub fn framer_incomplete_eof_test() {
 
 pub fn writer_failure_is_returned_to_the_caller_test() {
   let assert Ok(writer) =
-    stdio_frames.start_writer(fn(_bytes) { Error("closed pipe") })
-  let assert Error("closed pipe") =
+    stdio_frames.start_writer(fn(_bytes) { Error("closed pipe") }, 1000)
+  let assert Error(stdio_frames.SinkFailed("closed pipe")) =
     stdio_frames.write_bytes(writer, <<"response\n">>)
   stdio_frames.stop_writer(writer)
+}
+
+pub fn stalled_writer_times_out_and_then_fails_at_once_test() {
+  let release = process.new_subject()
+  let assert Ok(writer) =
+    stdio_frames.start_writer(
+      fn(_bytes) {
+        // A sink that never returns, like a write to a full pipe.
+        process.receive_forever(release)
+      },
+      50,
+    )
+  let assert Error(stdio_frames.WriteTimedOut) =
+    stdio_frames.write_bytes(writer, <<"first\n">>)
+  // The stuck writer is gone: a later write fails without waiting.
+  let assert Error(stdio_frames.WriterStopped) =
+    stdio_frames.write_bytes(writer, <<"second\n">>)
+  stdio_frames.stop_writer(writer)
+}
+
+pub fn writer_stuck_in_its_sink_stops_when_its_owner_exits_test() {
+  let writing = process.new_subject()
+  let owner =
+    process.spawn_unlinked(fn() {
+      let assert Ok(writer) =
+        stdio_frames.start_writer(
+          fn(_bytes) {
+            // Report the process running the sink, then never return.
+            process.send(writing, process.self())
+            process.sleep_forever()
+            Ok(Nil)
+          },
+          60_000,
+        )
+      stdio_frames.write_bytes(writer, <<"response\n">>)
+    })
+  let assert Ok(sink) = process.receive(writing, 1000)
+  let monitor = process.monitor(sink)
+  process.kill(owner)
+  let assert Ok(_) =
+    process.new_selector()
+    |> process.select_specific_monitor(monitor, fn(down) { down })
+    |> process.selector_receive(1000)
 }
 
 // --- a spawned child over OS pipes -------------------------------------------

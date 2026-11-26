@@ -63,6 +63,7 @@
 //// | --- | --- | --- |
 //// | request timeout | 30 s | `with_timeout`, per call `with_deadline` |
 //// | connect | 10 s | `with_connect_timeout` |
+//// | HTTP listen stream lifetime | 1 h | `with_listen_timeout`, per call `with_deadline` |
 //// | response size | 1 MiB | `with_max_response_bytes` |
 //// | listings | 256 pages, 10,000 items | `with_listing_limits` |
 //// | stdio pending calls | 64, then `TooManyPendingCalls` | `with_max_pending_calls` |
@@ -101,6 +102,7 @@ import relay/internal/carrier
 import relay/internal/client_http_owner as http_owner
 import relay/internal/core
 import relay/internal/emit
+import relay/internal/header_value
 import relay/internal/protocol/v2026_07_28 as v2026
 import relay/internal/subscriptions_state as subs
 import relay/internal/transport/stdio_client
@@ -132,6 +134,7 @@ pub opaque type Config {
     target: Target,
     timeout: Duration,
     connect_timeout: Duration,
+    listen_timeout: Duration,
     max_response_bytes: Int,
     input_methods: List(tool.InputMethod),
     max_listing_pages: Int,
@@ -142,6 +145,7 @@ pub opaque type Config {
     http_client: Option(http_gun.Client),
     max_pending_calls: Int,
     label: Option(String),
+    environment: fn() -> List(#(String, String)),
   )
 }
 
@@ -150,6 +154,7 @@ fn defaults(target: Target) -> Config {
     target: target,
     timeout: duration.seconds(30),
     connect_timeout: duration.seconds(10),
+    listen_timeout: duration.hours(1),
     max_response_bytes: 1_048_576,
     input_methods: [],
     max_listing_pages: 256,
@@ -160,6 +165,7 @@ fn defaults(target: Target) -> Config {
     http_client: None,
     max_pending_calls: 64,
     label: None,
+    environment: fn() { [] },
   )
 }
 
@@ -290,6 +296,14 @@ fn unbracket(host: String) -> String {
 /// standard input and output. The executable runs directly, never through a
 /// shell. The command is held in a closure, so it does not print in
 /// `string.inspect`, crash reports or logs.
+///
+/// The child does not inherit this VM's environment. It receives only the
+/// variables a program needs to run (`HOME`, `LOGNAME`, `PATH`, `SHELL`,
+/// `TERM` and `USER`; on Windows the system and profile directories,
+/// `PATH`, `TEMP` and `USERNAME`, names compared without case), and the
+/// ones added with `with_environment`. The allow-list holds against the
+/// environment at launch, not against an `os:putenv` that another process
+/// in this VM makes while the child launches.
 pub fn stdio(executable: String, arguments: List(String)) -> Config {
   defaults(StdioTarget(fn() { #(executable, arguments) }))
 }
@@ -308,9 +322,18 @@ pub fn in_process(server: Server(context), context: context) -> Config {
 
 /// How long one request may take, including dynamic headers. A view's
 /// `with_deadline` can shorten it. For subscriptions this bounds opening and
-/// acknowledgement; an established stream keeps its own lifetime.
+/// acknowledgement; an established HTTP stream lasts until the listen
+/// timeout.
 pub fn with_timeout(config: Config, timeout: Duration) -> Config {
   Config(..config, timeout: timeout)
+}
+
+/// How long an established HTTP `listen` stream stays open. The stream
+/// ends with `TimedOut` when the time is up, or earlier at a view's
+/// `with_deadline`; reopen it with `listen`. Every HTTP request needs a
+/// finite bound, so a stream cannot stay open forever.
+pub fn with_listen_timeout(config: Config, timeout: Duration) -> Config {
+  Config(..config, listen_timeout: timeout)
 }
 
 /// How long connecting, or starting the stdio child, may take.
@@ -363,6 +386,21 @@ pub fn allow_plaintext_headers(config: Config) -> Config {
   Config(..config, plaintext_headers: True)
 }
 
+/// Adds variables to a stdio child's environment, on top of the allow-listed
+/// ones it inherits; a variable named here replaces an inherited one. Each
+/// call adds to the earlier ones. The values are held in a closure, so they
+/// do not print in `string.inspect`, crash reports or logs. A name must be
+/// non-empty and contain no `=`, and no name or value may contain a NUL
+/// byte; `connect` refuses the configuration otherwise, and for an HTTP or
+/// in-process target, with `InvalidConfig(Environment)`.
+pub fn with_environment(
+  config: Config,
+  variables: List(#(String, String)),
+) -> Config {
+  let earlier = config.environment
+  Config(..config, environment: fn() { list.append(earlier(), variables) })
+}
+
 /// Trusts the CA certificates in this PEM file instead of the system's, for
 /// HTTPS.
 pub fn with_ca_cert_file(config: Config, path: String) -> Config {
@@ -394,11 +432,13 @@ pub type ConfigField {
   Url
   RequestTimeout
   ConnectTimeout
+  ListenTimeout
   MaxResponseBytes
   ListingLimits
   CaCertFile
   MaxPendingCalls
   Headers
+  Environment
 }
 
 /// Whether the server may have received a request.
@@ -642,11 +682,13 @@ fn config_field_name(field: ConfigField) -> String {
     Url -> "the URL"
     RequestTimeout -> "the request timeout"
     ConnectTimeout -> "the connect timeout"
+    ListenTimeout -> "the listen timeout"
     MaxResponseBytes -> "the response size limit"
     ListingLimits -> "the listing limits"
     CaCertFile -> "the CA certificate file"
     MaxPendingCalls -> "the pending call limit"
     Headers -> "the request headers"
+    Environment -> "the stdio child environment"
   }
 }
 
@@ -724,11 +766,22 @@ fn validate(config: Config) -> Result(Config, Error) {
       Error(config_error(ListingLimits))
     _ if config.max_pending_calls <= 0 -> Error(config_error(MaxPendingCalls))
     _ ->
-      case ms(config.timeout) > 0, ms(config.connect_timeout) > 0 {
-        False, _ -> Error(config_error(RequestTimeout))
-        _, False -> Error(config_error(ConnectTimeout))
-        True, True ->
+      case
+        ms(config.timeout) > 0,
+        ms(config.connect_timeout) > 0,
+        ms(config.listen_timeout) > 0
+      {
+        False, _, _ -> Error(config_error(RequestTimeout))
+        _, False, _ -> Error(config_error(ConnectTimeout))
+        _, _, False -> Error(config_error(ListenTimeout))
+        True, True, True -> {
+          let environment = config.environment()
+          let environment_fits = case config.target {
+            StdioTarget(_) -> valid_environment(environment)
+            HttpTarget(..) | InProcessTarget(_) -> environment == []
+          }
           case config.ca_cert_file, config.target {
+            _, _ if !environment_fits -> Error(config_error(Environment))
             Some(""), _ -> Error(config_error(CaCertFile))
             Some(_), HttpTarget(secure: False, ..) ->
               Error(config_error(CaCertFile))
@@ -736,8 +789,19 @@ fn validate(config: Config) -> Result(Config, Error) {
               Error(config_error(CaCertFile))
             _, _ -> Ok(config)
           }
+        }
       }
   }
+}
+
+fn valid_environment(variables: List(#(String, String))) -> Bool {
+  list.all(variables, fn(variable) {
+    let #(name, value) = variable
+    name != ""
+    && !string.contains(name, "=")
+    && !string.contains(name, "\u{0000}")
+    && !string.contains(value, "\u{0000}")
+  })
 }
 
 /// Validates the configuration and connects: starts the HTTP client, the
@@ -901,7 +965,6 @@ fn http_peer(
         gun_config.default()
         |> gun_config.with_destination(policy)
         |> gun_config.with_connect_timeout(config.connect_timeout)
-        |> gun_config.with_request_timeout(gun_config.After(config.timeout))
         |> gun_config.with_max_response_body_bytes(config.max_response_bytes)
         // `close` cancels in-flight calls instead of draining them: stopping
         // closes each open response's connection at once, which is how MCP
@@ -973,7 +1036,7 @@ fn http_peer(
       |> request.set_header("mcp-method", out.method)
     let base = case out.name {
       Some(name) ->
-        request.set_header(base, "mcp-name", uri.percent_encode(name))
+        request.set_header(base, "mcp-name", header_value.encode(name))
       None -> base
     }
     let base = case carried(budget) {
@@ -984,7 +1047,7 @@ fn http_peer(
       request.set_header(req, string.lowercase(header.0), header.1)
     })
   }
-  let view = fn(budget: Budget, timeout: gun_config.Timeout) {
+  let view = fn(budget: Budget, timeout: Duration) {
     let view = http_gun.with_timeout(gun, timeout)
     let view = case budget.deadline {
       Some(deadline) -> http_gun.with_deadline(view, deadline)
@@ -996,97 +1059,104 @@ fn http_peer(
     }
     http_gun.with_correlation(view, budget.correlation)
   }
-  Ok(
-    Peer(
-      send: fn(out, budget) {
-        use #(headers, owner) <- result.try(acquire(budget))
-        let client =
-          view(
-            budget,
-            gun_config.After(duration.milliseconds(remaining_ms(budget))),
-          )
-          |> http_gun.with_body_limit(budget.max_bytes, http_gun.Fail)
-          |> http_gun.with_additional_cancellation(http_owner.token(owner))
-        let outcome =
-          http_gun.send(client, build(out, "application/json", budget, headers))
-        let stopped = http_owner.finish(owner)
-        case outcome {
-          Ok(buffered) ->
-            Ok(Incoming(
-              buffered.response.status,
-              buffered.response.body,
-              www_authenticate(buffered.response.headers),
-            ))
-          Error(failure) ->
-            Error(owned_failure(
-              gun_failure(failure, budget.max_bytes, budget.correlation),
-              stopped,
-            ))
-        }
-      },
-      listen: fn(out, budget) {
-        use #(headers, owner) <- result.try(acquire(budget))
-        let client =
-          view(budget, gun_config.Infinity)
-          |> http_gun.with_additional_cancellation(http_owner.token(owner))
-        case
-          http_gun.open(
-            client,
-            build(out, "text/event-stream", budget, headers),
-          )
-        {
-          Error(failure) ->
-            Error(owned_failure(
-              gun_failure(failure, budget.max_bytes, budget.correlation),
-              http_owner.finish(owner),
-            ))
-          Ok(response) ->
-            case response.status {
-              200 ->
-                Ok(owned_stream(
-                  sse_stream(
-                    response.body,
-                    budget.max_bytes,
-                    budget.correlation,
-                  ),
-                  owner,
+  Ok(Peer(
+    send: fn(out, budget) {
+      use #(headers, owner) <- result.try(acquire(budget))
+      // An ordinary call lasts no longer than its request budget; the
+      // listen timeout bounds only an established listen stream.
+      let client =
+        view(budget, duration.milliseconds(remaining_ms(budget)))
+        |> http_gun.with_body_limit(budget.max_bytes, http_gun.Fail)
+        |> http_gun.with_additional_cancellation(http_owner.token(owner))
+      let outcome =
+        http_gun.with_response(
+          client,
+          build(out, "application/json, text/event-stream", budget, headers),
+          gun_failure(_, budget.max_bytes, budget.correlation),
+          fn(response) {
+            let answer = case
+              response.status,
+              is_event_stream(response.headers)
+            {
+              200, True ->
+                stream_response(
+                  response.body,
+                  <<>>,
+                  0,
+                  budget.max_bytes,
+                  budget.correlation,
+                )
+              _, _ ->
+                body.collect(response.body, budget.max_bytes)
+                |> result.map(fn(collected) { collected.bytes })
+                |> result.map_error(gun_failure(
+                  _,
+                  budget.max_bytes,
                   budget.correlation,
                 ))
-              status -> {
-                let collected = body.collect(response.body, budget.max_bytes)
-                body.close(response.body)
-                let stopped = http_owner.finish(owner)
-                case collected {
-                  Ok(collected) ->
-                    Error(status_error(
-                      Incoming(
-                        status,
-                        collected.bytes,
-                        www_authenticate(response.headers),
-                      ),
-                      budget.correlation,
-                    ))
-                  Error(failure) ->
-                    Error(owned_failure(
-                      gun_failure(failure, budget.max_bytes, budget.correlation),
-                      stopped,
-                    ))
-                }
+            }
+            use bytes <- result.map(answer)
+            Incoming(response.status, bytes, www_authenticate(response.headers))
+          },
+        )
+      let stopped = http_owner.finish(owner)
+      result.map_error(outcome, owned_failure(_, stopped))
+    },
+    listen: fn(out, budget) {
+      use #(headers, owner) <- result.try(acquire(budget))
+      let client =
+        view(budget, config.listen_timeout)
+        |> http_gun.with_additional_cancellation(http_owner.token(owner))
+      case
+        http_gun.open(client, build(out, "text/event-stream", budget, headers))
+      {
+        Error(failure) ->
+          Error(owned_failure(
+            gun_failure(failure, budget.max_bytes, budget.correlation),
+            http_owner.finish(owner),
+          ))
+        Ok(response) ->
+          case response.status {
+            200 ->
+              Ok(owned_stream(
+                sse_stream(response.body, budget.max_bytes, budget.correlation),
+                owner,
+                budget.correlation,
+              ))
+            status -> {
+              let collected = body.collect(response.body, budget.max_bytes)
+              body.close(response.body)
+              let stopped = http_owner.finish(owner)
+              case collected {
+                Ok(collected) ->
+                  Error(status_error(
+                    Incoming(
+                      status,
+                      collected.bytes,
+                      www_authenticate(response.headers),
+                    ),
+                    budget.correlation,
+                  ))
+                Error(failure) ->
+                  Error(owned_failure(
+                    gun_failure(failure, budget.max_bytes, budget.correlation),
+                    stopped,
+                  ))
               }
             }
-        }
-      },
-      close: fn() {
-        case owned {
-          True -> {
-            option.map(lifetime, process.kill)
-            http_gun.stop(gun)
           }
-          False -> Nil
+      }
+    },
+    close: fn() {
+      case owned {
+        True -> {
+          option.map(lifetime, process.kill)
+          http_gun.stop(gun)
         }
-      },
-    ),
-  )
+        False -> Nil
+      }
+    },
+  ))
 }
 
 fn header_failure(failure: http_owner.Failure, call: Correlation) -> Error {
@@ -1173,8 +1243,129 @@ fn gun_failure(
   }
 }
 
+fn is_event_stream(headers: List(#(String, String))) -> Bool {
+  case list.key_find(headers, "content-type") {
+    Ok(value) ->
+      string.starts_with(
+        string.lowercase(string.trim(value)),
+        "text/event-stream",
+      )
+    Error(Nil) -> False
+  }
+}
+
+// Reads a request-scoped event stream up to the JSON-RPC response and
+// returns that frame. Notifications that precede it, such as
+// `notifications/progress`, are skipped. The caller closes the stream, so a
+// server that keeps it open after the response does not hold the call.
+// `read` counts the bytes taken from the stream against `limit`.
+fn stream_response(
+  stream: body.Body,
+  pending: BitArray,
+  read: Int,
+  limit: Int,
+  call: Correlation,
+) -> Result(BitArray, Error) {
+  case split_event(pending) {
+    Some(#(event, rest)) ->
+      case event_data(event) {
+        Some(data) ->
+          case is_notification(data) {
+            True -> stream_response(stream, rest, read, limit, call)
+            False -> Ok(data)
+          }
+        None -> stream_response(stream, rest, read, limit, call)
+      }
+    None -> {
+      use #(pending, read) <- result.try(read_to_blank_line(
+        stream,
+        pending,
+        line_end(pending),
+        read,
+        limit,
+        call,
+      ))
+      stream_response(stream, pending, read, limit, call)
+    }
+  }
+}
+
+// Where a scan for the blank line that ends an event stands.
+type LineEnd {
+  AtText
+  AfterNewline
+  AfterNewlineReturn
+}
+
+// Appends chunks to `pending` until one completes a blank line, scanning
+// each chunk once, so a large event costs time linear in its size.
+fn read_to_blank_line(
+  stream: body.Body,
+  pending: BitArray,
+  at: LineEnd,
+  read: Int,
+  limit: Int,
+  call: Correlation,
+) -> Result(#(BitArray, Int), Error) {
+  case read > limit {
+    True -> Error(Failed(ResponseTooLarge(limit), call))
+    False ->
+      case body.next(stream) {
+        Ok(body.Chunk(chunk)) -> {
+          let pending = bit_array.append(pending, chunk)
+          let read = read + bit_array.byte_size(chunk)
+          case blank_line(chunk, at) {
+            Ok(Nil) -> Ok(#(pending, read))
+            Error(at) ->
+              read_to_blank_line(stream, pending, at, read, limit, call)
+          }
+        }
+        Ok(body.End(_)) -> Error(Failed(ConnectionClosed(MaybeSent), call))
+        Error(failure) -> Error(gun_failure(failure, limit, call))
+      }
+  }
+}
+
+// Where a scan of the bytes after `pending` starts: bytes left over from a
+// chunk that held an earlier event may already end in a newline.
+fn line_end(pending: BitArray) -> LineEnd {
+  case blank_line(pending, AtText) {
+    Error(at) -> at
+    // `pending` holds no complete event, so it holds no blank line.
+    Ok(Nil) -> AtText
+  }
+}
+
+// `Ok` when `chunk` completes a blank line (`\n\n` or `\n\r\n`), else where
+// the scan stands at its end.
+fn blank_line(chunk: BitArray, at: LineEnd) -> Result(Nil, LineEnd) {
+  case chunk, at {
+    <<>>, _ -> Error(at)
+    <<"\n", _:bits>>, AfterNewline | <<"\n", _:bits>>, AfterNewlineReturn ->
+      Ok(Nil)
+    <<"\n", rest:bits>>, AtText -> blank_line(rest, AfterNewline)
+    <<"\r", rest:bits>>, AfterNewline -> blank_line(rest, AfterNewlineReturn)
+    <<_, rest:bits>>, _ -> blank_line(rest, AtText)
+    _, _ -> Error(at)
+  }
+}
+
+// A frame with a `method` is a notification on a response stream; the
+// response itself has none.
+fn is_notification(frame: BitArray) -> Bool {
+  bit_array.to_string(frame)
+  |> result.try(fn(text) {
+    json.parse(text, decode.at(["method"], decode.string))
+    |> result.replace_error(Nil)
+  })
+  |> result.is_ok
+}
+
 // Server-sent events: blank-line separated, `data:` lines joined, comments
-// and other fields ignored.
+// and other fields ignored. One `next` call waits until a single deadline: a
+// chunk that completes no data event (a keepalive comment, or part of an
+// event) does not end the wait, so `Ok(None)` means only that no event
+// arrived within the requested wait.
 fn sse_stream(stream: body.Body, limit: Int, call: Correlation) -> Stream {
   let buffer = process.new_subject()
   process.send(buffer, <<>>)
@@ -1182,8 +1373,9 @@ fn sse_stream(stream: body.Body, limit: Int, call: Correlation) -> Stream {
     establish: fn() { Ok(Nil) },
     next: fn(wait_ms) {
       let assert Ok(pending) = process.receive(buffer, 0)
+      let deadline = monotonic_ms() + wait_ms
       let #(event, rest, outcome) =
-        next_event(stream, pending, wait_ms, limit, call)
+        next_event(stream, pending, deadline, limit, call)
       process.send(buffer, rest)
       case outcome {
         Error(error) -> Error(error)
@@ -1197,7 +1389,7 @@ fn sse_stream(stream: body.Body, limit: Int, call: Correlation) -> Stream {
 fn next_event(
   stream: body.Body,
   pending: BitArray,
-  wait_ms: Int,
+  deadline: Int,
   limit: Int,
   call: Correlation,
 ) -> #(Option(BitArray), BitArray, Result(Nil, Error)) {
@@ -1205,19 +1397,24 @@ fn next_event(
     Some(#(event, rest)) ->
       case event_data(event) {
         Some(data) -> #(Some(data), rest, Ok(Nil))
-        None -> next_event(stream, rest, wait_ms, limit, call)
+        None -> next_event(stream, rest, deadline, limit, call)
       }
     None ->
       case bit_array.byte_size(pending) > limit {
         True -> #(None, <<>>, Error(Failed(ResponseTooLarge(limit), call)))
         False ->
-          case body.next_within(stream, duration.milliseconds(wait_ms)) {
+          case
+            body.next_within(
+              stream,
+              duration.milliseconds(int.max(0, deadline - monotonic_ms())),
+            )
+          {
             Ok(None) -> #(None, pending, Ok(Nil))
             Ok(Some(body.Chunk(chunk))) ->
               next_event(
                 stream,
                 bit_array.append(pending, chunk),
-                0,
+                deadline,
                 limit,
                 call,
               )
@@ -1278,7 +1475,10 @@ fn stdio_peer(
 ) -> Result(Peer, Error) {
   case
     stdio_client.connect(
-      command,
+      fn() {
+        let #(executable, arguments) = command()
+        stdio_client.Command(executable, arguments, config.environment())
+      },
       ms(config.connect_timeout),
       config.max_response_bytes,
     )
@@ -1347,6 +1547,8 @@ fn stdio_failure(failure: stdio_client.Failure, call: Correlation) -> Error {
     stdio_client.NotRunning -> Failed(ConnectionClosed(NotSent), call)
     stdio_client.Busy(limit) -> Failed(TooManyPendingCalls(limit), call)
     stdio_client.TimedOut -> Failed(TimedOut(MaybeSent), call)
+    stdio_client.TimedOutUnsent -> Failed(TimedOut(NotSent), call)
+    stdio_client.CancelledUnsent -> Failed(Cancelled(NotSent), call)
     stdio_client.Exited -> Failed(ConnectionClosed(MaybeSent), call)
     stdio_client.ClientClosed -> Failed(Cancelled(MaybeSent), call)
     stdio_client.Cancelled -> Failed(Cancelled(MaybeSent), call)
@@ -2586,8 +2788,9 @@ pub opaque type Subscription {
 /// Opens a stream for these notifications; `ResourceUpdated(uri)` subscribes
 /// to one resource. Returns once the server acknowledged it. One request budget
 /// covers dynamic headers, transport opening and acknowledgement. The relative
-/// timeout stops applying after acknowledgement; explicit absolute deadlines
-/// and cancellation continue to apply to the established stream.
+/// timeout stops applying after acknowledgement; over HTTP the established
+/// stream lasts until the listen timeout (`with_listen_timeout`), and explicit
+/// absolute deadlines and cancellation continue to apply to it.
 pub fn listen(
   client: Client,
   notifications: List(Notification),
@@ -2638,7 +2841,9 @@ pub fn listening(subscription: Subscription) -> List(Notification) {
 }
 
 /// Waits at most `wait` for the next notification; `Ok(None)` means none
-/// arrived. The stream stays open after a wait. A terminal transport or
+/// arrived within `wait`. Keepalives and other stream traffic that carry no
+/// notification do not end the wait early. The stream stays open after a
+/// wait. A terminal transport or
 /// protocol failure closes the stream and releases its request owner.
 pub fn next_notification(
   subscription: Subscription,

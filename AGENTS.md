@@ -49,7 +49,7 @@ sibling source graph into a new output directory per run.
 
 - [docs/ORACLE.md](docs/ORACLE.md): the frozen MCP `2026-07-28` schema, the pinned `@modelcontextprotocol/conformance` server suite, the jsonschema validator and the scoped peers Relay is compared with, with their pins, classification rules and limits. Update it with any change to a pin, the corpus or the suite.
 - [examples/relay_usage](examples/relay_usage/README.md): compiled and run usage recipes. Change them with any public API change, because the application test script builds and runs them.
-- Relay has no benchmark harness and makes no latency claim, so there is no `docs/BENCHMARKS.md`. Add one, linked from here and from `docs/ORACLE.md`, if a benchmark is introduced.
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md): the one benchmark, `gleam run -m relay_decode_bench`, which compares the HTTP `tools/call` decode cost of two builds on one machine. Relay makes no latency claim.
 
 <!-- agent-skills:begin -->
 <!-- framework-commit: cab7c0590036edaa66d8430cc5016399a9fd2c71 origin: git@github.com:lostbean/skills.git -->

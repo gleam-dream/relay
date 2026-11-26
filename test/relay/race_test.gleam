@@ -131,12 +131,14 @@ pub fn duplicate_admission_race_test() {
   let frame = call_frame("dup-adm", "echo", "test")
 
   // The first message is admitted.
-  let #(s1, eff1) = reducer.step(s0, Received(ex, "ctx", frame, None))
+  let #(s1, eff1) =
+    reducer.step(s0, Received(ex, "ctx", reducer.decode(frame), None))
   list.length(eff1) |> should.equal(2)
 
   // A second message on the same exchange while the first is pending is
   // discarded without an invocation.
-  let #(_s2, eff2) = reducer.step(s1, Received(ex, "ctx", frame, None))
+  let #(_s2, eff2) =
+    reducer.step(s1, Received(ex, "ctx", reducer.decode(frame), None))
   eff2 |> should.equal([])
 }
 

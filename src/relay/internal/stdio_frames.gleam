@@ -1,10 +1,11 @@
 //// Newline framing and a serialized writer for stdio transports.
 
 import gleam/bit_array
-import gleam/erlang/process.{type Subject}
+import gleam/erlang/process.{type Pid, type Subject}
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
+import gleam/result
 
 pub type ReadOutcome {
   ReadChunk(BitArray)
@@ -159,14 +160,36 @@ type WriterMessage {
 }
 
 pub opaque type Writer {
-  Writer(subject: Subject(WriterMessage))
+  Writer(subject: Subject(WriterMessage), pid: Pid, timeout_ms: Int)
 }
 
+/// Why a write did not complete.
+pub type WriteError {
+  /// The sink reported this failure.
+  SinkFailed(reason: String)
+  /// The sink did not finish within the write timeout. The writer has been
+  /// stopped, so every later write fails with `WriterStopped` at once.
+  WriteTimedOut
+  /// The writer is not running.
+  WriterStopped
+}
+
+/// Starts a process that runs `sink` for one write at a time. Every write
+/// waits at most `timeout_ms` for the sink. The writer is not linked to its
+/// caller: it stops when the calling process exits, and a write that times
+/// out stops it.
 pub fn start_writer(
   sink: fn(BitArray) -> Result(Nil, String),
+  timeout_ms: Int,
 ) -> Result(Writer, actor.StartError) {
+  let owner = process.self()
   let builder =
-    actor.new(Nil)
+    actor.new_with_initialiser(5000, fn(subject) {
+      guard_owner(owner, process.self())
+      actor.initialised(Nil)
+      |> actor.returning(subject)
+      |> Ok
+    })
     |> actor.on_message(fn(_state, msg) {
       case msg {
         WriteBytes(bytes, reply) -> {
@@ -182,19 +205,75 @@ pub fn start_writer(
     })
 
   case actor.start(builder) {
-    Ok(started) -> Ok(Writer(started.data))
+    Ok(started) -> {
+      // Stopping the writer after a stalled write must not take its owner
+      // with it; a guard process watches the owner instead.
+      process.unlink(started.pid)
+      Ok(Writer(started.data, started.pid, timeout_ms))
+    }
     Error(err) -> Error(err)
   }
 }
 
-pub fn write_bytes(writer: Writer, bytes: BitArray) -> Result(Nil, String) {
-  let Writer(subj) = writer
-  process.call(subj, waiting: 5000, sending: fn(reply) {
-    WriteBytes(bytes, reply)
-  })
+// Kills the writer when its owner exits, also while the writer is stuck in
+// its sink and reads no message, and ends with the writer.
+fn guard_owner(owner: Pid, writer: Pid) -> Nil {
+  let _ =
+    process.spawn_unlinked(fn() {
+      let owner_monitor = process.monitor(owner)
+      let writer_monitor = process.monitor(writer)
+      let owner_exited =
+        process.new_selector()
+        |> process.select_specific_monitor(owner_monitor, fn(_) { True })
+        |> process.select_specific_monitor(writer_monitor, fn(_) { False })
+        |> process.selector_receive_forever
+      case owner_exited {
+        True -> process.kill(writer)
+        False -> Nil
+      }
+    })
+  Nil
 }
 
+/// Writes `bytes` and waits at most the writer's timeout for the sink.
+/// The wait is the back-pressure a slow reader puts on the producer. When it
+/// runs out the output is treated as broken: the writer is stopped, because
+/// a sink that is stuck in a write cannot serve the writes behind it.
+pub fn write_bytes(writer: Writer, bytes: BitArray) -> Result(Nil, WriteError) {
+  let Writer(subject, pid, timeout_ms) = writer
+  let monitor = process.monitor(pid)
+  let reply = process.new_subject()
+  process.send(subject, WriteBytes(bytes, reply))
+  let outcome =
+    process.new_selector()
+    |> process.select_map(reply, result.map_error(_, SinkFailed))
+    |> process.select_specific_monitor(monitor, fn(_) { Error(WriterStopped) })
+    |> process.selector_receive(timeout_ms)
+  process.demonitor_process(monitor)
+  case outcome {
+    Ok(written) -> written
+    Error(Nil) -> {
+      process.kill(pid)
+      Error(WriteTimedOut)
+    }
+  }
+}
+
+/// Stops the writer after the writes already sent to it, waiting at most the
+/// writer's timeout before stopping it regardless.
 pub fn stop_writer(writer: Writer) -> Nil {
-  let Writer(subj) = writer
-  process.call(subj, waiting: 5000, sending: CloseWriter)
+  let Writer(subject, pid, timeout_ms) = writer
+  let monitor = process.monitor(pid)
+  let reply = process.new_subject()
+  process.send(subject, CloseWriter(reply))
+  let stopped =
+    process.new_selector()
+    |> process.select(reply)
+    |> process.select_specific_monitor(monitor, fn(_) { Nil })
+    |> process.selector_receive(timeout_ms)
+  process.demonitor_process(monitor)
+  case stopped {
+    Ok(Nil) -> Nil
+    Error(Nil) -> process.kill(pid)
+  }
 }

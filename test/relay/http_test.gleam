@@ -7,7 +7,7 @@ import gleam/http/response
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import gleam/time/duration
@@ -984,7 +984,8 @@ pub fn mounted_handler_refuses_deep_json_test() {
   response.status |> should.equal(400)
   string.contains(testing.body_text(response), "-32600") |> should.be_true
 
-  // Within the depth limit, the same shape reaches the server.
+  // Within the depth limit, the same shape reaches the tool's input codec,
+  // which refuses the object where `text` expects a string.
   let shallow =
     testing.request("tools/call", [
       #("name", json.string("echo")),
@@ -992,7 +993,106 @@ pub fn mounted_handler_refuses_deep_json_test() {
     ])
   let response = http.handle(handler, shallow)
   response.status |> should.equal(200)
-  string.contains(testing.body_text(response), "-32602") |> should.be_true
+  let body = testing.body_text(response)
+  string.contains(body, "\"isError\":true") |> should.be_true
+  string.contains(body, "Invalid arguments: $[\\\"text\\\"]: expected a string")
+  |> should.be_true
+}
+
+pub fn an_input_codec_message_reaches_telemetry_not_the_client_test() {
+  // The application's own check writes the value it refused into its
+  // message, which must not be published.
+  let pin = {
+    use pin <- codec.field(
+      "pin",
+      codec.string()
+        |> codec.try_map(
+          decode: fn(pin) {
+            case string.length(pin) == 4 {
+              True -> Ok(pin)
+              False -> Error("pin " <> pin <> " is not four digits")
+            }
+          },
+          encode: Ok,
+          placeholder: "0000",
+        ),
+      get: fn(pin) { pin },
+    )
+    codec.success(pin)
+  }
+  let unlock = tool.handle(tool.define("unlock", pin, codec.string()), Ok)
+  let handler = mounted(http.new(server.new([unlock])))
+  let rejected = process.new_subject()
+  let attachment =
+    sinal.observe(telemetry.arguments_rejected_event(), fn(_, meta) {
+      process.send(rejected, meta)
+    })
+
+  let response =
+    http.handle(
+      handler,
+      testing.request("tools/call", [
+        #("name", json.string("unlock")),
+        #("arguments", json.object([#("pin", json.string("918273"))])),
+      ]),
+    )
+  response.status |> should.equal(200)
+  let body = testing.body_text(response)
+  string.contains(body, "\"isError\":true") |> should.be_true
+  string.contains(
+    body,
+    "Invalid arguments: $[\\\"pin\\\"]: custom validation failed",
+  )
+  |> should.be_true
+  string.contains(body, "918273") |> should.be_false
+  string.contains(body, "four digits") |> should.be_false
+
+  // The server's own observers get the codec's message.
+  let assert Ok(meta) = process.receive(rejected, 1000)
+  meta.tool |> should.equal("unlock")
+  meta.path |> should.equal("$[\"pin\"]")
+  meta.detail |> should.equal("$[\"pin\"]: pin 918273 is not four digits")
+  sinal.detach(attachment)
+}
+
+pub fn invalid_arguments_are_a_tool_error_with_detail_test() {
+  let handler = mounted(http.new(echo_server()))
+  // `text` must be a string; the value sent is a number the reply must not
+  // repeat.
+  let wrong_type =
+    testing.request("tools/call", [
+      #("name", json.string("echo")),
+      #("arguments", json.object([#("text", json.int(918_273))])),
+    ])
+  let response = http.handle(handler, wrong_type)
+  response.status |> should.equal(200)
+  let body = testing.body_text(response)
+  string.contains(body, "\"isError\":true") |> should.be_true
+  string.contains(body, "$[\\\"text\\\"]: expected a string")
+  |> should.be_true
+  string.contains(body, "918273") |> should.be_false
+
+  // A missing field names the field.
+  let missing =
+    testing.request("tools/call", [
+      #("name", json.string("echo")),
+      #("arguments", json.object([])),
+    ])
+  let body = testing.body_text(http.handle(handler, missing))
+  string.contains(body, "\"isError\":true") |> should.be_true
+  string.contains(body, "$[\\\"text\\\"]: missing field") |> should.be_true
+}
+
+pub fn depth_is_checked_before_the_body_is_parsed_test() {
+  let handler = mounted(http.new(echo_server()))
+  // Deeper than the limit and not valid JSON: the depth scan refuses it
+  // before any parse is attempted.
+  let deep_and_broken =
+    testing.request("tools/call", [])
+    |> request.set_body(bit_array.from_string(string.repeat("[", 70)))
+  let response = http.handle(handler, deep_and_broken)
+  response.status |> should.equal(400)
+  string.contains(testing.body_text(response), "nesting") |> should.be_true
 }
 
 pub fn context_builder_sees_the_request_test() {
@@ -1128,6 +1228,116 @@ pub fn listen_streams_beyond_the_cap_get_503_test() {
   client.close_subscription(second)
   client.close(peer)
   http.stop(listener)
+}
+
+@external(erlang, "relay_ffi", "monotonic_time_ms")
+fn monotonic_ms() -> Int
+
+// Reads the stream until a notification or an error arrives, or until `until`
+// passes. Keepalives end a single wait early with `Ok(None)`.
+fn wait_for_notification(
+  subscription: client.Subscription,
+  until: Int,
+) -> Result(Option(subscriptions.Notification), client.Error) {
+  let left = until - monotonic_ms()
+  case left <= 0 {
+    True -> Ok(None)
+    False ->
+      case client.next_notification(subscription, duration.milliseconds(left)) {
+        Ok(None) -> wait_for_notification(subscription, until)
+        other -> other
+      }
+  }
+}
+
+// The request timeout bounds opening a stream, not the established stream:
+// every HTTP call has a finite deadline, so a stream's is the listen timeout.
+pub fn listen_streams_outlive_the_request_timeout_test() {
+  let listener =
+    http.new(echo_server())
+    |> http.with_sse_keepalive(duration.milliseconds(50))
+    |> started
+  let assert Ok(config) =
+    client.http(
+      "http://127.0.0.1:" <> int.to_string(http.port(listener)) <> "/",
+    )
+  let assert Ok(peer) =
+    config
+    |> client.with_timeout(duration.milliseconds(300))
+    |> client.connect
+  let assert Ok(subscription) =
+    client.listen(peer, [subscriptions.ToolsListChanged])
+
+  wait_for_notification(subscription, monotonic_ms() + 1500)
+  |> should.equal(Ok(None))
+  http.notify(listener, subscriptions.ToolsListChanged)
+  client.next_notification(subscription, duration.seconds(2))
+  |> should.equal(Ok(Some(subscriptions.ToolsListChanged)))
+
+  client.close_subscription(subscription)
+  client.close(peer)
+  http.stop(listener)
+}
+
+pub fn listen_streams_end_at_the_listen_timeout_test() {
+  let listener =
+    http.new(echo_server())
+    |> http.with_sse_keepalive(duration.milliseconds(50))
+    |> started
+  let assert Ok(config) =
+    client.http(
+      "http://127.0.0.1:" <> int.to_string(http.port(listener)) <> "/",
+    )
+  let assert Ok(peer) =
+    config
+    |> client.with_listen_timeout(duration.milliseconds(300))
+    |> client.connect
+  let assert Ok(subscription) =
+    client.listen(peer, [subscriptions.ToolsListChanged])
+
+  let assert Error(client.TimedOut(_)) =
+    wait_for_notification(subscription, monotonic_ms() + 2000)
+    |> reason_support.of
+
+  client.close(peer)
+  http.stop(listener)
+}
+
+pub fn ordinary_calls_follow_the_request_timeout_not_the_listen_timeout_test() {
+  let pause =
+    tool.handle(tool.define("pause", no_input(), codec.string()), fn(_) {
+      process.sleep(800)
+      Ok("done")
+    })
+  let listener = http.new(server.new([pause])) |> started
+  let assert Ok(config) =
+    client.http(
+      "http://127.0.0.1:" <> int.to_string(http.port(listener)) <> "/",
+    )
+  let assert Ok(peer) =
+    config
+    |> client.with_timeout(duration.seconds(5))
+    |> client.with_listen_timeout(duration.milliseconds(300))
+    |> client.connect
+
+  // The call takes longer than the listen timeout and well within the
+  // request timeout, which is the only bound an ordinary call has.
+  let assert Ok(client.Succeeded("done", _)) =
+    client.call(peer, tool.define("pause", no_input(), codec.string()), Nil)
+
+  client.close(peer)
+  http.stop(listener)
+}
+
+pub fn listen_timeout_must_be_positive_test() {
+  let assert Ok(config) = client.http("http://127.0.0.1:1/")
+  let assert Error(error) =
+    config
+    |> client.with_listen_timeout(duration.milliseconds(0))
+    |> client.connect
+  client.describe_error(error)
+  |> string.contains("the listen timeout")
+  |> should.be_true
 }
 
 // --- mounting in an application's mist server ---------------------------------

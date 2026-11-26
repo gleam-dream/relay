@@ -3,15 +3,18 @@
     is_null/1,
     dynamic_to_json_string/1,
     raw_json/1,
-    extract_arguments_as_blueprint_value/1,
-    extract_input_responses_as_blueprint_value/1,
+    decode_json_exact/1,
+    exact_to_value/2,
+    exact_to_native/1,
     unique_integer/0,
     rescue_run/1,
     monotonic_time_ms/0,
-    set_stdio_binary/0,
-    close_stdin/0,
-    read_stdin/1,
+    reserve_stdio/0,
+    read_stdin/0,
+    lead_output_to_stderr/0,
+    restore_group_leader/1,
     stop_supervisor/1,
+    child_environment/3,
     write_stdout/1,
     write_stderr/1,
     spawn_stdio_child/1,
@@ -31,7 +34,7 @@
     watch_client_close/1,
     set_send_timeout/2,
     decode_base64_strict/1,
-    start_stdio_client_port/3,
+    start_stdio_client_port/4,
     send_stdio_client_command/2,
     close_stdio_client_port/1,
     json_depth_within/2,
@@ -97,45 +100,44 @@ dynamic_to_json_string(Data) ->
         _:_ -> <<"{}"/utf8>>
     end.
 
-extract_arguments_as_blueprint_value(RawJsonBin) ->
+%% Parses one JSON value and nothing after it but whitespace, keeping every
+%% number as its source text in a `{raw_number, Text}` tuple. Returns
+%% `{ok, Term}` or `{error, nil}`.
+decode_json_exact(Bin) ->
     Decoders = #{
         float => fun(B) -> {raw_number, B} end,
         integer => fun(B) -> {raw_number, B} end
     },
     try
-        {Root, ok, <<>>} = json:decode(RawJsonBin, ok, Decoders),
-        Params = maps:get(<<"params">>, Root, #{}),
-        case maps:find(<<"arguments">>, Params) of
-            {ok, ArgsTerm} ->
-                Limits = json@blueprint@number:limits(1024, 100, 1000),
-                case term_to_blueprint_value(ArgsTerm, Limits) of
-                    {ok, {object, Entries}} -> {ok, {object, Entries}};
-                    _ -> {error, invalid_arguments}
-                end;
-            error ->
-                {ok, {object, []}}
+        {Root, ok, Rest} = json:decode(Bin, ok, Decoders),
+        case is_json_whitespace(Rest) of
+            true -> {ok, Root};
+            false -> {error, nil}
         end
     catch
-        _:_ -> {error, parse_error}
+        _:_ -> {error, nil}
     end.
 
-extract_input_responses_as_blueprint_value(RawJsonBin) ->
-    Decoders = #{
-        float => fun(B) -> {raw_number, B} end,
-        integer => fun(B) -> {raw_number, B} end
-    },
-    try
-        {Root, ok, <<>>} = json:decode(RawJsonBin, ok, Decoders),
-        Params = maps:get(<<"params">>, Root, #{}),
-        case maps:find(<<"inputResponses">>, Params) of
-            {ok, Responses} when is_map(Responses) ->
-                Limits = json@blueprint@number:limits(1024, 100, 1000),
-                term_to_blueprint_value(Responses, Limits);
-            _ -> {error, invalid_input_responses}
-        end
-    catch
-        _:_ -> {error, parse_error}
-    end.
+is_json_whitespace(<<>>) -> true;
+is_json_whitespace(<<C, Rest/binary>>) when C =:= $\s; C =:= $\t; C =:= $\n; C =:= $\r ->
+    is_json_whitespace(Rest);
+is_json_whitespace(_) -> false.
+
+%% A term from `decode_json_exact` with its numbers as integers and floats.
+exact_to_native({raw_number, Text}) ->
+    {Number, ok, _} = json:decode(Text, ok, #{}),
+    Number;
+exact_to_native(Map) when is_map(Map) ->
+    maps:map(fun(_Key, Value) -> exact_to_native(Value) end, Map);
+exact_to_native(List) when is_list(List) ->
+    [exact_to_native(Item) || Item <- List];
+exact_to_native(Other) ->
+    Other.
+
+%% A term from `decode_json_exact` as a JSON Blueprint value, its numbers
+%% parsed within `Limits`.
+exact_to_value(Term, Limits) ->
+    term_to_blueprint_value(Term, Limits).
 
 term_to_blueprint_value(null, _Limits) -> {ok, null};
 term_to_blueprint_value(true, _Limits) -> {ok, {bool, true}};
@@ -231,66 +233,84 @@ rescue_run(Fun) ->
             {error, <<"handler crashed (redacted)">>}
     end.
 
-set_stdio_binary() ->
-    io:setopts(standard_io, [{binary, true}, {encoding, utf8}]),
-    io:setopts(standard_error, [{binary, true}, {encoding, utf8}]),
-    enable_raw_stdin(),
-    {ok, nil}.
+%% Prepares the VM for serving MCP over its standard streams. Standard input
+%% is Relay's only when the VM never reads it itself, which `-noinput`
+%% guarantees; otherwise the VM's terminal reader already owns descriptor 0.
+%% Every logger handler that writes to standard output is moved to standard
+%% error, so that log events (crash reports and emulator warnings included)
+%% cannot interleave with protocol frames.
+reserve_stdio() ->
+    case init:get_argument(noinput) of
+        error -> {error, nil};
+        {ok, _} ->
+            lists:foreach(fun route_handler_to_stderr/1, logger:get_handler_config()),
+            {ok, nil}
+    end.
 
-close_stdin() ->
-    case erase(relay_stdio_input) of
+%% `logger_std_h` cannot change its `type` in place, so the handler is
+%% removed and added again with the same level, filters, formatter and
+%% overload settings.
+route_handler_to_stderr(#{id := Id, module := logger_std_h,
+                          config := #{type := standard_io} = Config} = Handler) ->
+    Overload = maps:with([sync_mode_qlen, drop_mode_qlen, flush_qlen,
+                          burst_limit_enable, burst_limit_max_count,
+                          burst_limit_window_time, overload_kill_enable,
+                          overload_kill_qlen, overload_kill_mem_size,
+                          overload_kill_restart_after], Config),
+    Kept = maps:with([level, filter_default, filters, formatter], Handler),
+    _ = logger:remove_handler(Id),
+    _ = logger:add_handler(Id, logger_std_h,
+                           Kept#{config => Overload#{type => standard_error}}),
+    ok;
+route_handler_to_stderr(_) ->
+    ok.
+
+%% Makes standard error the group leader of the calling process and returns
+%% the previous one. Processes it spawns from now on inherit the new group
+%% leader, so `io` output from the runtime and its handlers goes to standard
+%% error instead of standard output.
+lead_output_to_stderr() ->
+    Previous = group_leader(),
+    case whereis(standard_error) of
         undefined -> ok;
-        Device -> file:close(Device)
+        StandardError -> group_leader(StandardError, self())
     end,
+    Previous.
+
+restore_group_leader(Previous) ->
+    group_leader(Previous, self()),
     nil.
 
-enable_raw_stdin() ->
-    try
-        case whereis(user) of
-            undefined -> ok;
-            User ->
-                case sys:get_status(User) of
-                    {status, _, _, [_, _, _, _, [_, _, {data, [{_, {_, State}}]}]]} ->
-                        Drv = element(3, State),
-                        User ! {Drv, terminal_mode, raw},
-                        ok;
-                    _ -> ok
-                end
-        end
-    catch
-        _:_ -> ok
-    end.
-
-read_stdin(ChunkSize) when ChunkSize =< 0 ->
-    {read_failed, <<"stdin chunk limit must be positive">>};
-read_stdin(ChunkSize) ->
-    case ensure_stdin_input() of
-        {ok, Device} ->
-            read_stdin_result(ChunkSize, file:read(Device, ChunkSize));
+%% Returns the next bytes of standard input as soon as any arrive. A raw file
+%% read of a pipe waits for its whole count, so input comes from a port in
+%% stream mode on descriptor 0, owned by the calling process. The port
+%% delivers each read as it completes, so the framer bounds a frame while it
+%% grows. A port cannot be paused: input the server has not framed yet waits
+%% in the owner's mailbox.
+read_stdin() ->
+    case ensure_stdin_port() of
+        {ok, Port} ->
+            receive
+                {Port, {data, Data}} -> {read_chunk, Data};
+                {Port, eof} -> read_eof
+            end;
         {error, Reason} ->
-            {read_failed, unicode:characters_to_binary(io_lib:format("~p", [Reason]))}
+            {read_failed, printable(Reason)}
     end.
 
-ensure_stdin_input() ->
+ensure_stdin_port() ->
     case get(relay_stdio_input) of
         undefined ->
-            case file:open("/dev/stdin", [read, binary, raw]) of
-                {ok, Device} ->
-                    put(relay_stdio_input, Device),
-                    {ok, Device};
-                {error, Reason} -> {error, Reason}
+            try erlang:open_port({fd, 0, 1}, [in, binary, stream, eof]) of
+                Port ->
+                    put(relay_stdio_input, Port),
+                    {ok, Port}
+            catch
+                error:Reason -> {error, Reason}
             end;
-        Device -> {ok, Device}
+        Port ->
+            {ok, Port}
     end.
-
-read_stdin_result(ChunkSize, {ok, Data}) when is_binary(Data), byte_size(Data) =< ChunkSize ->
-    {read_chunk, Data};
-read_stdin_result(_ChunkSize, eof) ->
-    read_eof;
-read_stdin_result(_ChunkSize, {error, Reason}) ->
-    {read_failed, unicode:characters_to_binary(io_lib:format("~p", [Reason]))};
-read_stdin_result(_ChunkSize, _) ->
-    {read_failed, <<"stdin returned an invalid chunk">>}.
 
 mailbox_size(Pid) when is_pid(Pid) ->
     case erlang:process_info(Pid, message_queue_len) of
@@ -402,22 +422,78 @@ git_head(RepoPath) ->
     Out = os:cmd(Cmd),
     string:trim(unicode:characters_to_binary(Out)).
 
+%% Stops a listener's supervision tree and returns once its sockets are
+%% closed. `sys:terminate` replies before the supervisor shuts its children
+%% down, and a port owned by an exited process closes after the owner's
+%% exit, so the wait is on the supervisor's exit and then on each socket.
+%% The tree's shutdown timeouts bound both waits.
 stop_supervisor(Pid) when is_pid(Pid) ->
-    try sys:terminate(Pid, shutdown, 5000) catch _:_ -> ok end,
+    Sockets = [erlang:monitor(port, Port) || Port <- sockets_under(Pid)],
+    Ref = erlang:monitor(process, Pid),
+    try sys:terminate(Pid, shutdown, infinity) catch _:_ -> ok end,
+    receive {'DOWN', Ref, process, Pid, _} -> ok end,
+    [receive {'DOWN', Socket, port, _, _} -> ok end || Socket <- Sockets],
     nil.
 
-start_stdio_client_port(CmdBin, ArgsList, GleamSubject) ->
+%% TCP sockets, listening or accepted, owned by a process started under
+%% `Supervisor`. Reads each owner's `proc_lib` ancestry instead of asking
+%% the supervisors, so a busy or suspended supervisor cannot delay it.
+sockets_under(Supervisor) ->
+    [Port || Port <- erlang:ports(),
+             erlang:port_info(Port, name) =:= {name, "tcp_inet"},
+             {connected, Owner} <- [erlang:port_info(Port, connected)],
+             lists:member(Supervisor, ancestors(Owner))].
+
+ancestors(Pid) ->
+    case erlang:process_info(Pid, dictionary) of
+        {dictionary, Dictionary} ->
+            proplists:get_value('$ancestors', Dictionary, []);
+        undefined ->
+            []
+    end.
+
+%% The environment of a stdio child: the variables a program needs to run
+%% (the same allow-list the reference MCP SDKs use), inherited from this OS
+%% process, plus the ones the caller added. A port inherits the whole
+%% environment unless each other variable is unset, so the rest are unset.
+child_environment(Added) ->
+    child_environment(os:type(), os:env(), Added).
+
+child_environment(OsType, Inherited, Added) ->
+    Allowed = case OsType of
+        {win32, _} ->
+            ["APPDATA", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "PATH",
+             "PROCESSOR_ARCHITECTURE", "SYSTEMDRIVE", "SYSTEMROOT", "TEMP",
+             "USERNAME", "USERPROFILE", "PROGRAMFILES"];
+        _ ->
+            ["HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER"]
+    end,
+    %% Windows variable names ignore case and keep the spelling they were
+    %% set with; Unix names are compared exactly.
+    Key = case OsType of
+        {win32, _} -> fun string:uppercase/1;
+        _ -> fun(Name) -> Name end
+    end,
+    Explicit = [{unicode:characters_to_list(Name), unicode:characters_to_list(Value)}
+                || {Name, Value} <- Added],
+    Kept = [Key(Name) || Name <- Allowed ++ [Name || {Name, _} <- Explicit]],
+    Unset = [{Name, false} || {Name, _} <- Inherited,
+                              not lists:member(Key(Name), Kept)],
+    Unset ++ Explicit.
+
+start_stdio_client_port(CmdBin, ArgsList, Added, GleamSubject) ->
     Parent = self(),
     OpenRef = make_ref(),
     Cmd = binary_to_list(CmdBin),
     Args = [binary_to_list(A) || A <- ArgsList],
+    Env = child_environment(Added),
     case resolve_stdio_executable(Cmd) of
         {error, Reason} -> {error, Reason};
         {ok, Executable} ->
             {Pid, Monitor} = spawn_monitor(fun() ->
                 try erlang:open_port(
                     {spawn_executable, Executable},
-                    [stream, binary, use_stdio, exit_status, {args, Args}]
+                    [stream, binary, use_stdio, exit_status, {args, Args}, {env, Env}]
                 ) of
                     Port ->
                         Parent ! {port_ready, OpenRef, {ok, self()}},

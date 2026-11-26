@@ -34,7 +34,8 @@ pub fn reducer_determinism_property_test() {
   let s_b = reducer.init(srv)
 
   let ex = reducer.new_exchange_id()
-  let in1 = Received(ex, "ctx", echo_frame("det-1", "hello"), None)
+  let in1 =
+    Received(ex, "ctx", reducer.decode(echo_frame("det-1", "hello")), None)
 
   let #(s_a1, eff_a1) = reducer.step(s_a, in1)
   let #(s_b1, eff_b1) = reducer.step(s_b, in1)
@@ -119,7 +120,10 @@ pub fn no_output_after_terminal_state_property_test() {
 
   // A frame on the closed exchange produces no output.
   let #(_s2, eff2) =
-    reducer.step(s1, Received(ex, "ctx", echo_frame("late", "foo"), None))
+    reducer.step(
+      s1,
+      Received(ex, "ctx", reducer.decode(echo_frame("late", "foo")), None),
+    )
   eff2 |> should.equal([])
 }
 

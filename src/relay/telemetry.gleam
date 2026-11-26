@@ -9,6 +9,7 @@
 //// | `[relay, invocation, completed]` | a handler returned; measures `duration_ms` |
 //// | `[relay, invocation, cancelled]` | a running handler was cancelled |
 //// | `[relay, invocation, crashed]` | a handler crashed or timed out |
+//// | `[relay, invocation, arguments_rejected]` | a tool's input codec refused the call's arguments |
 //// | `[relay, exchange, closed]` | an exchange closed |
 //// | `[relay, http, rejected]` | the HTTP endpoint refused a request |
 //// | `[relay, authorization, decided]` | bearer admission granted or refused a request |
@@ -27,7 +28,16 @@
 //// `frame.rejected`, for a frame refused before admission, has no
 //// correlation field. Read
 //// metadata by label: a later release may add fields. Status and reason
-//// fields are enums, never prose.
+//// fields are enums, never prose. The one exception is the `detail` of
+//// `arguments_rejected`: the input codec's own description of the refusal,
+//// which can include a message the application's codec wrote and the value
+//// it refused. The caller never receives that text; it exists only for the
+//// server's observers.
+////
+//// A handler belongs to the process that attaches it and is detached when
+//// that process exits, so attach from a process that lives as long as the
+//// observation should, such as a supervised worker, not from a short-lived
+//// task.
 ////
 //// ```gleam
 //// import gleam/io
@@ -174,6 +184,22 @@ pub type InvocationCrashedMeta {
     method: String,
     tool: Option(String),
     reason: CrashReason,
+    correlation: Correlation,
+    listener: Option(String),
+  )
+}
+
+/// Metadata of `[relay, invocation, arguments_rejected]`. `path` is the
+/// JSON path of the refused value, such as `$["pin"]`. `detail` is the
+/// codec's description of the refusal, including any message the
+/// application's codec wrote; the response to the caller carries the path
+/// and a fixed text instead.
+pub type ArgumentsRejectedMeta {
+  ArgumentsRejectedMeta(
+    invocation_id: Int,
+    tool: String,
+    path: String,
+    detail: String,
     correlation: Correlation,
     listener: Option(String),
   )
@@ -475,6 +501,37 @@ pub fn invocation_crashed_event() -> Event(Nil, InvocationCrashedMeta) {
     ))
   }
   sinal.event(["relay", "invocation", "crashed"], fields.empty(), meta)
+}
+
+/// `[relay, invocation, arguments_rejected]`.
+pub fn arguments_rejected_event() -> Event(Nil, ArgumentsRejectedMeta) {
+  let meta = {
+    use invocation_id <- fields.include(fields.int("invocation_id"), get: fn(m) {
+      m.invocation_id
+    })
+    use tool <- fields.include(fields.string("tool"), get: fn(m) { m.tool })
+    use path <- fields.include(fields.string("path"), get: fn(m) { m.path })
+    use detail <- fields.include(fields.string("detail"), get: fn(m) {
+      m.detail
+    })
+    use correlation <- fields.include(correlation.required_field(), get: fn(m) {
+      m.correlation
+    })
+    use listener <- fields.include(listener(), get: fn(m) { m.listener })
+    fields.success(ArgumentsRejectedMeta(
+      invocation_id:,
+      tool:,
+      path:,
+      detail:,
+      correlation:,
+      listener:,
+    ))
+  }
+  sinal.event(
+    ["relay", "invocation", "arguments_rejected"],
+    fields.empty(),
+    meta,
+  )
 }
 
 /// `[relay, exchange, closed]`.

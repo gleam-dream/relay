@@ -81,7 +81,10 @@ pub fn receive(
 ) -> #(State(context), ExchangeId, List(Effect(context))) {
   let exchange = reducer.new_exchange_id()
   let #(state, effects) =
-    reducer.step(state, reducer.Received(exchange, context, bytes, None))
+    reducer.step(
+      state,
+      reducer.Received(exchange, context, reducer.decode(bytes), None),
+    )
   #(state, exchange, effects)
 }
 

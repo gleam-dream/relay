@@ -7,7 +7,8 @@
     send_and_hold/4,
     read_until/3,
     abort_connection/1,
-    with_unlistened_port/1
+    with_unlistened_port/1,
+    keepalive_before_notification_server/1
 ]).
 
 %% A raw HTTP/1.1 client for the endpoint tests. It sends exactly the given
@@ -297,3 +298,64 @@ suspend_stream_writer(Port) ->
 resume_stream_writer(Pid) ->
     try erlang:resume_process(Pid) catch _:_ -> ok end,
     nil.
+
+%% A one-connection MCP endpoint that answers one `subscriptions/listen`
+%% request: it acknowledges the tools list subscription, waits `GapMs`, sends
+%% an SSE keepalive comment, waits `GapMs` again, then sends one
+%% `notifications/tools/list_changed` event. It holds the stream open until
+%% the client closes it. Returns the port.
+keepalive_before_notification_server(GapMs) ->
+    {ok, Listen} = gen_tcp:listen(0, [binary, {active, false}, {ip, {127, 0, 0, 1}}]),
+    {ok, Port} = inet:port(Listen),
+    Pid = spawn(fun() ->
+        receive go -> ok end,
+        {ok, Socket} = gen_tcp:accept(Listen, 5000),
+        {Head, Rest} = read_head(Socket, <<>>),
+        Body = read_body(Socket, Rest, content_length(Head)),
+        Id = json:encode(maps:get(<<"id">>, json:decode(Body))),
+        ok = gen_tcp:send(Socket, <<"HTTP/1.1 200 OK\r\n"
+            "content-type: text/event-stream\r\n"
+            "transfer-encoding: chunked\r\n"
+            "connection: close\r\n\r\n">>),
+        Meta = [<<"\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":">>, Id, <<"}">>],
+        send_chunk(Socket, [<<"data: {\"jsonrpc\":\"2.0\","
+            "\"method\":\"notifications/subscriptions/acknowledged\","
+            "\"params\":{">>, Meta, <<",\"notifications\":{\"toolsListChanged\":true}}}\n\n">>]),
+        timer:sleep(GapMs),
+        send_chunk(Socket, <<": keepalive\n\n">>),
+        timer:sleep(GapMs),
+        send_chunk(Socket, [<<"data: {\"jsonrpc\":\"2.0\","
+            "\"method\":\"notifications/tools/list_changed\","
+            "\"params\":{">>, Meta, <<"}}\n\n">>]),
+        _ = gen_tcp:recv(Socket, 0, 5000),
+        gen_tcp:close(Socket),
+        gen_tcp:close(Listen)
+    end),
+    ok = gen_tcp:controlling_process(Listen, Pid),
+    Pid ! go,
+    Port.
+
+read_head(Socket, Acc) ->
+    case binary:split(Acc, <<"\r\n\r\n">>) of
+        [Head, Rest] -> {Head, Rest};
+        [_] ->
+            {ok, More} = gen_tcp:recv(Socket, 0, 5000),
+            read_head(Socket, <<Acc/binary, More/binary>>)
+    end.
+
+content_length(Head) ->
+    [_ | Lines] = binary:split(Head, <<"\r\n">>, [global]),
+    hd([binary_to_integer(string:trim(Value))
+        || Line <- Lines,
+           [Name, Value] <- [binary:split(Line, <<":">>)],
+           string:lowercase(Name) =:= <<"content-length">>]).
+
+read_body(_Socket, Acc, Length) when byte_size(Acc) >= Length ->
+    binary:part(Acc, 0, Length);
+read_body(Socket, Acc, Length) ->
+    {ok, More} = gen_tcp:recv(Socket, 0, 5000),
+    read_body(Socket, <<Acc/binary, More/binary>>, Length).
+
+send_chunk(Socket, Data) ->
+    Bytes = iolist_to_binary(Data),
+    ok = gen_tcp:send(Socket, [integer_to_binary(byte_size(Bytes), 16), <<"\r\n">>, Bytes, <<"\r\n">>]).

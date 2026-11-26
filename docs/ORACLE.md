@@ -1,8 +1,9 @@
 # Relay oracles
 
 Relay compares its behavior with independent references and pinned evidence.
-Each reference below has a recorded source, a pin and a stated limit. Relay has
-no benchmark harness and makes no latency claim, so there is no `BENCHMARKS.md`.
+Each reference below has a recorded source, a pin and a stated limit. Relay
+makes no latency claim; [BENCHMARKS.md](BENCHMARKS.md) describes its one
+benchmark, which compares two builds on one machine.
 
 The [design](design/design.typ#validation-and-extension-ownership) states which
 evidence layer proves what. [ADR 0007](adr/0007-freeze-independent-evidence-and-retain-provenance.md)

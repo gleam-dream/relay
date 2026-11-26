@@ -1,4 +1,5 @@
 import gleam/dict
+import gleam/erlang/atom
 import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/json
@@ -34,6 +35,9 @@ fn disconnect_after_first_sse_event(
   headers: List(#(String, String)),
   body: BitArray,
 ) -> Result(Int, String)
+
+@external(erlang, "relay_http_ffi", "keepalive_before_notification_server")
+fn keepalive_before_notification_server(gap_ms: Int) -> Int
 
 @external(erlang, "relay_ffi", "monotonic_time_ms")
 fn monotonic_ms() -> Int
@@ -212,6 +216,11 @@ fn local_server(observed: Subject(String)) -> server.Server(context) {
 
 fn start_http(service: server.Server(Nil)) -> #(http.Handler(Nil), String) {
   let assert Ok(handler) = http.start(http.new(service))
+  #(handler, url_of(handler))
+}
+
+fn start_http_with(config: http.Config(Nil)) -> #(http.Handler(Nil), String) {
+  let assert Ok(handler) = http.start(config)
   #(handler, url_of(handler))
 }
 
@@ -1566,6 +1575,166 @@ fn churn(handler: http.Handler(Nil), remaining: Int) -> Nil {
   }
 }
 
+// When the endpoint ends a subscription, here because its events outgrow
+// the response limit, the response completes with its final chunk; its head
+// said `connection: close`, so no client reuses the connection.
+pub fn http_subscription_ended_by_the_endpoint_completes_its_response_test() {
+  let #(handler, url) =
+    start_http_with(
+      http.new(server.new([]))
+      |> http.with_max_response_bytes(400),
+    )
+  let peer = connect_url(url)
+  let assert Ok(subscription) =
+    client.listen(peer, [subscriptions.ToolsListChanged])
+  list.each(["one", "two", "three", "four"], fn(name) {
+    let assert Ok(Nil) =
+      http.register_tool(
+        handler,
+        tool.define(name, named_input(), codec.string()) |> tool.handle(Ok),
+      )
+  })
+  let assert Error(ended) = await_end(subscription, 3)
+  let assert client.ConnectionClosed(client.Completed) = client.reason(ended)
+  client.close(peer)
+  http.stop(handler)
+}
+
+fn await_end(
+  subscription: client.Subscription,
+  seconds: Int,
+) -> Result(Nil, client.Error) {
+  let elapsed = process.new_subject()
+  process.send_after(elapsed, seconds * 1000, Nil)
+  end_before(subscription, elapsed)
+}
+
+fn end_before(
+  subscription: client.Subscription,
+  elapsed: Subject(Nil),
+) -> Result(Nil, client.Error) {
+  case process.receive(elapsed, 0) {
+    Ok(Nil) -> Ok(Nil)
+    Error(Nil) ->
+      case client.next_notification(subscription, duration.seconds(1)) {
+        Ok(_) -> end_before(subscription, elapsed)
+        Error(error) -> Error(error)
+      }
+  }
+}
+
+// A streamed call's head says `connection: close`. Gun once ended such a
+// response on its own 15 s graceful-close timer; only the call's deadline
+// may end it now. gleeunit stops a plain test after 5 s; this allows 60 s.
+pub fn http_streamed_call_outlives_the_peer_graceful_close_window_test_() {
+  #(atom.create("timeout"), 60, fn() {
+    let long =
+      tool.define("long", named_input(), codec.string())
+      |> tool.handle(fn(name) {
+        process.sleep(17_000)
+        Ok("done " <> name)
+      })
+    let #(handler, url) =
+      start_http_with(
+        http.new(server.new([long]))
+        |> http.with_request_timeout(duration.seconds(40))
+        |> http.with_sse_keepalive(duration.seconds(1)),
+      )
+    let assert Ok(config) = client.http(url)
+    let assert Ok(peer) =
+      config |> client.with_timeout(duration.seconds(40)) |> client.connect
+    let assert Ok(client.Succeeded("done Ada", _)) =
+      client.call(
+        peer,
+        tool.define("long", named_input(), codec.string()),
+        "Ada",
+      )
+    client.close(peer)
+    http.stop(handler)
+  })
+}
+
+// gleeunit stops a plain test after 5 s; this generator form allows 60 s.
+pub fn http_subscription_outlives_the_peer_graceful_close_window_test_() {
+  #(atom.create("timeout"), 60, fn() {
+    let #(handler, url) =
+      start_http_with(
+        http.new(server.new([]))
+        |> http.with_sse_keepalive(duration.seconds(1)),
+      )
+    let peer = connect_url(url)
+    let assert Ok(subscription) =
+      client.listen(peer, [subscriptions.ToolsListChanged])
+    // Twenty idle seconds: the stream carries only keepalive comments.
+    hold_idle(subscription, 20)
+    let late =
+      tool.define("late", named_input(), codec.string())
+      |> tool.handle(fn(_) { Ok("late") })
+    let assert Ok(Nil) = http.register_tool(handler, late)
+    let assert Ok(subscriptions.ToolsListChanged) =
+      await_notification(subscription, 3)
+    client.close_subscription(subscription)
+    client.close(peer)
+    http.stop(handler)
+  })
+}
+
+fn hold_idle(subscription: client.Subscription, seconds: Int) -> Nil {
+  let elapsed = process.new_subject()
+  process.send_after(elapsed, seconds * 1000, Nil)
+  wait_idle(subscription, elapsed)
+}
+
+fn wait_idle(subscription: client.Subscription, elapsed: Subject(Nil)) -> Nil {
+  case process.receive(elapsed, 0) {
+    Ok(Nil) -> Nil
+    Error(Nil) -> {
+      let assert Ok(None) =
+        client.next_notification(subscription, duration.seconds(1))
+      wait_idle(subscription, elapsed)
+    }
+  }
+}
+
+// A keepalive comment ends a `next_notification` wait early with `Ok(None)`.
+fn await_notification(
+  subscription: client.Subscription,
+  seconds: Int,
+) -> Result(subscriptions.Notification, Nil) {
+  let elapsed = process.new_subject()
+  process.send_after(elapsed, seconds * 1000, Nil)
+  next_before(subscription, elapsed)
+}
+
+fn next_before(
+  subscription: client.Subscription,
+  elapsed: Subject(Nil),
+) -> Result(subscriptions.Notification, Nil) {
+  case process.receive(elapsed, 0) {
+    Ok(Nil) -> Error(Nil)
+    Error(Nil) ->
+      case client.next_notification(subscription, duration.seconds(1)) {
+        Ok(Some(notification)) -> Ok(notification)
+        Ok(None) -> next_before(subscription, elapsed)
+        Error(_) -> Error(Nil)
+      }
+  }
+}
+
+// An SSE keepalive comment is not an answer to the wait: the client keeps
+// waiting for the rest of the requested time, so a notification that follows
+// a keepalive within that time is returned.
+pub fn http_subscription_keepalive_keeps_the_remaining_wait_test() {
+  let port = keepalive_before_notification_server(100)
+  let peer = connect_url("http://127.0.0.1:" <> int.to_string(port) <> "/")
+  let assert Ok(subscription) =
+    client.listen(peer, [subscriptions.ToolsListChanged])
+  let event = client.next_notification(subscription, duration.seconds(2))
+  client.close_subscription(subscription)
+  client.close(peer)
+  let assert Ok(Some(subscriptions.ToolsListChanged)) = event
+}
+
 pub fn http_subscription_fails_when_the_endpoint_stops_test() {
   let entered = process.new_subject()
   let assert Ok(handler) =
@@ -1605,6 +1774,66 @@ pub fn stdio_client_uses_typed_request_surface_test() {
     client.call(peer, greet, "stdio")
   let assert True = block == content.text("child-server: hello stdio")
   client.close(peer)
+}
+
+@external(erlang, "relay_stdio_env_ffi", "putenv")
+fn putenv(name: String, value: String) -> Nil
+
+pub fn stdio_child_gets_only_allowed_and_explicit_variables_test() {
+  // A secret in this VM's environment must not reach the child.
+  putenv("RELAY_TEST_SECRET", "s3cret")
+  let config =
+    runner_config()
+    |> client.with_environment([#("RELAY_TEST_EXTRA", "given")])
+  let assert Ok(peer) = client.connect(config)
+  let env = tool.define("env", named_input(), codec.string())
+  let assert Ok(client.Succeeded("(unset)", _)) =
+    client.call(peer, env, "RELAY_TEST_SECRET")
+  let assert Ok(client.Succeeded("given", _)) =
+    client.call(peer, env, "RELAY_TEST_EXTRA")
+  // An allow-listed variable is inherited.
+  let assert Ok(client.Succeeded(path, _)) = client.call(peer, env, "PATH")
+  assert path != "(unset)"
+  client.close(peer)
+}
+
+@external(erlang, "relay_stdio_env_ffi", "windows_unset")
+fn windows_unset(
+  inherited: List(#(String, String)),
+  added: List(#(String, String)),
+) -> List(String)
+
+pub fn windows_child_keeps_allowed_variables_in_any_case_test() {
+  // Windows variable names ignore case and keep the spelling they were set
+  // with, so `Path` and `SystemRoot` are the allow-listed PATH and
+  // SYSTEMROOT. An added `path` replaces the inherited `Path`.
+  let unset =
+    windows_unset(
+      [
+        #("Path", "C:\\Windows"),
+        #("SystemRoot", "C:\\Windows"),
+        #("Secret_Token", "s3cret"),
+        #("Extra", "old"),
+      ],
+      [#("EXTRA", "new")],
+    )
+  assert unset == ["Secret_Token"]
+}
+
+pub fn environment_is_refused_for_a_non_stdio_target_test() {
+  let assert Ok(config) = client.http("http://127.0.0.1:1/")
+  let assert Error(error) =
+    config
+    |> client.with_environment([#("NAME", "value")])
+    |> client.connect
+  assert client.reason(error) == client.InvalidConfig(client.Environment)
+
+  // A name with `=` cannot be set in a child environment.
+  let assert Error(error) =
+    runner_config()
+    |> client.with_environment([#("A=B", "value")])
+    |> client.connect
+  assert client.reason(error) == client.InvalidConfig(client.Environment)
 }
 
 pub fn stdio_client_redacts_its_command_test() {

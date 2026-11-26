@@ -7,6 +7,11 @@ licenses = ["Apache-2.0"]
 description = "A Gleam MCP server and client for the frozen 2026-07-28 revision, with stdio and Streamable HTTP transports."
 repository = { type = "github", user = "gleam-dream", repo = "relay" }
 
+[[documentation.pages]]
+title = "Migrating from 0.2 to 0.3"
+path = "migration.html"
+source = "docs/MIGRATION.md"
+
 [dependencies]
 gleam_stdlib = ">= 0.70.0 and < 2.0.0"
 gleam_json = ">= 3.0.0 and < 4.0.0"
@@ -14,9 +19,9 @@ gleam_http = ">= 4.4.0 and < 5.0.0"
 gleam_erlang = ">= 1.0.0 and < 2.0.0"
 gleam_otp = ">= 1.0.0 and < 2.0.0"
 gleam_time = ">= 1.11.0 and < 2.0.0"
-json_blueprint = ">= 2.2.0 and < 3.0.0"
-sinal = ">= 0.1.0 and < 0.2.0"
-http_gun = ">= 0.1.0 and < 0.3.0"
+json_blueprint = ">= 3.0.0 and < 4.0.0"
+sinal = ">= 0.2.0 and < 0.3.0"
+http_gun = ">= 0.4.0 and < 0.5.0"
 # Streaming uses mist's public `chunked` API. Two optional helpers in
 # relay_ffi.erl read mist's `Connection` record (body, socket, transport,
 # factory_name): a socket send timeout for event streams and the closure

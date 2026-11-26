@@ -76,6 +76,7 @@
 //// request worker, not to the process calling buffered `handle`.
 
 import gleam/bit_array
+import gleam/bool
 import gleam/bytes_tree.{type BytesTree}
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Pid, type Subject}
@@ -93,7 +94,6 @@ import gleam/result
 import gleam/set
 import gleam/string
 import gleam/time/duration.{type Duration}
-import gleam/uri
 import json/blueprint/value
 import mist
 import relay/authorization.{
@@ -101,6 +101,8 @@ import relay/authorization.{
 }
 import relay/internal/carrier
 import relay/internal/emit
+import relay/internal/frame as inbound
+import relay/internal/header_value
 import relay/internal/held.{type Held}
 import relay/internal/http_mist
 import relay/internal/jsonrpc
@@ -597,7 +599,7 @@ pub opaque type Message(context) {
   Unregister(name: String, reply: Subject(Bool))
   GetPort(reply: Subject(Option(Int)))
   GetBodyLimit(reply: Subject(Int))
-  StopEndpoint(reply: Subject(Nil))
+  StopEndpoint
 }
 
 // What an admitted request receives: a handle to the endpoint's held
@@ -772,14 +774,24 @@ pub fn port(handler: Handler(context)) -> Int {
 }
 
 /// Stops the endpoint: closes its streams, stops its listener and its
-/// actor without terminating its linked caller. Initiates request cleanup,
-/// which may continue after this call returns. Waits at most 5 s.
-/// Unexpected listener failure still reaches the caller through the link.
+/// actor without terminating its linked caller. Returns once the endpoint
+/// actor has exited; for a listener, its listening socket is closed by then,
+/// so a new connection is refused. A request in flight is cut off: its
+/// connection handler has exited and its response is not sent. Cleanup of
+/// the request's own work may continue after this call returns. Stopping an
+/// endpoint that is not running returns at once. Unexpected listener
+/// failure still reaches the caller through the link.
 pub fn stop(handler: Handler(context)) -> Nil {
-  let reply = process.new_subject()
-  process.send(handler.subject, StopEndpoint(reply))
-  let _ = process.receive(reply, hub_timeout)
-  Nil
+  case process.subject_owner(handler.subject) {
+    Error(Nil) -> Nil
+    Ok(endpoint) -> {
+      let monitor = process.monitor(endpoint)
+      process.send(handler.subject, StopEndpoint)
+      process.new_selector()
+      |> process.select_specific_monitor(monitor, fn(_) { Nil })
+      |> process.selector_receive_forever
+    }
+  }
 }
 
 /// Tells every open `subscriptions/listen` stream that asked for it.
@@ -951,14 +963,13 @@ fn handle_hub(
       process.send(reply, hub.config.max_body_bytes)
       actor.continue(hub)
     }
-    StopEndpoint(reply) -> {
+    StopEndpoint -> {
       dict.each(hub.slots, fn(_, slot) { slot.cancel() })
       each_stream(hub, runtime.close)
       case hub.listener {
         Some(listener) -> http_mist.stop(listener)
         None -> Nil
       }
-      process.send(reply, Nil)
       actor.stop()
     }
   }
@@ -1370,7 +1381,12 @@ fn dispatch(
 ) -> http_mist.Reply {
   let config = held.get(lease.config)
   let body = request.body
-  case v2026.http_route(body) {
+  // The nesting depth is checked on the bytes, then one decode of the body
+  // gives the routing fields and the admitted request the runtime receives.
+  use <- bool.lazy_guard(!v2026.depth_within(body, config.max_json_depth), fn() {
+    too_deep(config, correlation)
+  })
+  case v2026.http_inspect(body) {
     Error(Nil) ->
       reject(
         config,
@@ -1379,7 +1395,7 @@ fn dispatch(
         correlation,
         "Invalid MCP JSON-RPC envelope",
       )
-    Ok(route) ->
+    Ok(#(route, decoded)) ->
       case
         valid_route_headers(request, route)
         && valid_parameter_headers(request, config.server, route)
@@ -1397,7 +1413,7 @@ fn dispatch(
           ))
         }
         True ->
-          case v2026.http_admission_failure(body) {
+          case v2026.http_admission_failure(decoded.admission) {
             Some(v2026.HttpFailure(status, failure)) ->
               http_mist.Buffered(json_response(status, failure))
             None ->
@@ -1415,7 +1431,7 @@ fn dispatch(
                     handler,
                     lease,
                     route,
-                    body,
+                    inbound.from_decoded(decoded),
                     context,
                     correlation,
                     scope,
@@ -1427,11 +1443,31 @@ fn dispatch(
   }
 }
 
+fn too_deep(
+  config: Config(context),
+  correlation: Correlation,
+) -> http_mist.Reply {
+  emit.http_rejected(400, telemetry.MalformedBody, correlation, config.label)
+  http_mist.Buffered(json_response(
+    400,
+    bit_array.from_string(
+      json.to_string(jsonrpc.error_to_json(
+        None,
+        jsonrpc.RpcError(
+          jsonrpc.invalid_request_code,
+          "JSON nesting exceeds the configured depth.",
+          None,
+        ),
+      )),
+    ),
+  ))
+}
+
 fn run(
   handler: Handler(context),
   lease: Lease(context),
   route: v2026.HttpRoute,
-  body: BitArray,
+  frame: reducer.Frame,
   context: context,
   correlation: Correlation,
   scope: request_owner.Scope,
@@ -1485,30 +1521,14 @@ fn run(
           let exchange = reducer.new_exchange_id()
           attach_runtime(broker, rt, exchange)
           case
-            runtime.send_frame(rt, exchange, context, body, Some(correlation))
+            runtime.send_decoded(
+              rt,
+              exchange,
+              context,
+              frame,
+              Some(correlation),
+            )
           {
-            Error(runtime.FrameTooDeep(_)) -> {
-              finish(broker, rt)
-              emit.http_rejected(
-                400,
-                telemetry.MalformedBody,
-                correlation,
-                config.label,
-              )
-              http_mist.Buffered(json_response(
-                400,
-                bit_array.from_string(
-                  json.to_string(jsonrpc.error_to_json(
-                    None,
-                    jsonrpc.RpcError(
-                      jsonrpc.invalid_request_code,
-                      "JSON nesting exceeds the configured depth.",
-                      None,
-                    ),
-                  )),
-                ),
-              ))
-            }
             Error(_) -> {
               finish(broker, rt)
               http_mist.Buffered(plain(
@@ -1571,7 +1591,7 @@ fn streamed(
       |> response.set_header("cache-control", "no-store")
       |> response.set_header("mcp-protocol-version", "2026-07-28")
       |> response.set_body(Nil),
-    next: fn(wait_ms) { next(broker, wait_ms) },
+    next: fn(wait_ms, closed) { next(broker, wait_ms, closed) },
     close: fn() { client_gone(broker) },
     keepalive_ms: keepalive_ms,
     write_budget: fn() { Ok(write_budget_ms) },
@@ -1587,9 +1607,9 @@ fn buffered(
 ) -> http_mist.Reply {
   let deadline = monotonic_ms() + timeout_ms
   case collect(broker, deadline, []) {
-    Collected(frames) -> {
+    Collected(frames, status) -> {
       finish(broker, rt)
-      http_mist.Buffered(respond_with_frames(frames))
+      http_mist.Buffered(respond(frames, status))
     }
     TooLate -> {
       finish(broker, rt)
@@ -1602,7 +1622,9 @@ fn buffered(
 }
 
 type Collection {
-  Collected(List(BitArray))
+  /// The frames, and the HTTP status of the last one when it was already
+  /// classified as the response.
+  Collected(frames: List(BitArray), status: Option(Int))
   TooLate
 }
 
@@ -1617,18 +1639,20 @@ fn collect(
   case remaining <= 0 {
     True -> TooLate
     False ->
-      case next(broker, int.min(remaining, poll_ms)) {
+      case next(broker, int.min(remaining, poll_ms), process.new_selector()) {
         http_mist.Idle -> collect(broker, deadline, frames)
+        // Nothing selects a closure here: the request owner watches it.
+        http_mist.Gone -> TooLate
         http_mist.Ended ->
           case frames {
             [] -> TooLate
-            _ -> Collected(list.reverse(frames))
+            _ -> Collected(list.reverse(frames), final_status(frames))
           }
         http_mist.Data(bytes) -> {
           let frames = [bytes, ..frames]
-          case v2026.is_response_frame(bytes) {
-            True -> Collected(list.reverse(frames))
-            False -> collect(broker, deadline, frames)
+          case v2026.response_status(bytes) {
+            Ok(status) -> Collected(list.reverse(frames), status)
+            Error(Nil) -> collect(broker, deadline, frames)
           }
         }
       }
@@ -1725,7 +1749,13 @@ fn deliver(
   }
 }
 
-fn next(broker: Broker(context), wait_ms: Int) -> http_mist.Event {
+// Waits for the broker's next event, or for `closed`, which a streaming
+// reader passes to learn that its client left while the stream was silent.
+fn next(
+  broker: Broker(context),
+  wait_ms: Int,
+  closed: process.Selector(Nil),
+) -> http_mist.Event {
   case process.subject_owner(broker) {
     Error(Nil) -> http_mist.Ended
     Ok(owner) -> {
@@ -1736,6 +1766,9 @@ fn next(broker: Broker(context), wait_ms: Int) -> http_mist.Event {
         process.new_selector()
         |> process.select(reply)
         |> process.select_specific_monitor(monitor, fn(_) { http_mist.Ended })
+        |> process.merge_selector(
+          process.map_selector(closed, fn(_) { http_mist.Gone }),
+        )
         |> process.selector_receive(wait_ms + hub_timeout)
       let _ = process.demonitor_process(monitor)
       result.unwrap(answer, http_mist.Ended)
@@ -1983,26 +2016,20 @@ fn valid_route_headers(
     Some(_), Error(Nil) -> False
     None, _ -> True
   }
-  case header("mcp-method") {
+  // `Mcp-Method` is compared as sent. `Mcp-Name` may also arrive in the
+  // Base64 form, which is decoded first. Neither is percent-decoded: a header
+  // that differs from the body after that is a mismatch.
+  let method_matches = case header("mcp-method") {
+    Ok(method) -> string.trim(method) == route.method
     Error(Nil) -> False
-    Ok(method) ->
-      case uri.percent_decode(string.trim(method)) {
-        Error(Nil) -> False
-        Ok(method) -> {
-          let name_matches = case route.name, header("mcp-name") {
-            Some(name), Ok(sent) ->
-              case uri.percent_decode(string.trim(sent)) {
-                Ok(sent) -> sent == name
-                Error(Nil) -> False
-              }
-            Some(_), Error(Nil) -> False
-            None, Error(Nil) -> True
-            None, Ok(_) -> False
-          }
-          method == route.method && name_matches && version_matches
-        }
-      }
   }
+  let name_matches = case route.name, header("mcp-name") {
+    Some(name), Ok(sent) -> header_value.decode(string.trim(sent)) == Ok(name)
+    Some(_), Error(Nil) -> False
+    None, Error(Nil) -> True
+    None, Ok(_) -> False
+  }
+  method_matches && name_matches && version_matches
 }
 
 // A property whose schema declares `x-mcp-header` must arrive both in the
@@ -2061,7 +2088,7 @@ fn parameter_header_matches(
           case argument, header {
             Error(Nil), Error(Nil) -> True
             Ok(value.String(expected)), Ok(raw) ->
-              decode_parameter_header(string.trim(raw)) == Ok(expected)
+              header_value.decode(string.trim(raw)) == Ok(expected)
             _, _ -> False
           }
         }
@@ -2071,31 +2098,25 @@ fn parameter_header_matches(
   }
 }
 
-@external(erlang, "relay_ffi", "decode_base64_strict")
-fn decode_base64_strict(encoded: String) -> Result(String, Nil)
-
-fn decode_parameter_header(raw: String) -> Result(String, Nil) {
-  let prefix = "=?base64?"
-  let suffix = "?="
-  case string.starts_with(raw, prefix) && string.ends_with(raw, suffix) {
-    True ->
-      raw
-      |> string.drop_start(string.length(prefix))
-      |> string.drop_end(string.length(suffix))
-      |> decode_base64_strict
-    False -> Ok(raw)
-  }
-}
-
 // --- responses ---------------------------------------------------------------
 
 fn respond_with_frames(frames: List(BitArray)) -> Response(BytesTree) {
+  respond(frames, final_status(list.reverse(frames)))
+}
+
+// The HTTP status of the newest frame, given newest first.
+fn final_status(newest_first: List(BitArray)) -> Option(Int) {
+  case newest_first {
+    [bytes, ..] -> v2026.http_response_status(bytes)
+    [] -> None
+  }
+}
+
+// Answers with the last frame under an HTTP status worked out earlier.
+fn respond(frames: List(BitArray), status: Option(Int)) -> Response(BytesTree) {
   case list.last(frames) {
     Error(Nil) -> plain(500, "Relay produced no response")
-    Ok(bytes) -> {
-      let status = option.unwrap(v2026.http_response_status(bytes), 200)
-      json_response(status, bytes)
-    }
+    Ok(bytes) -> json_response(option.unwrap(status, 200), bytes)
   }
 }
 

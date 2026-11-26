@@ -219,7 +219,10 @@ pub fn main() -> Nil {
 
   let exchange = reducer.new_exchange_id()
   let #(services, effects) =
-    reducer.step(services, reducer.Received(exchange, Nil, listen, None))
+    reducer.step(
+      services,
+      reducer.Received(exchange, Nil, reducer.decode(listen), None),
+    )
   let assert [reducer.Admitted(_, _), reducer.Write(_, ack)] = effects
   emit(
     "subscriptions_acknowledged",
@@ -297,7 +300,12 @@ fn deliver_frame(
   let #(state, effects) =
     reducer.step(
       state,
-      reducer.Received(reducer.new_exchange_id(), Nil, bytes, None),
+      reducer.Received(
+        reducer.new_exchange_id(),
+        Nil,
+        reducer.decode(bytes),
+        None,
+      ),
     )
   case effects {
     [reducer.Admitted(_, _), reducer.Write(_, bytes), reducer.Close(_)]

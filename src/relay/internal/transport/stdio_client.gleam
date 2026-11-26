@@ -1,6 +1,16 @@
 //// The client side of the stdio transport: one child process, one request
 //// at a time, newline framing, and listen streams read from the same pipe.
 ////
+//// A request belongs to its caller. The actor writes it only while the
+//// caller still waits: a request whose deadline passed, whose caller
+//// cancelled or whose caller exited before its turn is answered without
+//// being written. While a request is in flight the actor monitors its
+//// caller and cancels the request when the caller exits. The ids of
+//// requests given up in flight are remembered, so a response that crosses
+//// the cancellation on the pipe is dropped instead of being taken for the
+//// next request's answer. A wait for a notification serves requests that
+//// arrive meanwhile.
+////
 //// The command is held in a closure, so `string.inspect` and crash reports
 //// print a function reference instead of the executable and its arguments.
 
@@ -20,6 +30,11 @@ import relay/internal/stdio_frames.{
 
 const max_buffered_frames = 256
 
+// How many given-up request ids are remembered. Ids are unique per request,
+// so forgetting the oldest only matters for a response more than this many
+// cancellations late.
+const max_abandoned = 256
+
 /// Why a request failed.
 pub type Failure {
   /// No child is running: it never started or it exited earlier.
@@ -27,12 +42,18 @@ pub type Failure {
   /// Too many calls are already waiting for the child.
   Busy(limit: Int)
   TimedOut
+  /// The request's time ran out while it waited for its turn; it was never
+  /// written to the child.
+  TimedOutUnsent
   /// The child exited while the request was in flight.
   Exited
   /// The client was closed while the request was in flight.
   ClientClosed
   /// The caller cancelled the request; the child was told.
   Cancelled
+  /// The caller cancelled the request while it waited for its turn; it was
+  /// never written to the child.
+  CancelledUnsent
   TooLarge(limit: Int)
   Malformed(detail: String)
 }
@@ -42,18 +63,20 @@ pub opaque type Client {
 }
 
 type Message {
-  OpenPort(
-    command: fn() -> #(String, List(String)),
-    reply: Subject(Result(Nil, Nil)),
-  )
+  OpenPort(command: fn() -> Command, reply: Subject(Result(Nil, Nil)))
   Request(
     bytes: BitArray,
     id: String,
-    timeout_ms: Int,
+    /// Monotonic milliseconds after which the caller no longer waits.
+    deadline: Int,
     max_pending: Int,
     reply: Subject(Result(BitArray, Failure)),
   )
+  /// The caller of `id` gave up, whether the request is in flight, still
+  /// waiting or already answered.
   CancelInFlight(id: String)
+  /// The caller of the exchange in progress exited.
+  CallerDown
   Subscribe(
     bytes: BitArray,
     id: String,
@@ -82,8 +105,21 @@ type State {
     frames: List(BitArray),
     notifications: List(BitArray),
     closed_subscriptions: List(String),
+    /// Ids of requests whose caller gave up, newest first, at most
+    /// `max_abandoned`.
+    abandoned: List(String),
     subject: Subject(Message),
     max_frame_bytes: Int,
+  )
+}
+
+/// What to launch: the executable, its arguments, and the variables added
+/// to the child's allow-listed environment.
+pub type Command {
+  Command(
+    executable: String,
+    arguments: List(String),
+    environment: List(#(String, String)),
   )
 }
 
@@ -91,6 +127,7 @@ type State {
 fn start_port(
   executable: String,
   args: List(String),
+  environment: List(#(String, String)),
   subject: Subject(Message),
 ) -> Result(Pid, String)
 
@@ -106,10 +143,11 @@ fn monotonic_ms() -> Int
 @external(erlang, "relay_ffi", "mailbox_size")
 fn mailbox_size(pid: Pid) -> Int
 
-/// Starts the child. `command` returns the executable and its arguments;
-/// the executable is launched directly, never through a shell.
+/// Starts the child. `command` returns what to launch; the executable is
+/// launched directly, never through a shell, with an allow-listed
+/// environment and the command's own variables.
 pub fn connect(
-  command: fn() -> #(String, List(String)),
+  command: fn() -> Command,
   timeout_ms: Int,
   max_frame_bytes: Int,
 ) -> Result(Client, Nil) {
@@ -121,6 +159,7 @@ pub fn connect(
         frames: [],
         notifications: [],
         closed_subscriptions: [],
+        abandoned: [],
         subject: subject,
         max_frame_bytes: max_frame_bytes,
       )
@@ -168,9 +207,9 @@ pub fn request(
     _, True -> Error(Cancelled)
     False, False -> {
       let reply = process.new_subject()
-      process.send(subject, Request(bytes, id, timeout_ms, max_pending, reply))
-      let deadline = monotonic_ms() + timeout_ms + 1000
-      await_reply(subject, reply, id, deadline, cancelled)
+      let deadline = monotonic_ms() + timeout_ms
+      process.send(subject, Request(bytes, id, deadline, max_pending, reply))
+      await_reply(subject, reply, id, deadline + 1000, cancelled)
       |> result.try(within(_, max_bytes))
     }
   }
@@ -193,6 +232,7 @@ fn await_reply(
           process.send(subject, CancelInFlight(id))
           case process.receive(reply, 1000) {
             Ok(Ok(frame)) -> Ok(frame)
+            Ok(Error(CancelledUnsent)) -> Error(CancelledUnsent)
             _ -> Error(Cancelled)
           }
         }
@@ -291,8 +331,8 @@ fn handle_message(
 ) -> actor.Next(State, Message) {
   case message {
     OpenPort(command, reply) -> {
-      let #(executable, args) = command()
-      case start_port(executable, args, state.subject) {
+      let Command(executable, args, environment) = command()
+      case start_port(executable, args, environment, state.subject) {
         Error(_) -> {
           process.send(reply, Error(Nil))
           actor.continue(state)
@@ -303,21 +343,18 @@ fn handle_message(
         }
       }
     }
-    Request(bytes, id, timeout_ms, _, reply) ->
-      case state.port {
-        None -> {
-          process.send(reply, Error(NotRunning))
+    Request(bytes, id, deadline, _, reply) ->
+      case admit(state, id, deadline, reply) {
+        Error(#(failure, state)) -> {
+          process.send(reply, Error(failure))
           actor.continue(state)
         }
-        Some(port) -> {
-          send_command(port, bit_array.append(bytes, <<"\n">>))
-          let deadline = monotonic_ms() + timeout_ms
+        Ok(#(port, caller)) ->
           settle(
             state,
-            await_response(state, deadline, id, []),
+            exchange(state, port, caller, bytes, id, deadline, []),
             reply_to(reply),
           )
-        }
       }
     Subscribe(bytes, id, timeout_ms, reply) ->
       case state.port {
@@ -330,7 +367,7 @@ fn handle_message(
           let deadline = monotonic_ms() + timeout_ms
           settle(
             state,
-            await_notification(state, deadline, id, []),
+            await_notification(state, deadline, id, [], mailbox(state)),
             reply_to(reply),
           )
         }
@@ -343,7 +380,17 @@ fn handle_message(
         }
         False -> {
           let deadline = monotonic_ms() + timeout_ms
-          case await_notification(state, deadline, id, []) {
+          // A listener that exits stops its wait, like a wait that ran out.
+          let #(selector, monitor) = case process.subject_owner(reply) {
+            Ok(listener) -> {
+              let monitor = process.monitor(listener)
+              #(watching(state, monitor), Some(monitor))
+            }
+            Error(Nil) -> #(mailbox(state), None)
+          }
+          let outcome = await_notification(state, deadline, id, [], selector)
+          option.map(monitor, process.demonitor_process)
+          case outcome {
             Answered(frame, next, queued) -> {
               process.send(reply, Ok(Some(frame)))
               requeue(next, queued)
@@ -381,8 +428,10 @@ fn handle_message(
         ),
       )
     }
-    // A cancellation that arrives after its response was sent.
-    CancelInFlight(_) -> actor.continue(state)
+    // The request is still waiting in the mailbox, or was already answered.
+    CancelInFlight(id) -> actor.continue(abandon(state, id))
+    // The monitor of a finished exchange; nothing is in progress.
+    CallerDown -> actor.continue(state)
     ClientPortMessage(PortData(chunk)) ->
       case collect(state, chunk) {
         Ok(state) -> actor.continue(state)
@@ -452,9 +501,183 @@ fn reject_queued(queued: List(Message)) -> Nil {
         process.send(reply, Error(ClientClosed))
       CancelSubscription(_, reply) -> process.send(reply, Nil)
       CloseClient(reply) -> process.send(reply, Nil)
-      CancelInFlight(_) | ClientPortMessage(_) -> Nil
+      CancelInFlight(_) | CallerDown | ClientPortMessage(_) -> Nil
     }
   })
+}
+
+// Decides whether a request is still worth writing when its turn comes.
+// `Ok` carries the child and the caller to monitor.
+fn admit(
+  state: State,
+  id: String,
+  deadline: Int,
+  reply: Subject(Result(BitArray, Failure)),
+) -> Result(#(Pid, Pid), #(Failure, State)) {
+  let caller = case process.subject_owner(reply) {
+    Ok(caller) ->
+      case process.is_alive(caller) {
+        True -> Ok(caller)
+        False -> Error(Nil)
+      }
+    Error(Nil) -> Error(Nil)
+  }
+  case state.port, list.contains(state.abandoned, id), caller {
+    None, _, _ -> Error(#(NotRunning, state))
+    _, True, _ | _, _, Error(Nil) ->
+      Error(#(
+        CancelledUnsent,
+        State(
+          ..state,
+          abandoned: list.filter(state.abandoned, fn(found) { found != id }),
+        ),
+      ))
+    Some(port), False, Ok(caller) ->
+      case monotonic_ms() >= deadline {
+        True -> Error(#(TimedOutUnsent, state))
+        False -> Ok(#(port, caller))
+      }
+  }
+}
+
+// Writes one admitted request and waits for its response while monitoring
+// its caller.
+fn exchange(
+  state: State,
+  port: Pid,
+  caller: Pid,
+  bytes: BitArray,
+  id: String,
+  deadline: Int,
+  queued: List(Message),
+) -> Await {
+  send_command(port, bit_array.append(bytes, <<"\n">>))
+  let monitor = process.monitor(caller)
+  let outcome =
+    await_response(state, deadline, id, queued, watching(state, monitor))
+  process.demonitor_process(monitor)
+  outcome
+}
+
+fn mailbox(state: State) -> process.Selector(Message) {
+  process.new_selector() |> process.select(state.subject)
+}
+
+fn watching(
+  state: State,
+  monitor: process.Monitor,
+) -> process.Selector(Message) {
+  mailbox(state)
+  |> process.select_specific_monitor(monitor, fn(_) { CallerDown })
+}
+
+// Removes the queued request with this id, returning its reply subject.
+fn take_request(
+  queued: List(Message),
+  id: String,
+) -> Result(#(Subject(Result(BitArray, Failure)), List(Message)), Nil) {
+  case
+    list.split_while(queued, fn(message) {
+      case message {
+        Request(id: found, ..) -> found != id
+        _ -> True
+      }
+    })
+  {
+    #(before, [Request(reply: reply, ..), ..after]) ->
+      Ok(#(reply, list.append(before, after)))
+    _ -> Error(Nil)
+  }
+}
+
+fn abandon(state: State, id: String) -> State {
+  case list.contains(state.abandoned, id) {
+    True -> state
+    False ->
+      State(
+        ..state,
+        abandoned: list.take([id, ..state.abandoned], max_abandoned),
+      )
+  }
+}
+
+// Serves, in arrival order, the requests that queued up during a wait for a
+// notification, then resumes that wait.
+fn serve_queued(
+  state: State,
+  queued: List(Message),
+  resume: fn(State, List(Message)) -> Await,
+) -> Await {
+  // `queued` is newest first; take the oldest request out of it.
+  let #(earlier, from_request) =
+    list.reverse(queued)
+    |> list.split_while(fn(message) {
+      case message {
+        Request(..) -> False
+        _ -> True
+      }
+    })
+  case from_request {
+    [Request(bytes, id, deadline, _, reply), ..later] ->
+      serve(
+        state,
+        bytes,
+        id,
+        deadline,
+        reply,
+        list.reverse(list.append(earlier, later)),
+        resume,
+      )
+    _ -> resume(state, queued)
+  }
+}
+
+// Serves one request inside a wait for a notification. A failure that
+// costs the child also ends the wait.
+fn serve(
+  state: State,
+  bytes: BitArray,
+  id: String,
+  deadline: Int,
+  reply: Subject(Result(BitArray, Failure)),
+  queued: List(Message),
+  resume: fn(State, List(Message)) -> Await,
+) -> Await {
+  case admit(state, id, deadline, reply) {
+    Error(#(failure, state)) -> {
+      process.send(reply, Error(failure))
+      serve_queued(state, queued, resume)
+    }
+    Ok(#(port, caller)) ->
+      case exchange(state, port, caller, bytes, id, deadline, queued) {
+        Answered(frame, next, queued) -> {
+          process.send(reply, Ok(frame))
+          serve_queued(next, queued, resume)
+        }
+        Failed(Cancelled, next, queued) -> {
+          process.send(reply, Error(Cancelled))
+          serve_queued(next, queued, resume)
+        }
+        // The request's own deadline passed, not the notification wait's:
+        // give the request up as a cancelled one and resume the wait.
+        Failed(TimedOut, next, queued) -> {
+          case next.port {
+            Some(port) -> send_command(port, cancellation_frame(id))
+            None -> Nil
+          }
+          process.send(reply, Error(TimedOut))
+          serve_queued(abandon(next, id), queued, resume)
+        }
+        Failed(failure, ..) as failed -> {
+          process.send(reply, Error(failure))
+          failed
+        }
+        CloseRequested(failure, ..) as closing -> {
+          process.send(reply, Error(failure))
+          closing
+        }
+      }
+  }
 }
 
 fn await_response(
@@ -462,6 +685,7 @@ fn await_response(
   deadline: Int,
   id: String,
   queued: List(Message),
+  selector: process.Selector(Message),
 ) -> Await {
   case state.frames {
     [frame, ..rest] ->
@@ -469,16 +693,28 @@ fn await_response(
         Error(detail) -> Failed(Malformed(detail), state, queued)
         Ok(Some(found)) if found == id ->
           Answered(frame, State(..state, frames: rest), queued)
-        Ok(Some(_)) ->
-          Failed(
-            Malformed("the response id did not match the request"),
-            state,
-            queued,
-          )
+        Ok(Some(found)) ->
+          case list.contains(state.abandoned, found) {
+            // The answer to a request its caller gave up on.
+            True ->
+              await_response(
+                forget(State(..state, frames: rest), found),
+                deadline,
+                id,
+                queued,
+                selector,
+              )
+            False ->
+              Failed(
+                Malformed("the response id did not match the request"),
+                state,
+                queued,
+              )
+          }
         Ok(None) ->
           case enqueue_notification(State(..state, frames: rest), frame) {
             Error(detail) -> Failed(Malformed(detail), state, queued)
-            Ok(next) -> await_response(next, deadline, id, queued)
+            Ok(next) -> await_response(next, deadline, id, queued, selector)
           }
       }
     [] ->
@@ -486,9 +722,26 @@ fn await_response(
         state,
         deadline,
         queued,
-        fn(next, queued) { await_response(next, deadline, id, queued) },
+        fn(next, queued) {
+          await_response(next, deadline, id, queued, selector)
+        },
         Some(id),
+        selector,
       )
+  }
+}
+
+fn forget(state: State, id: String) -> State {
+  State(
+    ..state,
+    abandoned: list.filter(state.abandoned, fn(found) { found != id }),
+  )
+}
+
+fn is_abandoned_response(state: State, frame: BitArray) -> Bool {
+  case response_id(frame) {
+    Ok(Some(found)) -> list.contains(state.abandoned, found)
+    _ -> False
   }
 }
 
@@ -497,6 +750,7 @@ fn await_notification(
   deadline: Int,
   id: String,
   queued: List(Message),
+  selector: process.Selector(Message),
 ) -> Await {
   case take_notification(state.notifications, id) {
     Ok(#(frame, rest)) ->
@@ -507,9 +761,23 @@ fn await_notification(
           case belongs_to(frame, id) {
             True -> Answered(frame, State(..state, frames: rest), queued)
             False ->
-              case enqueue_notification(State(..state, frames: rest), frame) {
-                Error(detail) -> Failed(Malformed(detail), state, queued)
-                Ok(next) -> await_notification(next, deadline, id, queued)
+              case is_abandoned_response(state, frame) {
+                True ->
+                  await_notification(
+                    State(..state, frames: rest),
+                    deadline,
+                    id,
+                    queued,
+                    selector,
+                  )
+                False ->
+                  case
+                    enqueue_notification(State(..state, frames: rest), frame)
+                  {
+                    Error(detail) -> Failed(Malformed(detail), state, queued)
+                    Ok(next) ->
+                      await_notification(next, deadline, id, queued, selector)
+                  }
               }
           }
         [] ->
@@ -517,27 +785,33 @@ fn await_notification(
             state,
             deadline,
             queued,
-            fn(next, queued) { await_notification(next, deadline, id, queued) },
+            fn(next, queued) {
+              await_notification(next, deadline, id, queued, selector)
+            },
             None,
+            selector,
           )
       }
   }
 }
 
-// Waits for the next message while a request or stream waits. Messages for
-// other calls are queued and replayed afterwards.
+// Waits for the next message while a request or stream waits. `in_flight`
+// is the request awaiting its response, or `None` during a wait for a
+// notification. Requests that arrive during a response wait are queued and
+// replayed afterwards; a wait for a notification serves them at once.
 fn receive(
   state: State,
   deadline: Int,
   queued: List(Message),
   continue: fn(State, List(Message)) -> Await,
   in_flight: Option(String),
+  selector: process.Selector(Message),
 ) -> Await {
   let remaining = deadline - monotonic_ms()
   case remaining <= 0 {
     True -> Failed(TimedOut, state, queued)
     False ->
-      case process.receive(state.subject, remaining) {
+      case process.selector_receive(selector, remaining) {
         Error(Nil) -> Failed(TimedOut, state, queued)
         Ok(ClientPortMessage(PortData(chunk))) ->
           case collect(state, chunk) {
@@ -557,23 +831,75 @@ fn receive(
                 Some(port) -> send_command(port, cancellation_frame(id))
                 None -> Nil
               }
-              Failed(Cancelled, state, queued)
+              Failed(Cancelled, abandon(state, id), queued)
             }
-            _ -> receive(state, deadline, queued, continue, in_flight)
+            // A request that is still waiting leaves the queue unwritten;
+            // the id of one already answered is remembered.
+            _ ->
+              case take_request(queued, target) {
+                Ok(#(reply, queued)) -> {
+                  process.send(reply, Error(CancelledUnsent))
+                  receive(
+                    state,
+                    deadline,
+                    queued,
+                    continue,
+                    in_flight,
+                    selector,
+                  )
+                }
+                Error(Nil) ->
+                  receive(
+                    abandon(state, target),
+                    deadline,
+                    queued,
+                    continue,
+                    in_flight,
+                    selector,
+                  )
+              }
           }
+        Ok(CallerDown) ->
+          case in_flight {
+            Some(id) -> {
+              case state.port {
+                Some(port) -> send_command(port, cancellation_frame(id))
+                None -> Nil
+              }
+              Failed(Cancelled, abandon(state, id), queued)
+            }
+            None -> Failed(TimedOut, state, queued)
+          }
+        Ok(Request(bytes, id, request_deadline, _, reply))
+          if in_flight == None
+        -> serve(state, bytes, id, request_deadline, reply, queued, continue)
         // A call that arrives while another is in flight waits in `queued`,
         // out of the mailbox the caller's check reads: bound it here.
         Ok(Request(max_pending: max_pending, reply: reply, ..) as request) ->
           case waiting_requests(queued) >= max_pending {
             True -> {
               process.send(reply, Error(Busy(max_pending)))
-              receive(state, deadline, queued, continue, in_flight)
+              receive(state, deadline, queued, continue, in_flight, selector)
             }
             False ->
-              receive(state, deadline, [request, ..queued], continue, in_flight)
+              receive(
+                state,
+                deadline,
+                [request, ..queued],
+                continue,
+                in_flight,
+                selector,
+              )
           }
         Ok(other) ->
-          receive(state, deadline, [other, ..queued], continue, in_flight)
+          receive(
+            state,
+            deadline,
+            [other, ..queued],
+            continue,
+            in_flight,
+            selector,
+          )
       }
   }
 }
@@ -636,6 +962,7 @@ fn reset(state: State) -> State {
     frames: [],
     notifications: [],
     closed_subscriptions: [],
+    abandoned: [],
   )
 }
 
