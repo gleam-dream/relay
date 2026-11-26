@@ -40,9 +40,9 @@ Do not print to standard output from processes started before `serve`, and do no
 
 ## `stdio.Config` is a record
 
-**What changed.** `stdio.Config` is a public record with two fields, `runtime` and `write_timeout`. `stdio.with_runtime` and `stdio.with_chunk_size` are removed, and so is `StdioError.InvalidChunkSize`. A write to standard output that takes longer than `write_timeout` (default 5 s) ends `serve` with `StdoutBroken`. A request that arrives while the runtime's exchange limit is reached now gets JSON-RPC error `-32000` instead of no answer.
+**What changed.** `stdio.Config` is a public record with three fields, `runtime`, `write_timeout` and `max_unframed_bytes`. `stdio.with_runtime` and `stdio.with_chunk_size` are removed, and so is `StdioError.InvalidChunkSize`. A write to standard output that takes longer than `write_timeout` (default 5 s) ends `serve` with `StdoutBroken`. Standard input that the server has read but not yet framed is bounded by `max_unframed_bytes` (default 4 MiB, four times the default frame limit): past it the server stops reading and `serve` returns `UnframedInputTooLarge`. The limit must be at least the runtime's frame limit and 64 KiB, else `serve` returns `InvalidUnframedLimit` before any I/O. A request that arrives while the runtime's exchange limit is reached now gets JSON-RPC error `-32000` instead of no answer.
 
-**Why.** A parent that stopped reading held the server forever. The chunk size no longer bounded anything, because the port delivers what each read returns.
+**Why.** A parent that stopped reading held the server forever, and a parent that kept writing while a slow write held the server grew the server's memory without limit. The chunk size no longer bounded anything, because the port delivers what each read returns.
 
 **What to do.**
 
@@ -58,6 +58,12 @@ Delete every `with_chunk_size` call. Set `write_timeout` when your parent may re
 
 ```gleam
 stdio.Config(..stdio.config(), write_timeout: duration.seconds(30))
+```
+
+Raise `max_unframed_bytes` when you raise the runtime's frame limit above 1 MiB, or when the parent sends large bursts:
+
+```gleam
+stdio.Config(..stdio.config(), max_unframed_bytes: 16 * 1024 * 1024)
 ```
 
 ## Stdio children get an allow-listed environment
@@ -124,7 +130,7 @@ A transport that needs the decoded request before submitting it can call `reduce
 An exhaustive `case` needs a branch for each:
 
 - `client.ConfigField`: `ListenTimeout` and `Environment`.
-- `stdio.StdioError`: `InvalidWriteTimeout(timeout)` and `StdinOwnedByVm`. `InvalidChunkSize` is removed.
+- `stdio.StdioError`: `InvalidWriteTimeout(timeout)`, `InvalidUnframedLimit(bytes)`, `UnframedInputTooLarge(limit)` and `StdinOwnedByVm`. `InvalidChunkSize` is removed.
 
 ## Wire changes
 

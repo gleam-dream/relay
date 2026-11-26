@@ -2,7 +2,7 @@
 
 > **Relay 0.3.0 is a breaking release.** Read the [migration guide](https://github.com/gleam-dream/relay/blob/main/docs/MIGRATION.md) before you upgrade from 0.2.
 >
-> - A stdio server's VM must start with `-noinput`, and `stdio.Config` is a record with `runtime` and `write_timeout`.
+> - A stdio server's VM must start with `-noinput`, and `stdio.Config` is a record with `runtime`, `write_timeout` and `max_unframed_bytes` (standard input not yet framed is bounded, 4 MiB by default).
 > - A stdio child launched by the client gets an allow-listed environment; add variables with `client.with_environment`.
 > - Invalid tool arguments return a tool error (`ToolFailed`) with the failing path instead of JSON-RPC `-32602`; a message your input codec wrote goes only to the `arguments_rejected` telemetry event, never to the caller.
 > - Over HTTP, `next_notification`'s `Ok(None)` means only that the wait ended, and a `listen` stream ends at the listen timeout (1 h); ordinary calls keep the 30 s request timeout.

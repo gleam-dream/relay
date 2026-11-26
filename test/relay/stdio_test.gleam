@@ -142,6 +142,51 @@ pub fn stalled_stdout_stops_the_server_with_a_typed_error_test() {
   assert string.contains(report, "exit=1")
 }
 
+@external(erlang, "relay_stdio_input_ffi", "write_from_any_process")
+fn write_from_any_process(child: Dynamic, bytes: BitArray) -> Nil
+
+const backlog_runner =
+  "erl -pa build/dev/erlang/*/ebin -noinput -run relay_stdio_backlog_runner main"
+
+pub fn unframed_input_past_its_limit_stops_the_server_test() {
+  // Standard output stalls on a large answer, so the server stops framing
+  // while the parent keeps writing requests.
+  let child =
+    spawn_child(
+      "sh -c '{ { "
+      <> backlog_runner
+      <> " 2>&3; echo \"exit=$?\" >&3; } | sleep 20; } 3>&1'",
+    )
+  send_to_child(
+    child,
+    request_line("big", "tools/call", [
+      #("name", json.string("big")),
+      #("arguments", json.object([#("bytes", json.int(2_000_000))])),
+    ]),
+  )
+  process.sleep(200)
+  // 1 MiB of requests while the answer's write is stalled, from another
+  // process: once the server stops reading, a write to its full input pipe
+  // blocks.
+  process.spawn_unlinked(fn() {
+    list.repeat(Nil, 16)
+    |> list.each(fn(_) {
+      write_from_any_process(
+        child,
+        string.repeat("{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n", 1900)
+          |> bit_array.from_string,
+      )
+    })
+  })
+  let report = read_until(child, "exit=", 4000, "")
+  close_child(child)
+  assert string.contains(
+    report,
+    "stopped: standard input held more unframed bytes than the limit",
+  )
+  assert string.contains(report, "exit=1")
+}
+
 pub fn request_beyond_the_exchange_limit_gets_an_error_response_test() {
   let child = spawn_child(pressure_runner)
   send_to_child(
@@ -285,6 +330,30 @@ pub fn stdio_refuses_to_serve_while_the_vm_reads_stdin_test() {
   let assert Error(stdio.StdinOwnedByVm) = stdio.serve(server.new([]), Nil)
   assert stdio.describe_error(stdio.StdinOwnedByVm)
     == "the VM reads standard input itself; start it with -noinput"
+}
+
+pub fn unframed_limit_below_a_frame_or_a_pipe_read_is_refused_test() {
+  let service = server.new([])
+  assert stdio.config().max_unframed_bytes == 4_194_304
+  // Below the frame limit: one frame could not wait whole.
+  let assert Error(stdio.InvalidUnframedLimit(1_000_000)) =
+    stdio.serve_with(
+      service,
+      Nil,
+      stdio.Config(..stdio.config(), max_unframed_bytes: 1_000_000),
+    )
+  // Below one pipe read, with a small frame limit.
+  let small = runtime.config() |> runtime.with_max_frame_bytes(1024)
+  let assert Error(stdio.InvalidUnframedLimit(4096)) =
+    stdio.serve_with(
+      service,
+      Nil,
+      stdio.Config(
+        runtime: small,
+        write_timeout: duration.seconds(5),
+        max_unframed_bytes: 4096,
+      ),
+    )
 }
 
 pub fn stdio_rejects_invalid_settings_before_io_test() {

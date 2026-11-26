@@ -42,6 +42,7 @@ pub fn main() -> Nil {
     stdio.Config(
       runtime: runtime.config() |> runtime.with_max_live_exchanges(1),
       write_timeout: duration.milliseconds(300),
+      max_unframed_bytes: stdio.config().max_unframed_bytes,
     )
   case stdio.serve_with(server.new(tools()), Nil, config) {
     Ok(Nil) -> halt(0)

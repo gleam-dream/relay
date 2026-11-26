@@ -41,9 +41,10 @@ design kept two readers, the I/O server by default and the port under
 - Every stdio server launch passes `-noinput`, for example
   `ERL_FLAGS=-noinput`. A launch without it fails at once with a typed error
   that names the flag.
-- A port cannot be paused. Input the server has not framed yet waits in the
-  reader's mailbox, so a parent that writes faster than the server reads is
-  not held back by the pipe. The parent is trusted.
+- A port cannot be paused, so the pipe does not hold back a parent that
+  writes faster than the server frames. [ADR 0019](0019-bound-unframed-stdio-input.md)
+  supersedes the earlier choice to let that input wait unbounded: the server
+  stops when the unframed input passes a limit.
 - The logger change lasts for the rest of the VM's life. Processes started
   before `serve` keep their group leader and must not print to standard
   output; `erlang:display` writes to the descriptor directly and is outside
@@ -64,5 +65,4 @@ over OS pipes:
 - `log_and_print_output_while_serving_stays_off_stdout_test`: logger output
   and handler `io` output reach standard error, never standard output.
 
-No test bounds input that waits in the reader's mailbox, because the
-consequences above leave it unbounded.
+ADR 0019 lists the tests for the bound on input not yet framed.

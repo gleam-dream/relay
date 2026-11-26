@@ -35,6 +35,7 @@
 //// | --- | --- |
 //// | `runtime`: frame, depth, handler limits | `relay/runtime.config()` |
 //// | `write_timeout`: one write to standard output | 5 s, then `StdoutBroken` |
+//// | `max_unframed_bytes`: standard input read but not yet framed | 4 MiB, then `UnframedInputTooLarge` |
 ////
 //// ## Output pressure
 ////
@@ -71,12 +72,24 @@ pub type Config {
     /// longer counts as broken output and `serve` stops with
     /// `StdoutBroken`. At least 1 ms.
     write_timeout: Duration,
+    /// How many bytes of standard input may wait unframed, read from the
+    /// pipe but not yet framed and submitted. Input arrives as fast as the
+    /// parent writes it, also while a slow write holds the server, so past
+    /// this limit `serve` stops reading and returns `UnframedInputTooLarge`.
+    /// At least the runtime's frame limit and 64 KiB, the size of one pipe
+    /// read.
+    max_unframed_bytes: Int,
   )
 }
 
-/// The default runtime limits and a 5 s write timeout.
+/// The default runtime limits, a 5 s write timeout, and 4 MiB of unframed
+/// input, four times the default frame limit.
 pub fn config() -> Config {
-  Config(runtime: runtime.config(), write_timeout: duration.seconds(5))
+  Config(
+    runtime: runtime.config(),
+    write_timeout: duration.seconds(5),
+    max_unframed_bytes: 4_194_304,
+  )
 }
 
 /// Why `serve` stopped with an error.
@@ -84,6 +97,12 @@ pub type StdioError {
   InvalidRuntimeConfig(field: runtime.ConfigField)
   /// The write timeout is shorter than 1 ms.
   InvalidWriteTimeout(timeout: Duration)
+  /// `max_unframed_bytes` is below the runtime's frame limit or 64 KiB.
+  InvalidUnframedLimit(bytes: Int)
+  /// More than `max_unframed_bytes` of standard input waited unframed.
+  /// Serving stopped reading at once; the input after the limit is not
+  /// read.
+  UnframedInputTooLarge(limit: Int)
   /// The VM reads standard input itself because it was started without
   /// `-noinput`.
   StdinOwnedByVm
@@ -102,6 +121,10 @@ pub fn describe_error(error: StdioError) -> String {
   case error {
     InvalidRuntimeConfig(_) -> "a stdio runtime setting is out of range"
     InvalidWriteTimeout(_) -> "the stdio write timeout must be at least 1 ms"
+    InvalidUnframedLimit(_) ->
+      "the unframed input limit must be at least the frame limit and 64 KiB"
+    UnframedInputTooLarge(_) ->
+      "standard input held more unframed bytes than the limit"
     StdinOwnedByVm ->
       "the VM reads standard input itself; start it with -noinput"
     ReadFailed -> "standard input could not be read"
@@ -154,19 +177,38 @@ pub fn serve_with(
       }
     }),
   )
+  use _ <- result.try(
+    case
+      config.max_unframed_bytes >= runtime.max_frame_bytes(runtime_config)
+      && config.max_unframed_bytes >= min_unframed_bytes
+    {
+      True -> Ok(Nil)
+      False -> Error(InvalidUnframedLimit(config.max_unframed_bytes))
+    },
+  )
   use _ <- result.try(reserve_stdio() |> result.replace_error(StdinOwnedByVm))
   let previous_leader = lead_output_to_stderr()
   let outcome =
-    serve_reserved(server, context, runtime_config, write_timeout_ms)
+    serve_reserved(
+      server,
+      context,
+      runtime_config,
+      write_timeout_ms,
+      config.max_unframed_bytes,
+    )
   restore_group_leader(previous_leader)
   outcome
 }
+
+// One read from a pipe returns at most this much.
+const min_unframed_bytes = 65_536
 
 fn serve_reserved(
   server: Server(context),
   context: context,
   runtime_config: runtime.Config,
   write_timeout_ms: Int,
+  max_unframed_bytes: Int,
 ) -> Result(Nil, StdioError) {
   use writer <- result.try(
     stdio_frames.start_writer(write_stdout, write_timeout_ms)
@@ -195,9 +237,9 @@ fn serve_reserved(
     Ok(rt) -> {
       let framer =
         stdio_frames.new_framer(runtime.max_frame_bytes(runtime_config))
-      let reader = start_reader()
+      let reader = start_reader(max_unframed_bytes)
       let outcome = read_loop(rt, context, reader, writer, framer, write_errors)
-      process.kill(reader.0)
+      process.kill(reader.pid)
       runtime.close(rt)
       runtime.stop(rt)
       stdio_frames.stop_writer(writer)
@@ -211,58 +253,102 @@ fn serve_reserved(
 }
 
 type Signal {
-  Stdin(ReadOutcome)
+  Stdin(Input)
   WriteFailed(StdioError)
   ReaderDown
 }
 
-// The reader owns the standard input port; the port closes when it exits.
-fn start_reader() -> #(Pid, Subject(ReadOutcome)) {
-  let subject = process.new_subject()
-  let pid = process.spawn_unlinked(fn() { read_forever(subject) })
-  #(pid, subject)
+// What the reader sends the serving process.
+type Input {
+  Read(ReadOutcome)
+  /// More than the limit waited unframed; the reader has stopped.
+  Overflowed(limit: Int)
 }
 
-fn read_forever(subject: Subject(ReadOutcome)) -> Nil {
-  let outcome = read_stdin()
-  process.send(subject, outcome)
-  case outcome {
-    stdio_frames.ReadChunk(_) -> read_forever(subject)
-    stdio_frames.ReadEof | stdio_frames.ReadFailed(_) -> Nil
+type Reader {
+  Reader(pid: Pid, input: Subject(Input), framed: Subject(Int))
+}
+
+// The reader owns the standard input port; the port closes when it exits.
+// It counts the bytes it has sent and the serving process has not yet
+// reported framed, and stops reading when they pass `limit`, so the input
+// waiting in either mailbox stays bounded.
+fn start_reader(limit: Int) -> Reader {
+  let input = process.new_subject()
+  let ready = process.new_subject()
+  let pid =
+    process.spawn_unlinked(fn() {
+      let framed = process.new_subject()
+      process.send(ready, framed)
+      read_forever(input, framed, 0, limit)
+    })
+  let framed = process.receive_forever(ready)
+  Reader(pid, input, framed)
+}
+
+fn read_forever(
+  input: Subject(Input),
+  framed: Subject(Int),
+  unframed: Int,
+  limit: Int,
+) -> Nil {
+  case read_stdin() {
+    stdio_frames.ReadChunk(chunk) as outcome -> {
+      let unframed =
+        subtract_framed(framed, unframed) + bit_array.byte_size(chunk)
+      case unframed > limit {
+        True -> process.send(input, Overflowed(limit))
+        False -> {
+          process.send(input, Read(outcome))
+          read_forever(input, framed, unframed, limit)
+        }
+      }
+    }
+    outcome -> process.send(input, Read(outcome))
+  }
+}
+
+fn subtract_framed(framed: Subject(Int), unframed: Int) -> Int {
+  case process.receive(framed, 0) {
+    Ok(bytes) -> subtract_framed(framed, unframed - bytes)
+    Error(Nil) -> unframed
   }
 }
 
 fn read_loop(
   rt: Runtime(context),
   context: context,
-  reader: #(Pid, Subject(ReadOutcome)),
+  reader: Reader,
   writer: Writer,
   framer: Framer,
   write_errors: Subject(StdioError),
 ) -> Result(Nil, StdioError) {
-  let monitor = process.monitor(reader.0)
+  let monitor = process.monitor(reader.pid)
   let selector =
     process.new_selector()
-    |> process.select_map(reader.1, Stdin)
+    |> process.select_map(reader.input, Stdin)
     |> process.select_map(write_errors, WriteFailed)
     |> process.select_specific_monitor(monitor, fn(_) { ReaderDown })
-  loop(rt, context, writer, framer, selector)
+  loop(rt, context, reader, writer, framer, selector)
 }
 
 fn loop(
   rt: Runtime(context),
   context: context,
+  reader: Reader,
   writer: Writer,
   framer: Framer,
   selector: process.Selector(Signal),
 ) -> Result(Nil, StdioError) {
   case process.selector_receive_forever(selector) {
-    Stdin(stdio_frames.ReadChunk(chunk)) -> {
+    Stdin(Read(stdio_frames.ReadChunk(chunk))) -> {
       let #(framer, frames) = stdio_frames.feed_framer(framer, chunk)
       use _ <- result.try(submit(rt, context, writer, frames))
-      loop(rt, context, writer, framer, selector)
+      process.send(reader.framed, bit_array.byte_size(chunk))
+      loop(rt, context, reader, writer, framer, selector)
     }
-    Stdin(stdio_frames.ReadEof) ->
+    Stdin(Overflowed(limit)) -> Error(UnframedInputTooLarge(limit))
+    Stdin(Read(stdio_frames.ReadEof)) ->
       case stdio_frames.finish_framer(framer) {
         [InvalidTrailingBytes(rest), ..] -> {
           emit.frame_rejected(0, telemetry.TrailingBytes, None)
@@ -270,7 +356,7 @@ fn loop(
         }
         _ -> Ok(Nil)
       }
-    Stdin(stdio_frames.ReadFailed(_)) -> Error(ReadFailed)
+    Stdin(Read(stdio_frames.ReadFailed(_))) -> Error(ReadFailed)
     WriteFailed(error) -> Error(error)
     ReaderDown -> Error(ReadFailed)
   }
