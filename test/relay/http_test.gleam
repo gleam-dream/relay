@@ -984,7 +984,8 @@ pub fn mounted_handler_refuses_deep_json_test() {
   response.status |> should.equal(400)
   string.contains(testing.body_text(response), "-32600") |> should.be_true
 
-  // Within the depth limit, the same shape reaches the server.
+  // Within the depth limit, the same shape reaches the tool's input codec,
+  // which refuses the object where `text` expects a string.
   let shallow =
     testing.request("tools/call", [
       #("name", json.string("echo")),
@@ -992,7 +993,9 @@ pub fn mounted_handler_refuses_deep_json_test() {
     ])
   let response = http.handle(handler, shallow)
   response.status |> should.equal(200)
-  string.contains(testing.body_text(response), "\"isError\":true")
+  let body = testing.body_text(response)
+  string.contains(body, "\"isError\":true") |> should.be_true
+  string.contains(body, "Invalid arguments: $[\\\"text\\\"]: expected a string")
   |> should.be_true
 }
 
