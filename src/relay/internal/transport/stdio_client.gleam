@@ -639,6 +639,16 @@ fn serve(
           process.send(reply, Error(Cancelled))
           serve_queued(next, queued, resume)
         }
+        // The request's own deadline passed, not the notification wait's:
+        // give the request up as a cancelled one and resume the wait.
+        Failed(TimedOut, next, queued) -> {
+          case next.port {
+            Some(port) -> send_command(port, cancellation_frame(id))
+            None -> Nil
+          }
+          process.send(reply, Error(TimedOut))
+          serve_queued(abandon(next, id), queued, resume)
+        }
         Failed(failure, ..) as failed -> {
           process.send(reply, Error(failure))
           failed

@@ -155,3 +155,30 @@ pub fn waiting_for_a_notification_does_not_hold_other_callers_test() {
   client.close_subscription(subscription)
   client.close(peer)
 }
+
+pub fn request_that_times_out_during_a_notification_wait_is_cancelled_test() {
+  let peer = connect()
+  let assert Ok(subscription) =
+    client.listen(peer, [subscriptions.ToolsListChanged])
+  let called = process.new_subject()
+  let _ =
+    process.spawn(fn() {
+      process.sleep(100)
+      let outcome =
+        peer
+        |> client.with_deadline(deadline.after(duration.milliseconds(300)))
+        |> client.call(scripted("late"), 0)
+        |> reason_support.of
+      process.send(called, outcome)
+    })
+  let started = monotonic_ms()
+  let assert Ok(None) =
+    client.next_notification(subscription, duration.milliseconds(1500))
+  // The request's timeout is not the end of the notification wait.
+  assert monotonic_ms() - started >= 1400
+  let assert Ok(Error(client.TimedOut(_))) = process.receive(called, 1000)
+  // The child was told, its late answer was dropped, and it stays usable.
+  assert answer(peer, "cancels") == "1"
+  client.close_subscription(subscription)
+  client.close(peer)
+}
