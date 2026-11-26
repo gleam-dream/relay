@@ -1057,115 +1057,104 @@ fn http_peer(
     }
     http_gun.with_correlation(view, budget.correlation)
   }
-  Ok(
-    Peer(
-      send: fn(out, budget) {
-        use #(headers, owner) <- result.try(acquire(budget))
-        let client =
-          view(budget, config.listen_timeout)
-          |> http_gun.with_body_limit(budget.max_bytes, http_gun.Fail)
-          |> http_gun.with_additional_cancellation(http_owner.token(owner))
-        let outcome =
-          http_gun.with_response(
-            client,
-            build(out, "application/json, text/event-stream", budget, headers),
-            gun_failure(_, budget.max_bytes, budget.correlation),
-            fn(response) {
-              let answer = case
-                response.status,
-                is_event_stream(response.headers)
-              {
-                200, True ->
-                  stream_response(
-                    response.body,
-                    <<>>,
-                    0,
-                    budget.max_bytes,
-                    budget.correlation,
-                  )
-                _, _ ->
-                  body.collect(response.body, budget.max_bytes)
-                  |> result.map(fn(collected) { collected.bytes })
-                  |> result.map_error(gun_failure(
-                    _,
-                    budget.max_bytes,
-                    budget.correlation,
-                  ))
-              }
-              use bytes <- result.map(answer)
-              Incoming(
-                response.status,
-                bytes,
-                www_authenticate(response.headers),
-              )
-            },
-          )
-        let stopped = http_owner.finish(owner)
-        result.map_error(outcome, owned_failure(_, stopped))
-      },
-      listen: fn(out, budget) {
-        use #(headers, owner) <- result.try(acquire(budget))
-        let client =
-          view(budget, config.listen_timeout)
-          |> http_gun.with_additional_cancellation(http_owner.token(owner))
-        case
-          http_gun.open(
-            client,
-            build(out, "text/event-stream", budget, headers),
-          )
-        {
-          Error(failure) ->
-            Error(owned_failure(
-              gun_failure(failure, budget.max_bytes, budget.correlation),
-              http_owner.finish(owner),
-            ))
-          Ok(response) ->
-            case response.status {
-              200 ->
-                Ok(owned_stream(
-                  sse_stream(
-                    response.body,
-                    budget.max_bytes,
-                    budget.correlation,
-                  ),
-                  owner,
+  Ok(Peer(
+    send: fn(out, budget) {
+      use #(headers, owner) <- result.try(acquire(budget))
+      // An ordinary call lasts no longer than its request budget; the
+      // listen timeout bounds only an established listen stream.
+      let client =
+        view(budget, duration.milliseconds(remaining_ms(budget)))
+        |> http_gun.with_body_limit(budget.max_bytes, http_gun.Fail)
+        |> http_gun.with_additional_cancellation(http_owner.token(owner))
+      let outcome =
+        http_gun.with_response(
+          client,
+          build(out, "application/json, text/event-stream", budget, headers),
+          gun_failure(_, budget.max_bytes, budget.correlation),
+          fn(response) {
+            let answer = case
+              response.status,
+              is_event_stream(response.headers)
+            {
+              200, True ->
+                stream_response(
+                  response.body,
+                  <<>>,
+                  0,
+                  budget.max_bytes,
+                  budget.correlation,
+                )
+              _, _ ->
+                body.collect(response.body, budget.max_bytes)
+                |> result.map(fn(collected) { collected.bytes })
+                |> result.map_error(gun_failure(
+                  _,
+                  budget.max_bytes,
                   budget.correlation,
                 ))
-              status -> {
-                let collected = body.collect(response.body, budget.max_bytes)
-                body.close(response.body)
-                let stopped = http_owner.finish(owner)
-                case collected {
-                  Ok(collected) ->
-                    Error(status_error(
-                      Incoming(
-                        status,
-                        collected.bytes,
-                        www_authenticate(response.headers),
-                      ),
-                      budget.correlation,
-                    ))
-                  Error(failure) ->
-                    Error(owned_failure(
-                      gun_failure(failure, budget.max_bytes, budget.correlation),
-                      stopped,
-                    ))
-                }
+            }
+            use bytes <- result.map(answer)
+            Incoming(response.status, bytes, www_authenticate(response.headers))
+          },
+        )
+      let stopped = http_owner.finish(owner)
+      result.map_error(outcome, owned_failure(_, stopped))
+    },
+    listen: fn(out, budget) {
+      use #(headers, owner) <- result.try(acquire(budget))
+      let client =
+        view(budget, config.listen_timeout)
+        |> http_gun.with_additional_cancellation(http_owner.token(owner))
+      case
+        http_gun.open(client, build(out, "text/event-stream", budget, headers))
+      {
+        Error(failure) ->
+          Error(owned_failure(
+            gun_failure(failure, budget.max_bytes, budget.correlation),
+            http_owner.finish(owner),
+          ))
+        Ok(response) ->
+          case response.status {
+            200 ->
+              Ok(owned_stream(
+                sse_stream(response.body, budget.max_bytes, budget.correlation),
+                owner,
+                budget.correlation,
+              ))
+            status -> {
+              let collected = body.collect(response.body, budget.max_bytes)
+              body.close(response.body)
+              let stopped = http_owner.finish(owner)
+              case collected {
+                Ok(collected) ->
+                  Error(status_error(
+                    Incoming(
+                      status,
+                      collected.bytes,
+                      www_authenticate(response.headers),
+                    ),
+                    budget.correlation,
+                  ))
+                Error(failure) ->
+                  Error(owned_failure(
+                    gun_failure(failure, budget.max_bytes, budget.correlation),
+                    stopped,
+                  ))
               }
             }
-        }
-      },
-      close: fn() {
-        case owned {
-          True -> {
-            option.map(lifetime, process.kill)
-            http_gun.stop(gun)
           }
-          False -> Nil
+      }
+    },
+    close: fn() {
+      case owned {
+        True -> {
+          option.map(lifetime, process.kill)
+          http_gun.stop(gun)
         }
-      },
-    ),
-  )
+        False -> Nil
+      }
+    },
+  ))
 }
 
 fn header_failure(failure: http_owner.Failure, call: Correlation) -> Error {

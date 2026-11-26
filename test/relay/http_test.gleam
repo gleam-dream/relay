@@ -1247,6 +1247,32 @@ pub fn listen_streams_end_at_the_listen_timeout_test() {
   http.stop(listener)
 }
 
+pub fn ordinary_calls_follow_the_request_timeout_not_the_listen_timeout_test() {
+  let pause =
+    tool.handle(tool.define("pause", no_input(), codec.string()), fn(_) {
+      process.sleep(800)
+      Ok("done")
+    })
+  let listener = http.new(server.new([pause])) |> started
+  let assert Ok(config) =
+    client.http(
+      "http://127.0.0.1:" <> int.to_string(http.port(listener)) <> "/",
+    )
+  let assert Ok(peer) =
+    config
+    |> client.with_timeout(duration.seconds(5))
+    |> client.with_listen_timeout(duration.milliseconds(300))
+    |> client.connect
+
+  // The call takes longer than the listen timeout and well within the
+  // request timeout, which is the only bound an ordinary call has.
+  let assert Ok(client.Succeeded("done", _)) =
+    client.call(peer, tool.define("pause", no_input(), codec.string()), Nil)
+
+  client.close(peer)
+  http.stop(listener)
+}
+
 pub fn listen_timeout_must_be_positive_test() {
   let assert Ok(config) = client.http("http://127.0.0.1:1/")
   let assert Error(error) =
