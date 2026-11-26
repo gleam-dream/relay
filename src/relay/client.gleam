@@ -300,8 +300,10 @@ fn unbracket(host: String) -> String {
 /// The child does not inherit this VM's environment. It receives only the
 /// variables a program needs to run (`HOME`, `LOGNAME`, `PATH`, `SHELL`,
 /// `TERM` and `USER`; on Windows the system and profile directories,
-/// `PATH`, `TEMP` and `USERNAME`), and the ones added with
-/// `with_environment`.
+/// `PATH`, `TEMP` and `USERNAME`, names compared without case), and the
+/// ones added with `with_environment`. The allow-list holds against the
+/// environment at launch, not against an `os:putenv` that another process
+/// in this VM makes while the child launches.
 pub fn stdio(executable: String, arguments: List(String)) -> Config {
   defaults(StdioTarget(fn() { #(executable, arguments) }))
 }
