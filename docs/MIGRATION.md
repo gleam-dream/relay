@@ -62,7 +62,7 @@ stdio.Config(..stdio.config(), write_timeout: duration.seconds(30))
 
 ## Stdio children get an allow-listed environment
 
-**What changed.** A child launched with `client.stdio` no longer inherits the application's environment. It receives `HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM` and `USER` (on Windows the system and profile directories, `PATH`, `TEMP` and `USERNAME`), plus the variables you pass with the new `client.with_environment`.
+**What changed.** A child launched with `client.stdio` no longer inherits the application's environment. It receives `HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM` and `USER` (on Windows `APPDATA`, `HOMEDRIVE`, `HOMEPATH`, `LOCALAPPDATA`, `PATH`, `PROCESSOR_ARCHITECTURE`, `SYSTEMDRIVE`, `SYSTEMROOT`, `TEMP`, `USERNAME`, `USERPROFILE` and `PROGRAMFILES`; Windows names match without regard to case, so `Path` is kept), plus the variables you pass with the new `client.with_environment`.
 
 **Why.** Every secret in the application's environment reached every tool process it launched.
 
@@ -91,7 +91,7 @@ A name must be non-empty and contain no `=`, and no name or value may contain a 
 
 ## HTTP listen streams have a lifetime
 
-**What changed.** Every HTTP request now runs under a finite deadline. An established `subscriptions/listen` stream over HTTP stays open for the client's listen timeout, 1 hour by default, or until an earlier `with_deadline` on the view. Then `next_notification` returns an error with `TimedOut`.
+**What changed.** Every HTTP request now runs under a finite deadline. Ordinary calls (everything except `listen`) keep the request timeout, 30 s by default, set with `client.with_timeout`; the listen timeout applies only to `listen`. An established `subscriptions/listen` stream over HTTP stays open for the client's listen timeout, 1 hour by default, or until an earlier `with_deadline` on the view. Then `next_notification` returns an error with `TimedOut`.
 
 **What to do.** Reopen the subscription with `client.listen` when it ends with `TimedOut`. Change the lifetime with `client.with_listen_timeout(config, duration.hours(4))`; a zero or negative timeout is refused with `InvalidConfig(ListenTimeout)`. Stdio and in-process subscriptions have no such bound.
 
@@ -133,4 +133,4 @@ These need no code change in a Relay application, but a peer may notice them:
 - `Mcp-Name` is sent plain, or in the `=?base64?...?=` form for values that are not plain ASCII, as MCP `2026-07-28` requires. It is never percent-encoded. A Relay endpoint compares the header with the body literally, after decoding the Base64 form only. `relay/testing.request` builds the header the same way.
 - Over HTTP, a body deeper than the depth limit is refused with the depth error even when it is not valid JSON. Both answers are HTTP 400.
 - Every event stream from a Relay endpoint carries `connection: close` and ends with its final chunk. A subscription the endpoint ends reports `ConnectionClosed(Completed)` to a Relay client.
-- The stdio client ignores a response that arrives after its request was cancelled, and never writes a queued request whose caller already gave up.
+- The stdio client never writes a queued request whose caller already gave up, and answers it with not-sent evidence. It ignores a response that arrives after its request was cancelled, for the last 256 requests given up in flight; any other unrelated response still fails the call.
