@@ -763,21 +763,30 @@ fn receive_frame(
 ) -> #(State(context), Result(Nil, FrameError)) {
   case state.closed, inbound {
     True, _ -> #(state, Error(RuntimeStopped))
-    False, Decoded(frame) -> admit(state, exchange, context, frame, correlation)
+    False, Decoded(frame) ->
+      admit(state, exchange, context, fn() { frame }, correlation)
     False, Encoded(bytes) ->
-      case check_and_decode(state.config, exchange, bytes) {
+      case check(state.config, exchange, bytes) {
         Error(error) -> #(state, Error(error))
-        Ok(frame) -> admit(state, exchange, context, frame, correlation)
+        Ok(Nil) ->
+          admit(
+            state,
+            exchange,
+            context,
+            fn() { reducer.decode(bytes) },
+            correlation,
+          )
       }
   }
 }
 
-// Size and depth are checked on the bytes, before the one decode.
-fn check_and_decode(
+// Size and depth are checked on the bytes, before capacity and the one
+// decode.
+fn check(
   config: Config,
   exchange: ExchangeId,
   bytes: BitArray,
-) -> Result(reducer.Frame, FrameError) {
+) -> Result(Nil, FrameError) {
   let size = bit_array.byte_size(bytes)
   let exchange_int = reducer.exchange_id_to_int(exchange)
   case size > config.max_frame_bytes {
@@ -795,16 +804,18 @@ fn check_and_decode(
           )
           Error(FrameTooDeep(config.max_json_depth))
         }
-        True -> Ok(reducer.decode(bytes))
+        True -> Ok(Nil)
       }
   }
 }
 
+// `frame` decodes the frame; it runs only once the frame has a slot, so a
+// frame refused for capacity is never decoded.
 fn admit(
   state: State(context),
   exchange: ExchangeId,
   context: context,
-  frame: reducer.Frame,
+  frame: fn() -> reducer.Frame,
   correlation: Option(Correlation),
 ) -> #(State(context), Result(Nil, FrameError)) {
   let exchange_int = reducer.exchange_id_to_int(exchange)
@@ -825,6 +836,7 @@ fn admit(
       )
     }
     False -> {
+      let frame = frame()
       let correlation =
         carrier.resolve(correlation, reducer.frame_correlation(frame))
       let #(next, effects) =
